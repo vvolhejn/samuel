@@ -23,16 +23,18 @@ PARAM_NAMES = [
     "vibratoFrequency",
     "vibratoGain",
     "tractLength",
-    "constriction0index",
-    "constriction0diameter",
-    "constriction1index",
-    "constriction1diameter",
-    "constriction2index",
-    "constriction2diameter",
-    "constriction3index",
-    "constriction3diameter",
+    "constrictionIndex",
+    "constrictionDiameter",
 ]
-N_PARAMS = len(PARAM_NAMES)
+N_PARAMS = 13
+
+_TRACT_N = 44
+_NOSE_N = int(28 / 44 * _TRACT_N)  # 28
+_NOSE_START = _TRACT_N - _NOSE_N + 1  # 17
+_BLADE_START = int(10 / 44 * _TRACT_N)  # 10
+_TIP_START = int(32 / 44 * _TRACT_N)  # 32
+_LIP_START = int(39 / 44 * _TRACT_N)  # 39
+_NOSE_OFFSET = 0.8
 
 # fmt: off
 _P_TABLE = [
@@ -57,6 +59,20 @@ _GRAD3_XY = [
     [ 0,+1], [ 0,-1], [ 0,+1], [ 0,-1],
 ]
 # fmt: on
+
+
+def _make_nose_r() -> Tensor:
+    M = _NOSE_N
+    t = torch.arange(M, dtype=torch.float32) / M
+    d = torch.where(t < 0.5, 0.4 + 1.6 * (2 * t), 0.5 + 1.5 * (2 - 2 * t))
+    d = d.clamp(max=1.9)
+    A = d**2
+    r = torch.zeros(M)
+    r[1:] = (A[:-1] - A[1:]) / (A[:-1] + A[1:] + 1e-10)
+    return r  # [M]
+
+
+_NOSE_R_CPU = _make_nose_r()
 
 
 class SimplexNoise:
@@ -169,9 +185,7 @@ def _glottis(
     t = torch.arange(S, device=device, dtype=torch.float32) / SAMPLE_RATE  # [S]
 
     # ---- vibrato ----
-    vibrato = vibrato_gain * torch.sin(
-        2 * math.pi * t.unsqueeze(0) * vibrato_freq
-    )
+    vibrato = vibrato_gain * torch.sin(2 * math.pi * t.unsqueeze(0) * vibrato_freq)
     sn_vib = 0.02 * simplex.simplex1(t * 4.07) + 0.04 * simplex.simplex1(t * 2.15)
     vibrato = vibrato + sn_vib.unsqueeze(0)
 
@@ -232,11 +246,266 @@ def _glottis(
     sn_asp = (0.02 * simplex.simplex1(t * 1.99) + 0.2).unsqueeze(0)
     noise = noise_param * noise_mod
     noise = noise * intensity * intensity
-    noise = noise * (1 - torch.sqrt(torch.clamp(tenseness, min=0)))
+    noise = noise * (1 - torch.sqrt(torch.clamp(tenseness, min=1e-10)))
     noise = noise * sn_asp
 
     output = (noise + voice) * intensity
     return output, noise_mod
+
+
+# ---------------------------------------------------------------------------
+# Vocal tract waveguide
+# ---------------------------------------------------------------------------
+
+
+def _compute_diameter_profile(
+    tongue_index: Tensor,  # [B, S]
+    tongue_diameter: Tensor,  # [B, S]
+    constriction_index: Tensor,  # [B, S]
+    constriction_diameter: Tensor,  # [B, S]
+    N: int = _TRACT_N,
+) -> Tensor:  # [B, S, N]
+    B, S = tongue_index.shape
+    device = tongue_index.device
+
+    blade = _BLADE_START  # 10
+    tip = _TIP_START  # 32
+    lip = _LIP_START  # 39
+
+    # 1. Base rest profile
+    j = torch.arange(N, device=device, dtype=torch.float32)  # [N]
+    base = torch.where(
+        j < (7.0 / 44) * N - 0.5,
+        torch.full_like(j, 0.6),
+        torch.where(
+            j < (12.0 / 44) * N, torch.full_like(j, 1.1), torch.full_like(j, 1.5)
+        ),
+    )  # [N]
+    diameter = base.unsqueeze(0).unsqueeze(0).expand(B, S, N).contiguous()
+
+    # 2. Tongue shape (blade_start:lip_start)
+    L = lip - blade
+    j_tongue = torch.arange(blade, lip, device=device, dtype=torch.float32)  # [L]
+    interp = (tongue_index.unsqueeze(-1) - j_tongue) / (tip - blade)  # [B, S, L]
+    angle = 1.1 * math.pi * interp
+    # diameter_param = 2 + (tongue_diameter - 2) / 1.5
+    td = (2 + (tongue_diameter - 2) / 1.5).unsqueeze(-1)  # [B, S, 1]
+    curve = (1.5 - td + 1.7) * torch.cos(angle)  # [B, S, L]  (grid.offset=1.7)
+
+    # Edge scale factors: blade+0 → 0.94, lip-2 → 0.94, lip-1 → 0.8
+    scale = torch.ones(L, device=device)
+    scale[0] *= 0.94
+    if L >= 2:
+        scale[L - 2] *= 0.94
+    if L >= 1:
+        scale[L - 1] *= 0.8
+    curve = curve * scale  # [B, S, L]
+    tongue_vals = 1.5 - curve  # [B, S, L]
+
+    diameter = torch.cat(
+        [
+            diameter[:, :, :blade],
+            tongue_vals,
+            diameter[:, :, lip:],
+        ],
+        dim=2,
+    )
+
+    # 3. Constriction kernel
+    j_all = torch.arange(N, device=device, dtype=torch.float32)  # [N]
+    norm_idx = constriction_index / N  # [B, S]
+    lower_bound = 25.0 / 44
+    upper_bound = float(tip) / N
+
+    idx_range = torch.where(
+        norm_idx < lower_bound,
+        torch.full_like(norm_idx, 10.0),
+        torch.where(
+            norm_idx >= upper_bound,
+            torch.full_like(norm_idx, 5.0),
+            10.0
+            - (5.0 * (norm_idx - lower_bound)) / (upper_bound - lower_bound + 1e-10),
+        ),
+    )  # [B, S]
+
+    c_idx = constriction_index.unsqueeze(-1)  # [B, S, 1]
+    c_diam = constriction_diameter.unsqueeze(-1)  # [B, S, 1]
+    ir = idx_range.unsqueeze(-1)  # [B, S, 1]
+
+    offset = (j_all - c_idx).abs() - 0.5  # [B, S, N]
+    scalar = torch.where(
+        offset <= 0,
+        torch.zeros_like(offset),
+        torch.where(
+            offset > ir,
+            torch.ones_like(offset),
+            0.5 * (1 - torch.cos(math.pi * offset / (ir + 1e-10))),
+        ),
+    )  # [B, S, N]
+
+    new_diam = (c_diam - 0.3).clamp(min=0)  # [B, S, 1]
+    diff = diameter - new_diam  # [B, S, N]
+    new_diameter = new_diam + diff * scalar  # [B, S, N]
+    diameter = torch.where(diff > 0, new_diameter, diameter)
+
+    return diameter  # [B, S, N]
+
+
+def _waveguide_step(
+    right: Tensor,  # [B, N]
+    left: Tensor,  # [B, N]
+    nose_right: Tensor,  # [B, M]
+    nose_left: Tensor,  # [B, M]
+    glottis_s: Tensor,  # [B]
+    r_s: Tensor,  # [B, N]  oral reflection coefficients (r[:,0] unused)
+    r_L_s: Tensor,  # [B]
+    r_R_s: Tensor,  # [B]
+    r_N_s: Tensor,  # [B]
+    nose_r: Tensor,  # [M]  fixed nose reflections
+    turb_s: Tensor,  # [B, N]
+    N: int,
+    M: int,
+    ns: int,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    # 1. Turbulence injection
+    right = right + turb_s
+    left = left + turb_s
+
+    # 2. Oral junctions
+    # Convention: rj[:,i] = right.junction[i] (0-indexed)
+    #             lj[:,i] = left.junction[i+1] (1-indexed shift, so lj[:,N-1]=junction[N])
+    rj0 = left[:, 0] * 0.75 + glottis_s  # [B]  right.junction[0]
+    lj_last = right[:, -1] * (-0.85)  # [B]  left.junction[N]
+
+    offsets = r_s[:, 1:] * (right[:, :-1] + left[:, 1:])  # [B, N-1]
+    rj_inner = right[:, :-1] - offsets  # [B, N-1]  right.junction[1..N-1]
+    lj_inner = left[:, 1:] + offsets  # [B, N-1]  left.junction[1..N-1] → lj[:,0..N-2]
+
+    rj = torch.cat([rj0.unsqueeze(1), rj_inner], dim=1)  # [B, N]
+    lj = torch.cat([lj_inner, lj_last.unsqueeze(1)], dim=1)  # [B, N]
+
+    # 3. Override velum junction at ns
+    velum_common = nose_left[:, 0] + right[:, ns - 1]  # [B]
+    rj_ns = r_R_s * left[:, ns] + (r_R_s + 1) * velum_common
+    lj_ns = r_L_s * right[:, ns - 1] + (r_L_s + 1) * (nose_left[:, 0] + left[:, ns])
+
+    rj = torch.cat([rj[:, :ns], rj_ns.unsqueeze(1), rj[:, ns + 1 :]], dim=1)
+    lj = torch.cat([lj[:, : ns - 1], lj_ns.unsqueeze(1), lj[:, ns:]], dim=1)
+
+    # 4. Nose entry: nose_right.junction[0]
+    nose_rj0 = r_N_s * nose_left[:, 0] + (r_N_s + 1) * (left[:, ns] + right[:, ns - 1])
+
+    # 5. Nose junctions
+    # nose_rj[:,i] = nose_right.junction[i], nose_lj[:,i] = nose_left.junction[i+1]
+    nose_lj_last = nose_right[:, -1] * (-0.85)  # nose_left.junction[M]
+    nose_offsets = nose_r[1:] * (nose_left[:, 1:] + nose_right[:, :-1])  # [B, M-1]
+    nose_rj_inner = nose_right[:, :-1] - nose_offsets  # [B, M-1]
+    nose_lj_inner = nose_left[:, 1:] + nose_offsets  # [B, M-1]
+
+    nose_rj = torch.cat([nose_rj0.unsqueeze(1), nose_rj_inner], dim=1)  # [B, M]
+    nose_lj = torch.cat([nose_lj_inner, nose_lj_last.unsqueeze(1)], dim=1)  # [B, M]
+
+    # 6. State update (nose fade=1.0)
+    right_new = rj * 0.999
+    left_new = lj * 0.999
+    nose_right_new = nose_rj
+    nose_left_new = nose_lj
+
+    # 7. Output
+    out = right_new[:, -1] + nose_right_new[:, -1]
+
+    return right_new, left_new, nose_right_new, nose_left_new, out
+
+
+def _tract(
+    glottis_out: Tensor,  # [B, S]
+    noise_mod: Tensor,  # [B, S]
+    tongue_index: Tensor,  # [B, S]
+    tongue_diameter: Tensor,  # [B, S]
+    constriction_index: Tensor,  # [B, S]
+    constriction_diameter: Tensor,  # [B, S]
+) -> Tensor:  # [B, S]
+    B, S = glottis_out.shape
+    N = _TRACT_N
+    M = _NOSE_N
+    ns = _NOSE_START  # 17
+    device = glottis_out.device
+
+    # 1. Diameter profile [B, S, N] and oral reflections [B, S, N]
+    diameter = _compute_diameter_profile(
+        tongue_index, tongue_diameter, constriction_index, constriction_diameter, N
+    )
+    amplitude = diameter**2  # [B, S, N]
+    A_prev = amplitude[:, :, :-1]
+    A_curr = amplitude[:, :, 1:]
+    r_inner = (A_prev - A_curr) / (A_prev + A_curr + 1e-10)  # [B, S, N-1]
+    r = torch.cat([torch.zeros(B, S, 1, device=device), r_inner], dim=2)  # [B, S, N]
+
+    # 2. Velum and 3-way junction reflections [B, S]
+    velum = torch.where(
+        (constriction_index > ns) & (constriction_diameter < -_NOSE_OFFSET),
+        torch.full_like(constriction_index, 0.4),
+        torch.full_like(constriction_index, 0.01),
+    )
+    A_L = amplitude[:, :, ns]
+    A_R = amplitude[:, :, ns + 1]
+    A_N = velum**2
+    sum_A = A_L + A_R + A_N + 1e-10
+    r_L = (2 * A_L - sum_A) / sum_A
+    r_R = (2 * A_R - sum_A) / sum_A
+    r_N = (2 * A_N - sum_A) / sum_A
+
+    # 3. Turbulence injection [B, S, N] with STE
+    c_idx = constriction_index
+    c_diam = constriction_diameter
+    thinness = torch.clamp(8 * (0.7 - c_diam), 0, 1)
+    openness = torch.clamp(30 * (c_diam - 0.3), 0, 1)
+    noise_amount = noise_mod * glottis_out * 0.66 * (thinness * openness) / 2  # [B, S]
+    valid_mask = ((c_idx >= 2) & (c_idx <= N) & (c_diam > 0)).float()  # [B, S]
+
+    lo_float = c_idx.detach().floor()
+    frac = c_idx - lo_float  # STE: d/dc_idx = 1
+    lo = lo_float.long().clamp(0, N - 2)
+
+    # mask1: position lo+1 (always in [1, N-1])
+    # mask2: position lo+2 (may be N, use N+1 classes and slice)
+    mask1 = F.one_hot(lo + 1, N).float()  # [B, S, N]
+    mask2 = F.one_hot((lo + 2).clamp(max=N), N + 1).float()[:, :, :N]  # [B, S, N]
+    turb = (
+        mask1 * (noise_amount * frac).unsqueeze(-1)
+        + mask2 * (noise_amount * (1 - frac)).unsqueeze(-1)
+    ) * valid_mask.unsqueeze(-1)  # [B, S, N]
+
+    # 4. Fixed nose reflections
+    nose_r = _NOSE_R_CPU.to(device=device, dtype=glottis_out.dtype)  # [M]
+
+    # 5. Sample loop (BPTT)
+    right = torch.zeros(B, N, device=device, dtype=glottis_out.dtype)
+    left = torch.zeros(B, N, device=device, dtype=glottis_out.dtype)
+    nose_right = torch.zeros(B, M, device=device, dtype=glottis_out.dtype)
+    nose_left = torch.zeros(B, M, device=device, dtype=glottis_out.dtype)
+
+    outputs = []
+    for s in range(S):
+        right, left, nose_right, nose_left, out = _waveguide_step(
+            right,
+            left,
+            nose_right,
+            nose_left,
+            glottis_out[:, s],
+            r[:, s, :],
+            r_L[:, s],
+            r_R[:, s],
+            r_N[:, s],
+            nose_r,
+            turb[:, s, :],
+            N,
+            M,
+            ns,
+        )
+        outputs.append(out)
+
+    return torch.stack(outputs, dim=1) * 0.125  # [B, S]
 
 
 # ---------------------------------------------------------------------------
@@ -248,11 +517,11 @@ def pink_trombone(params: Tensor) -> Tensor:
     """Differentiable Pink Trombone vocal synthesizer.
 
     Args:
-        params: [B, T, 19] at 12.5 Hz control rate.
+        params: [B, T, 13] at 12.5 Hz control rate.
             Parameters (in order): noise, frequency, tenseness, intensity,
             loudness, tongueIndex, tongueDiameter, vibratoWobble,
             vibratoFrequency, vibratoGain, tractLength,
-            constriction{0-3}index, constriction{0-3}diameter.
+            constrictionIndex, constrictionDiameter.
 
     Returns:
         [B, T_samples] audio at 24 kHz.  T_samples = T * 1920.
@@ -277,5 +546,11 @@ def pink_trombone(params: Tensor) -> Tensor:
         simplex=simplex,
     )
 
-    # TODO: tract waveguide simulation
-    return glottis_out
+    return _tract(
+        glottis_out=glottis_out,
+        noise_mod=noise_mod,
+        tongue_index=p["tongueIndex"],
+        tongue_diameter=p["tongueDiameter"],
+        constriction_index=p["constrictionIndex"],
+        constriction_diameter=p["constrictionDiameter"],
+    )
