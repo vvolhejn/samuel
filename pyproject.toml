@@ -1,0 +1,30 @@
+[project]
+name = "samuel"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Václav Volhejn", email = "vaclav.volhejn@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.11.0",
+]
+
+[project.scripts]
+samuel = "samuel:main"
+
+[build-system]
+requires = ["uv_build>=0.9.26,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "jupyter>=1.1.1",
+    "pytest>=9.0.2",
+]
+
+[tool.uv.workspace]
+members = [
+    "foo/foop",
+]

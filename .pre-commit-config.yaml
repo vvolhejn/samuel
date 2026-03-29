@@ -1,0 +1,39 @@
+repos:
+  - repo: local
+    hooks:
+      - id: no-wandb-dir
+        name: no wandb/ directory in repo root
+        language: system
+        entry: bash -c 'if [ -d wandb ]; then echo "wandb/ directory found in repo root - remove it to avoid ruff treating wandb as first-party when sorting imports"; exit 1; fi'
+        pass_filenames: false
+        always_run: true
+  # Strip output from Jupyter notebooks before committing
+  - repo: https://github.com/kynan/nbstripout
+    rev: 0.8.1
+    hooks:
+      - id: nbstripout
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      # Don't commit large files
+      - id: check-added-large-files
+        args: ["--maxkb=2048"]
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.8
+    hooks:
+      # Ruff linter
+      # First, check and format without actually fixing the files, just say what would be changed.
+      # This is especially useful in CI to see if there are any formatting issues.
+      - id: ruff-check 
+        name: ruff-check - show diff
+        args: [ --diff ]
+        types_or: [ python, pyi ] # Don't run on notebooks
+      - id: ruff-format
+        name: ruff-format - show diff
+        args: [ --diff ]
+        types_or: [ python, pyi ] # Don't run on notebooks
+      - id: ruff-check
+        args: [ --fix ] # Auto-fix things like import order
+        types_or: [ python, pyi ] # Don't run on notebooks
+      - id: ruff-format
+        types_or: [ python, pyi ] # Don't run on notebooks
