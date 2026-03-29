@@ -1,0 +1,2814 @@
+/*
+    TODO
+        define custom value setters
+*/
+
+Math.clamp = function(value, min, max) {
+    return value <= min?
+    min :
+    value < max?
+        value :
+        max;
+};
+
+Math.interpolate = function(interpolation, from, to) {
+    interpolation = Math.clamp(interpolation, 0, 1);
+    return (from * (1 - interpolation)) + (to * (interpolation));
+};
+
+window.AudioContext = window.AudioContext || window.webkitAudioContext;
+
+if(window.AudioContext.prototype.createConstantSource == undefined) {
+    window.AudioContext.prototype.createConstantSource = function() {
+        
+        const constantSourceNode = this.createScriptProcessor(Math.pow(2, 14), 1, 1);
+        constantSourceNode._isRunning = false;
+        constantSourceNode._audioContext = this;
+        constantSourceNode.offset = constantSourceNode;
+    
+        constantSourceNode.__interpolationMode = "none";
+        Object.defineProperty(constantSourceNode, "_interpolationMode", {
+            get : function() {
+                return this.__interpolationMode;
+            },
+            set : function(newValue) {
+                if(["none", "linear"].includes(newValue))
+                    this.__interpolationMode = newValue;
+            }
+        });
+
+        constantSourceNode._startValue;
+        constantSourceNode._targetValue;
+
+        constantSourceNode._startTime;
+        constantSourceNode._targetTime;
+        constantSourceNode._duration;
+
+        constantSourceNode.minValue = -3.402820018375656e+38;
+        constantSourceNode.maxValue = +3.402820018375656e+38;
+        constantSourceNode._clamp = function(newValue) {
+            return Math.clamp(newValue, this.minValue, this.maxValue);
+        };
+
+        constantSourceNode._update = function() {
+            if(this._interpolationMode !== "none") {
+                const timeOffset = (this._audioContext.currentTime - this._startTime);
+                
+                const linearInterpolation = timeOffset/this._duration;
+                var interpolation = linearInterpolation;
+
+                switch(this._interpolationMode) {
+                    case "linear":
+                        interpolation = linearInterpolation;
+                        break;
+                }
+
+                interpolation = Math.clamp(interpolation, 0, 1);
+
+                this._value = this._clamp(Math.interpolate(interpolation, this._startValue, this._targetValue));
+                
+                if(interpolation >= 1)
+                    this._interpolationMode = "none";
+            }
+        };
+
+        constantSourceNode._value = 1;
+        Object.defineProperty(constantSourceNode, "value", {
+            get : function() {
+                return this._value;
+            },
+            set : function(newValue) {
+                this._interpolationMode = "none";
+                this._value = Math.clamp(newValue, this.minValue, this.maxValue);
+            },
+        });
+
+        constantSourceNode.linearRampToValueAtTime = function(value, time) {
+            // FILL
+            this.value = value;
+            return this;
+        };
+        constantSourceNode.setValueAtTime = function(value, time) {
+            // FILL
+            this.value = value;
+            return this;
+        };
+        constantSourceNode.exponentialRampToValueAtTime = function(value, time) {
+            // FILL
+            this.value = value;
+            return this;
+        };
+        constantSourceNode.setTargetAtTime = function(value, time, timeConstant) {
+            // FILL
+            this.value = value;
+            return this;
+        };
+        constantSourceNode.setValueAtTime = function(value, time) {
+            // FILL
+            this.value = value;
+            return this;
+        };
+        constantSourceNode.setValueCurveAtTime = function(value, time, duration) {
+            // FILL
+            this.value = value;
+            return this;
+        };
+
+        constantSourceNode.onaudioprocess = function(event) {
+            const inputChannel = event.inputBuffer.getChannelData(0);
+            const outputChannel = event.outputBuffer.getChannelData(0);
+
+            if(this._isRunning)
+                for(let sampleIndex = 0; sampleIndex < outputChannel.length; sampleIndex++) {
+                    this._update();
+                    outputChannel[sampleIndex] = inputChannel[sampleIndex] + this.value;
+                }
+        };
+
+        constantSourceNode.start = function() {
+            this._isRunning = true;
+        };
+        constantSourceNode.stop = function() {
+            this._isRunning = false;
+        };
+
+        return constantSourceNode;
+    };
+}
+
+/*
+    TODO
+        .type property that allows for different noise types (white noise, pink noise, etc)
+*/
+
+window.AudioContext = window.AudioContext || window.webkitAudioContext;
+
+window.AudioContext.prototype.createNoise = function() {
+    const noiseNode = this.createBufferSource();
+
+    const seconds = 1;
+
+    const buffer = this.createBuffer(1, seconds*this.sampleRate, this.sampleRate);
+    const bufferChannel = buffer.getChannelData(0);
+    for(let sampleIndex = 0; sampleIndex < bufferChannel.length; sampleIndex++)
+        bufferChannel[sampleIndex] = ((Math.random(0) *2) -1);
+
+    noiseNode.buffer = buffer;
+    noiseNode.loop = true;
+
+    noiseNode.start();
+    
+    return noiseNode;
+};
+
+const ParameterDescriptors = [
+  {
+    name: "noise",
+    defaultValue: 0,
+    minValue: -1,
+    maxValue: 1,
+  },
+  {
+    name: "frequency",
+    defaultValue: 140,
+    minValue: 0,
+  },
+  {
+    name: "tenseness",
+    defaultValue: 0.6,
+    minValue: 0,
+    maxValue: 1,
+  },
+  {
+    name: "intensity",
+    defaultValue: 1,
+    minValue: 0,
+    maxValue: 1,
+  },
+  {
+    name: "loudness",
+    defaultValue: 1,
+    minValue: 0,
+    maxValue: 1,
+  },
+
+  {
+    name: "tongueIndex",
+    defaultValue: 12.9,
+    //automationRate : "k-rate",
+  },
+  {
+    name: "tongueDiameter",
+    defaultValue: 2.43,
+    //automationRate : "k-rate",
+  },
+
+  {
+    name: "vibratoWobble",
+    defaultValue: 1,
+    minValue: 0,
+    maxValue: 1,
+  },
+
+  {
+    name: "vibratoFrequency",
+    defaultValue: 6,
+    minValue: 0,
+  },
+  {
+    name: "vibratoGain",
+    defaultValue: 0.005,
+    minValue: 0,
+  },
+
+  {
+    name: "tractLength",
+    defaultValue: 44,
+    minValue: 15,
+    maxValue: 88,
+  },
+];
+
+ParameterDescriptors.numberOfConstrictions = 4;
+
+for (
+  let index = 0;
+  index < ParameterDescriptors.numberOfConstrictions;
+  index++
+) {
+  const constrictionParameterDescriptors = [
+    {
+      name: "constriction" + index + "index",
+      defaultValue: 0,
+      //automationRate: "k-rate",
+    },
+    {
+      name: "constriction" + index + "diameter",
+      defaultValue: 0,
+      //automationRate: "k-rate",
+    },
+  ];
+
+  ParameterDescriptors.push(...constrictionParameterDescriptors);
+}
+
+// VECTOR 3
+
+function Vector3(x = 0, y = 0, z = 0) {
+    this.x = x;
+    this.y = y;
+    this.z = z;
+}
+
+Object.defineProperties(Vector3.prototype, {
+    dot2 : {
+        value : function(x, y) {
+            return (this.x*x) + (this.y*y);
+        }
+    },
+    dot3 : {
+        value : function(x, y, z) {
+            return this.dot2(x, y) + (this.z*z);
+        }
+    }
+});
+
+//////////////////////////////////////////////////////////////////////
+
+// SIMPLEX NOISE
+
+function SimplexNoise() {
+    this.grad3 = [
+        [+1, +1, +0],
+        [-1, +1, +0],
+        [+1, -1, +0],
+        [-1, -1, +0],
+        [+1, +0, +1],
+        [-1, +0, +1],
+        [+1, +0, -1],
+        [-1, +0, -1],
+        [+0, +1, +1],
+        [+0, -1, +1],
+        [+0, +1, -1],
+        [+0, -1, -1],
+    ].map(vector3Arguments => new Vector3(...vector3Arguments));
+
+    this.p = [151,160,137,91,90,15,
+        131,13,201,95,96,53,194,233,7,225,140,36,103,30,69,142,8,99,37,240,21,10,23,
+        190,6,148,247,120,234,75,0,26,197,62,94,252,219,203,117,35,11,32,57,177,33,
+        88,237,149,56,87,174,20,125,136,171,168,68,175,74,165,71,134,139,48,27,166,
+        77,146,158,231,83,111,229,122,60,211,133,230,220,105,92,41,55,46,245,40,244,
+        102,143,54,65,25,63,161,1,216,80,73,209,76,132,187,208,89,18,169,200,196,
+        135,130,116,188,159,86,164,100,109,198,173,186,3,64,52,217,226,250,124,123,
+        5,202,38,147,118,126,255,82,85,212,207,206,59,227,47,16,58,17,182,189,28,42,
+        223,183,170,213,119,248,152,2,44,154,163,70,221,153,101,155,167,43,172,9,
+        129,22,39,253,19,98,108,110,79,113,224,232,178,185,112,104,218,246,97,228,
+        251,34,242,193,238,210,144,12,191,179,162,241,81,51,145,235,249,14,239,107,
+        49,192,214,31,181,199,106,157,184,84,204,176,115,121,50,45,127,4,150,254,
+        138,236,205,93,222,114,67,29,24,72,243,141,128,195,78,66,215,61,156,180];
+    
+    this.perm = new Array(Math.pow(2, 8+1));
+    this.gradP = new Array(Math.pow(2, 8+1));
+
+    this.F2 = (0.5 * (Math.sqrt(3) - 1));
+    this.G2 = ((3 - Math.sqrt(3))/6);
+
+    this.F3 = (1/3);
+    this.G3 = (1/6);
+
+    this.seed(Date.now());
+}
+
+Object.defineProperties(SimplexNoise.prototype, {
+    seed : {
+        value : function(seed) {
+            if((seed > 0) && (seed < 1))
+                seed *= Math.pow(2, 16);
+            
+            seed = Math.floor(seed);
+    
+            if(seed < Math.pow(2, 8))
+                seed |= seed << Math.pow(2, 3);
+            
+            for(let index = 0; index < Math.pow(2, 8); index++) {
+                const seedShift = (index & 1)?
+                    0 :
+                    Math.pow(2, 3);
+    
+                const value = this.p[index] ^ ((seed >> seedShift) & (Math.pow(2, 8)-1));
+                
+                this.perm[index] = this.perm[index + Math.pow(2, 8)] = value;
+                this.gradP[index] = this.gradP[index + Math.pow(2, 8)] = this.grad3[value % this.grad3.length];
+            }
+        }
+    },
+    simplex2 : {
+        value : function(xin, yin) {
+            const s = ((xin + yin) * this.F2);
+            
+            var i = Math.floor(xin + s);
+            var j = Math.floor(yin + s);
+            
+            const t = (i + j) * this.G2;
+            
+            const x0 = xin - i + t;
+            const y0 = yin - j + t;
+            
+            const i1 = (x0 > y0)? 1:0;
+            const j1 = 1 - i1;
+    
+            const x1 = x0 - i1 + this.G2;
+            const y1 = y0 - j1 + this.G2;
+    
+            const x2 = (x0 - 1) + (2 * this.G2);
+            const y2 = (y0 - 1) + (2 * this.G2);
+    
+            i &= (Math.pow(2, 8)-1);
+            j &= (Math.pow(2, 8)-1);
+    
+            const gi0 = this.gradP[i + this.perm[j]];
+            const gi1 = this.gradP[i + i1 + this.perm[j + j1]];
+            const gi2 = this.gradP[i + 1 + this.perm[j + 1]];
+    
+            const t0 = 0.5 - Math.pow(x0, 2) - Math.pow(y0, 2);
+            const n0 = (t0 < 0)?
+                0 :
+                Math.pow(t0, 4) * gi0.dot2(x0, y0);
+    
+            const t1 = 0.5 - Math.pow(x1, 2) - Math.pow(y1, 2);
+            const n1 = (t1 < 0)?
+                0 :
+                Math.pow(t1, 4) * gi1.dot2(x1, y1);
+    
+            const t2 = 0.5 - Math.pow(x2, 2) - Math.pow(y2, 2);
+            const n2 = (t2 < 0)?
+                0 :
+                Math.pow(t2, 4) * gi2.dot2(x2, y2);
+    
+            return 70 * (n0 + n1 + n2);
+        }
+    },
+    simplex1 : {
+        value : function(x) {
+            return this.simplex2((x * 1.2), -(x * 0.7));
+        }
+    }
+});
+
+/*
+    TODO
+        *
+*/
+
+Math.clamp = function (value, min, max) {
+    if (value <= min) return min;
+    else if (value < max) return value;
+    else return max;
+};
+
+class Glottis {
+    constructor() {
+        this.noise = new SimplexNoise();
+
+        this.coefficients = {
+            alpha: 0,
+            Delta: 0,
+            E0: 0,
+            epsilon: 0,
+            omega: 0,
+            shift: 0,
+            Te: 0,
+        };
+
+        this.startSeconds = 0;
+    }
+
+    process(inputSamples, parameterSamples, sampleIndex, bufferLength, seconds) {
+        const intensity = parameterSamples.intensity;
+        const loudness = parameterSamples.loudness;
+
+        var vibrato = 0;
+        vibrato += parameterSamples.vibratoGain * Math.sin(2 * Math.PI * seconds * parameterSamples.vibratoFrequency);
+        vibrato += 0.02 * this.noise.simplex1(seconds * 4.07);
+        vibrato += 0.04 * this.noise.simplex1(seconds * 2.15);
+
+        if (parameterSamples.vibratoWobble > 0) {
+            var wobble = 0;
+            wobble += 0.2 * this.noise.simplex1(seconds * 0.98);
+            wobble += 0.4 * this.noise.simplex1(seconds * 0.5);
+            vibrato += wobble * parameterSamples.vibratoWobble;
+        }
+
+        var frequency = parameterSamples.frequency;
+        frequency *= 1 + vibrato;
+
+        var tenseness = parameterSamples.tenseness;
+        tenseness += 0.1 * this.noise.simplex1(seconds * 0.46);
+        tenseness += 0.05 * this.noise.simplex1(seconds * 0.36);
+        tenseness += (3 - tenseness) * (1 - intensity);
+
+        // waveform.update()
+        const period = 1 / frequency;
+
+        var secondsOffset = seconds - this.startSeconds;
+        var interpolation = secondsOffset / period;
+
+        if (interpolation >= 1) {
+            this.startSeconds = seconds + (secondsOffset % period);
+            interpolation = this.startSeconds / period;
+            this._updateCoefficients(tenseness);
+        }
+
+        // process
+        var outputSample = 0;
+
+        var noiseModulator = this._getNoiseModulator(interpolation);
+        noiseModulator += (1 - tenseness * intensity) * 3;
+        parameterSamples.noiseModulator = noiseModulator;
+
+        var noise = parameterSamples.noise;
+        noise *= noiseModulator;
+        noise *= intensity;
+        noise *= intensity;
+        noise *= 1 - Math.sqrt(Math.max(tenseness, 0));
+        noise *= 0.02 * this.noise.simplex1(seconds * 1.99) + 0.2;
+
+        var voice = this._getNormalizedWaveform(interpolation);
+        voice *= intensity;
+        voice *= loudness;
+
+        outputSample = noise + voice;
+        outputSample *= intensity;
+
+        return outputSample;
+    }
+
+    update() {}
+
+    _updateCoefficients(tenseness = 0) {
+        const R = {};
+        R.d = Math.clamp(3 * (1 - tenseness), 0.5, 2.7);
+        R.a = -0.01 + 0.048 * R.d;
+        R.k = 0.224 + 0.118 * R.d;
+        R.g = ((R.k / 4) * (0.5 + 1.2 * R.k)) / (0.11 * R.d - R.a * (0.5 + 1.2 * R.k));
+
+        const T = {};
+        T.a = R.a;
+        T.p = 1 / (2 * R.g);
+        T.e = T.p + T.p * R.k;
+
+        this.coefficients.epsilon = 1 / T.a;
+        this.coefficients.shift = Math.exp(-this.coefficients.epsilon * (1 - T.e));
+        this.coefficients.Delta = 1 - this.coefficients.shift;
+
+        const integral = {};
+        integral.RHS =
+            ((1 / this.coefficients.epsilon) * (this.coefficients.shift - 1) + (1 - T.e) * this.coefficients.shift) /
+            this.coefficients.Delta;
+        integral.total = {};
+        integral.total.lower = -(T.e - T.p) / 2 + integral.RHS;
+        integral.total.upper = -integral.total.lower;
+
+        this.coefficients.omega = Math.PI / T.p;
+
+        const s = Math.sin(this.coefficients.omega * T.e);
+        const y = (-Math.PI * s * integral.total.upper) / (T.p * 2);
+        const z = Math.log(y);
+
+        this.coefficients.alpha = z / (T.p / 2 - T.e);
+        this.coefficients.E0 = -1 / (s * Math.exp(this.coefficients.alpha * T.e));
+        this.coefficients.Te = T.e;
+    }
+
+    _getNormalizedWaveform(interpolation) {
+        return interpolation > this.coefficients.Te
+            ? (-Math.exp(-this.coefficients.epsilon * (interpolation - this.coefficients.Te)) +
+                  this.coefficients.shift) /
+                  this.coefficients.Delta
+            : this.coefficients.E0 *
+                  Math.exp(this.coefficients.alpha * interpolation) *
+                  Math.sin(this.coefficients.omega * interpolation);
+    }
+
+    _getNoiseModulator(interpolation) {
+        const angle = 2 * Math.PI * interpolation;
+        const amplitude = Math.sin(angle);
+        const positiveAmplitude = Math.max(0, amplitude);
+
+        const offset = 0.1;
+        const gain = 0.2;
+
+        const noiseModulator = positiveAmplitude * gain + offset;
+
+        return noiseModulator;
+    }
+}
+
+/*
+    TODO
+        *
+*/
+
+class Nose {
+  constructor(tract) {
+    this.maxLength = Math.floor((28 / 44) * tract.maxLength);
+
+    this.fade = 1;
+    this.offset = 0.8;
+
+    // buffers
+    this.left = new Float64Array(this.maxLength);
+    this.left.junction = new Float64Array(this.maxLength + 1);
+
+    this.right = new Float64Array(this.maxLength);
+    this.right.junction = new Float64Array(this.maxLength + 1);
+
+    this.reflection = new Float64Array(this.maxLength + 1);
+    this.reflection.value = 0;
+    this.reflection.new = 0;
+
+    this.diameter = new Float64Array(this.maxLength);
+
+    this.amplitude = new Float64Array(this.maxLength);
+    this.amplitude.max = new Float64Array(this.maxLength);
+
+    this._onTractUpdate(tract);
+  }
+
+  _onTractUpdate(tract) {
+    this.length = Math.floor((28 / 44) * tract.length);
+
+    this.start = tract.length - this.length + 1;
+
+    // setup
+    for (let index = 0; index < this.length; index++) {
+      const interpolation = index / this.length;
+
+      const value =
+        interpolation < 0.5
+          ? 0.4 + 1.6 * (2 * interpolation)
+          : 0.5 + 1.5 * (2 - 2 * interpolation);
+
+      this.diameter[index] = Math.min(value, 1.9);
+    }
+
+    for (let index = 0; index < this.length; index++) {
+      this.amplitude[index] = Math.pow(this.diameter[index], 2);
+
+      if (index > 0)
+        this.reflection[index] =
+          (this.amplitude[index - 1] - this.amplitude[index]) /
+          (this.amplitude[index - 1] + this.amplitude[index]);
+    }
+
+    this.diameter[0] = tract.velum.target;
+  }
+}
+
+class Transient {
+    constructor(position, seconds) {
+        this.position = position;
+
+        this.startTime = seconds;
+        this.timeAlive = 0;
+        this.lifetime = 0.2;
+
+        this.strength = 0.3;
+        this.exponent = 200;
+    }
+
+    get amplitude() {
+        return this.strength * Math.pow(-2, this.timeAlive * this.exponent);
+    }
+
+    get isAlive() {
+        return this.timeAlive < this.lifetime;
+    }
+
+    update(seconds) {
+        this.timeAlive = seconds - this.startTime;
+    }
+}
+
+/*
+    TODO
+        using tongue as a k-rate constriction
+*/
+
+
+Math.interpolate = function (interpolation, from, to) {
+  return from * (1 - interpolation) + to * interpolation;
+};
+Math.clamp = function (value, minValue, maxValue) {
+  return value <= minValue ? minValue : value < maxValue ? value : maxValue;
+};
+
+class Tract {
+  constructor(length = 44) {
+    this.maxLength = 88;
+    //this.length = length;
+
+    // Indices
+    this.blade = {
+      //start: Math.floor((10 / 44) * this.length),
+    };
+
+    this.tip = {
+      //start: Math.floor((32 / 44) * this.length),
+    };
+
+    this.lip = {
+      //start: Math.floor((39 / 44) * this.length),
+      reflection: -0.85,
+    };
+
+    this.glottis = {
+      reflection: 0.75,
+    };
+
+    this.velum = {
+      target: 0.01,
+    };
+
+    this.grid = {
+      offset: 1.7,
+    };
+
+    // Buffers
+    this.right = new Float64Array(this.maxLength);
+    this.right.junction = new Float64Array(this.maxLength + 1);
+    this.right.reflection = {
+      value: 0,
+      new: 0,
+    };
+
+    this.left = new Float64Array(this.maxLength);
+    this.left.junction = new Float64Array(this.maxLength + 1);
+    this.left.reflection = {
+      value: 0,
+      new: 0,
+    };
+
+    this.reflection = new Float64Array(this.maxLength + 1);
+    this.reflection.new = new Float64Array(this.maxLength + 1);
+
+    this.amplitude = new Float64Array(this.maxLength);
+    this.amplitude.max = new Float64Array(this.maxLength);
+
+    this.diameter = new Float64Array(this.maxLength);
+    this.diameter.rest = new Float64Array(this.maxLength);
+
+    // Tongue & Nose
+    this.tongue = {
+      _diameter: 2.43,
+      //_index: (12.9 * this.length) / 44,
+
+      range: {
+        diameter: {
+          minValue: 2.05,
+          maxValue: 3.5,
+          get range() {
+            return this.maxValue - this.minValue;
+          },
+          get center() {
+            return (this.maxValue + this.minValue) / 2;
+          },
+          interpolation(diameterValue) {
+            const interpolation = (diameterValue - this.minValue) / this.range;
+            return Math.clamp(interpolation, 0, 1);
+          },
+        },
+        index: {
+          //minValue: this.blade.start + 2,
+          //maxValue: this.tip.start - 3,
+          get range() {
+            return this.maxValue - this.minValue;
+          },
+          get center() {
+            return (this.maxValue + this.minValue) / 2;
+          },
+          centerOffset(interpolation) {
+            const centerOffsetDiameter = interpolation * this.range;
+            const centerOffsetRadius = centerOffsetDiameter / 2;
+            return centerOffsetRadius;
+          },
+        },
+      },
+
+      get diameter() {
+        return this._diameter;
+      },
+      set diameter(newValue) {
+        this._diameter = Math.clamp(newValue, this.range.diameter.minValue, this.range.diameter.maxValue);
+      },
+
+      get index() {
+        return this._index;
+      },
+      set index(newValue) {
+        const diameterInterpolation = this.range.diameter.interpolation(this.diameter);
+        const invertedDiameterInterpolation = 1 - diameterInterpolation;
+
+        const straightenedInterpolation =
+          Math.pow(invertedDiameterInterpolation, 0.58) -
+          0.2 * (Math.pow(invertedDiameterInterpolation, 2) - invertedDiameterInterpolation);
+        const centerOffset = this.range.index.centerOffset(straightenedInterpolation);
+
+        this._index = Math.clamp(newValue, this.range.index.center - centerOffset, this.range.index.center + centerOffset)
+          ;
+      },
+    };
+
+    // NOSE
+    this.nose = new Nose(this);
+
+    // Transients
+    this.transients = [];
+    this.transients.obstruction = {
+      last: -1,
+      new: -1,
+    };
+
+    // Constrictions
+    this.previousConstrictions = [];
+    this.previousConstrictions.tongue = {};
+
+    this._updateTractLength(length);
+    this._updateReflection();
+  }
+
+  // FILL
+  _updateTractLength(length) {
+    this.length = length;
+
+    this.blade.start = Math.floor((10 / 44) * this.length);
+    this.tip.start = Math.floor((32 / 44) * this.length);
+
+    this.lip.start = Math.floor((39 / 44) * this.length);
+
+    this.tongue._index = (12.9 * this.length) / 44;
+    this.tongue.range.index.minValue = this.blade.start + 2;
+    this.tongue.range.index.maxValue = this.tip.start - 3;
+
+    this.nose._onTractUpdate(this);
+
+    // diameter.update
+    for (let index = 0; index < this.length; index++) {
+      var value = 0;
+      if (index < (7 / 44) * this.length - 0.5) value = 0.6;
+      else if (index < (12 / 44) * this.length) value = 1.1;
+      else value = 1.5;
+
+      this.diameter[index] = value;
+      this.diameter.rest[index] = value;
+    }
+  }
+
+  // PROCESS
+  process(inputSamples, parameterSamples, sampleIndex, bufferLength, seconds) {
+    const currentTractLength = Math.round(parameterSamples.tractLength);
+    if (currentTractLength != this.length) {
+      this._updateTractLength(currentTractLength);
+    }
+
+    this.tongue.diameter = parameterSamples.tongueDiameter;
+    this.tongue.index = parameterSamples.tongueIndex;
+
+    this._processTransients(seconds);
+    this._processConstrictions(this.previousConstrictions, parameterSamples);
+
+    const bufferInterpolation = sampleIndex / bufferLength;
+    const updateAmplitudes = Math.random() < 0.1;
+
+    var outputSample = 0;
+    outputSample += this._processLips(parameterSamples, bufferInterpolation, updateAmplitudes);
+    outputSample += this._processNose(parameterSamples, bufferInterpolation, updateAmplitudes);
+
+    if (isNaN(outputSample)) this.reset();
+
+    return outputSample;
+  }
+
+  _processTransients(seconds) {
+    for (let index = this.transients.length - 1; index >= 0; index--) {
+      const transient = this.transients[index];
+
+      this.left[transient.position] += transient.amplitude;
+      transient.update(seconds);
+
+      if (!transient.isAlive) this.transients.splice(index, 1);
+    }
+  }
+  _processConstrictions(constrictions, parameterSamples) {
+    for (let index = 0; index < constrictions.length; index++) {
+      const constriction = constrictions[index];
+
+      if (constriction.index >= 2 && constriction.index <= this.length && constriction.diameter > 0) {
+        var noise = parameterSamples.glottis;
+
+        const noiseScalar = parameterSamples.noiseModulator * 0.66;
+        noise *= noiseScalar;
+
+        const thinness = Math.clamp(8 * (0.7 - constriction.diameter), 0, 1);
+        const openness = Math.clamp(30 * (constriction.diameter - 0.3), 0, 1);
+        const _ness = thinness * openness;
+        noise *= _ness / 2;
+
+        const lowerIndex = Math.floor(constriction.index);
+        const lowerWeight = constriction.index - lowerIndex;
+        const lowerNoise = noise * lowerWeight;
+
+        const upperIndex = lowerIndex + 1;
+        const upperWeight = upperIndex - constriction.index;
+        const upperNoise = noise * upperWeight;
+
+        this.right[lowerIndex + 1] += lowerNoise;
+        this.right[upperIndex + 1] += upperNoise;
+
+        this.left[lowerIndex + 1] += lowerNoise;
+        this.left[upperIndex + 1] += upperNoise;
+      }
+    }
+  }
+
+  _processLips(parameterSamples, bufferInterpolation, updateAmplitudes) {
+    this.right.junction[0] = this.left[0] * this.glottis.reflection + parameterSamples.glottis;
+    this.left.junction[this.length] = this.right[this.length - 1] * this.lip.reflection;
+
+    for (let index = 1; index < this.length; index++) {
+      const interpolation = Math.interpolate(bufferInterpolation, this.reflection[index], this.reflection.new[index]);
+      const offset = interpolation * (this.right[index - 1] + this.left[index]);
+
+      this.right.junction[index] = this.right[index - 1] - offset;
+      this.left.junction[index] = this.left[index] + offset;
+    }
+
+    const leftInterpolation = Math.interpolate(
+      bufferInterpolation,
+      this.left.reflection.new,
+      this.left.reflection.value
+    );
+    this.left.junction[this.nose.start] =
+      leftInterpolation * this.right[this.nose.start - 1] +
+      (leftInterpolation + 1) * (this.nose.left[0] + this.left[this.nose.start]);
+    const rightInterpolation = Math.interpolate(
+      bufferInterpolation,
+      this.right.reflection.new,
+      this.right.reflection.value
+    );
+    this.right.junction[this.nose.start] =
+      rightInterpolation * this.left[this.nose.start] +
+      (rightInterpolation + 1) * (this.nose.left[0] + this.right[this.nose.start - 1]);
+    const noseInterpolation = Math.interpolate(
+      bufferInterpolation,
+      this.nose.reflection.new,
+      this.nose.reflection.value
+    );
+    this.nose.right.junction[0] =
+      noseInterpolation * this.nose.left[0] +
+      (noseInterpolation + 1) * (this.left[this.nose.start] + this.right[this.nose.start - 1]);
+
+    for (let index = 0; index < this.length; index++) {
+      this.right[index] = this.right.junction[index] * 0.999;
+      this.left[index] = this.left.junction[index + 1] * 0.999;
+
+      if (updateAmplitudes) {
+        const sum = Math.abs(this.left[index] + this.right[index]);
+
+        this.amplitude.max[index] = sum > this.amplitude.max[index] ? sum : this.amplitude.max[index] * 0.999;
+      }
+    }
+
+    return this.right[this.length - 1];
+  }
+  _processNose(parameterSamples, bufferInterpolation, updateAmplitudes) {
+    this.nose.left.junction[this.nose.length] = this.nose.right[this.nose.length - 1] * this.lip.reflection;
+
+    for (let index = 1; index < this.nose.length; index++) {
+      const offset = this.nose.reflection[index] * (this.nose.left[index] + this.nose.right[index - 1]);
+
+      this.nose.left.junction[index] = this.nose.left[index] + offset;
+      this.nose.right.junction[index] = this.nose.right[index - 1] - offset;
+    }
+
+    for (let index = 0; index < this.nose.length; index++) {
+      this.nose.left[index] = this.nose.left.junction[index + 1] * this.nose.fade;
+      this.nose.right[index] = this.nose.right.junction[index] * this.nose.fade;
+
+      if (updateAmplitudes) {
+        const sum = Math.abs(this.nose.left[index] + this.nose.right[index]);
+        this.nose.amplitude.max[index] =
+          sum > this.nose.amplitude.max[index] ? sum : this.nose.amplitude.max[index] * 0.999;
+      }
+    }
+
+    return this.nose.right[this.nose.length - 1];
+  }
+
+  // UPDATE
+  update(seconds, constrictions) {
+    this._updateTract();
+
+    this._updateTransients(seconds);
+
+    this.nose.diameter[0] = this.velum.target;
+    this.nose.amplitude[0] = Math.pow(this.nose.diameter[0], 2);
+
+    this._updateReflection();
+
+    this._updateConstrictions(constrictions);
+  }
+
+  _updateDiameterRest() {
+    for (let index = this.blade.start; index < this.lip.start; index++) {
+      const interpolation = (this.tongue.index - index) / (this.tip.start - this.blade.start);
+
+      const angle = 1.1 * Math.PI * interpolation;
+      const diameter = 2 + (this.tongue.diameter - 2) / 1.5;
+
+      var curve = (1.5 - diameter + this.grid.offset) * Math.cos(angle);
+
+      if (index == this.blade.start - 2 || index == this.lip.start - 1) curve *= 0.8;
+
+      if (index == this.blade.start + 0 || index == this.lip.start - 2) curve *= 0.94;
+
+      const value = 1.5 - curve;
+
+      this.diameter.rest[index] = value;
+    }
+  }
+
+  _log() {
+    const now = Date.now();
+    if (this._numberOfLogs != undefined && this._numberOfLogs < 10) {
+      console.log(...arguments);
+      this._numberOfLogs++;
+      return;
+    }
+    if (this._lastLogTime == undefined || now - this._lastLogTime > 100) {
+      console.log(...arguments);
+      this._lastLogTime = now;
+      this._numberOfLogs = 0;
+    }
+  }
+
+  _updateConstrictions(constrictions) {
+    var update = false;
+
+    update =
+      update ||
+      this.tongue.index !== this.previousConstrictions.tongue.index ||
+      this.tongue.diameter !== this.previousConstrictions.tongue.diameter;
+
+    const maxIndex = Math.max(this.previousConstrictions.length, constrictions.length);
+    for (
+      let constrictionIndex = 0, A = constrictions[0], B = this.previousConstrictions[0];
+      !update && constrictionIndex < maxIndex;
+      constrictionIndex++, A = constrictions[constrictionIndex], B = this.previousConstrictions[constrictionIndex]
+    ) {
+      update =
+        A !== undefined && B !== undefined
+          ? A.index !== B.index || A.diameter !== B.diameter
+          : !(A == undefined && B == undefined);
+    }
+
+    if (update) {
+      this._updateDiameterRest();
+      for (let index = 0; index < this.length; index++) {
+        this.diameter[index] = this.diameter.rest[index];
+      }
+
+      this.velum.target = 0.01;
+
+      for (let index = -1; index < constrictions.length; index++) {
+        const constriction = constrictions[index] || this.tongue;
+
+        if (constriction.index > this.nose.start && constriction.diameter < -this.nose.offset) this.velum.target = 0.4;
+        if (constriction.diameter < -0.85 - this.nose.offset) {
+          continue;
+        }
+
+        var newTractDiameter = constriction.diameter;
+        newTractDiameter -= 0.3;
+        newTractDiameter = Math.max(0, newTractDiameter);
+
+        if (newTractDiameter < 3) {
+          // FIX
+          var tractIndexRange = 2;
+
+          const normalizedIndex = constriction.index / this.length;
+
+          if (!this.indexRangeParams) {
+            this.indexRangeParams = {
+              lowerIndex: 25 / 44,
+              lowerIndexRange: 10,
+              upperIndex: this.tip.start / this.length,
+              upperIndexRange: 5,
+            };
+            this.indexRangeParams.indexRange = this.indexRangeParams.upperIndex - this.indexRangeParams.lowerIndex;
+          }
+          const { lowerIndex, lowerIndexRange, upperIndex, upperIndexRange, indexRange } = this.indexRangeParams;
+
+          if (normalizedIndex < lowerIndex) tractIndexRange = lowerIndexRange;
+          else if (normalizedIndex >= upperIndex) tractIndexRange = upperIndexRange;
+          else tractIndexRange = lowerIndexRange - (upperIndexRange * (normalizedIndex - lowerIndex)) / indexRange;
+
+          tractIndexRange *= this.length / 44;
+          const constrictionIndex = Math.round(constriction.index);
+          const constrictionIndexRadius = Math.ceil(tractIndexRange) + 1;
+
+          for (
+            let tractIndex = constrictionIndex - constrictionIndexRadius;
+            tractIndex < constrictionIndex + tractIndexRange + 1;
+            tractIndex++
+          ) {
+            if (tractIndex < 0 || tractIndex >= this.length) {
+              continue;
+            }
+
+            const tractIndexOffset = Math.abs(tractIndex - constriction.index) - 0.5; // relpos
+
+            var tractDiameterScalar; // shrink
+            if (tractIndexOffset <= 0) tractDiameterScalar = 0;
+            else if (tractIndexOffset > tractIndexRange) tractDiameterScalar = 1;
+            else tractDiameterScalar = 0.5 * (1 - Math.cos((Math.PI * tractIndexOffset) / tractIndexRange));
+
+            const tractDiameterDifference = this.diameter[tractIndex] - newTractDiameter;
+            if (tractDiameterDifference > 0) {
+              this.diameter[tractIndex] = newTractDiameter + tractDiameterDifference * tractDiameterScalar;
+            }
+          }
+        }
+      }
+
+      this.previousConstrictions = constrictions;
+      this.previousConstrictions.tongue = {
+        index: this.tongue.index,
+        diameter: this.tongue.diameter,
+      };
+    }
+  }
+
+  _updateTract() {
+    for (let index = 0; index < this.length; index++) {
+      if (this.diameter[index] <= 0) {
+        this.transients.obstruction.new = index;
+      }
+    }
+  }
+
+  _updateTransients(seconds) {
+    if (this.nose.amplitude[0] < 0.05) {
+      if (this.transients.obstruction.last > -1 && this.transients.obstruction.new == -1)
+        this.transients.push(new Transient(this.transients.obstruction.new, seconds));
+
+      this.transients.obstruction.last = this.transients.obstruction.new;
+    }
+  }
+
+  _updateReflection() {
+    for (let index = 0; index < this.length; index++) {
+      this.amplitude[index] = Math.pow(this.diameter[index], 2);
+
+      if (index > 0) {
+        this.reflection[index] = this.reflection.new[index];
+        this.reflection.new[index] =
+          this.amplitude[index] == 0
+            ? 0.999
+            : (this.amplitude[index - 1] - this.amplitude[index]) / (this.amplitude[index - 1] + this.amplitude[index]);
+      }
+    }
+
+    const sum = this.amplitude[this.nose.start] + this.amplitude[this.nose.start + 1] + this.nose.amplitude[0];
+    this.left.reflection.value = this.left.reflection.new;
+    this.left.reflection.new = (2 * this.amplitude[this.nose.start] - sum) / sum;
+
+    this.right.reflection.value = this.right.reflection.new;
+    this.right.reflection.new = (2 * this.amplitude[this.nose.start + 1] - sum) / sum;
+
+    this.nose.reflection.value = this.nose.reflection.new;
+    this.nose.reflection.new = (2 * this.nose.amplitude[0] - sum) / sum;
+  }
+
+  reset() {
+    this.right.fill(0);
+    this.right.junction.fill(0);
+    this.left.fill(0);
+    this.left.junction.fill(0);
+
+    this.nose.left.fill(0);
+    this.nose.left.junction.fill(0);
+    this.nose.right.fill(0);
+    this.nose.right.junction.fill(0);
+  }
+}
+
+/*
+    TODO            
+        add "precision" property to iterate this.tract.process
+*/
+
+
+class Processor {
+    constructor() {
+        this.glottis = new Glottis();
+        this.tract = new Tract();
+    }
+
+    process(inputSamples, parameterSamples, sampleIndex, bufferLength, seconds) {
+        var outputSample = 0;
+
+        if (inputSamples) {
+            parameterSamples.glottis = inputSamples[sampleIndex];
+        } else {
+            const glottisSample = this.glottis.process(...arguments);
+            parameterSamples.glottis = glottisSample;
+        }
+
+        outputSample += this.tract.process(...arguments);
+        sampleIndex += 0.5; // process twice - note the "...arguments" doesn't read this
+        outputSample += this.tract.process(inputSamples, parameterSamples, sampleIndex, bufferLength, seconds);
+
+        if (!inputSamples) {
+            outputSample *= 0.125;
+        }
+
+        return outputSample;
+    }
+
+    update(seconds, constrictions) {
+        this.glottis.update();
+        this.tract.update(seconds, constrictions);
+    }
+}
+
+/*
+    TODO
+        *
+*/
+
+
+window.AudioContext = window.AudioContext || window.webkitAudioContext;
+
+// CONSTRUCTOR HELPERS
+function setupNode(audioNode) {
+    audioNode._constrictions = [];
+    for (
+        let constrictionIndex = 0;
+        constrictionIndex < ParameterDescriptors.numberOfConstrictions;
+        constrictionIndex++
+    ) {
+        audioNode._constrictions[constrictionIndex] = {
+            _index: constrictionIndex,
+
+            index: null,
+            diameter: null,
+
+            _enable: () => audioNode._enableConstriction(constrictionIndex),
+            _disable: () => audioNode._disableConstriction(constrictionIndex),
+
+            _isEnabled: false,
+        };
+    }
+
+    audioNode.newConstriction = function (index, diameter) {
+        return this._constrictions.find((constriction) => {
+            if (!constriction._isEnabled) {
+                if (index !== undefined) constriction.index.value = index;
+
+                if (diameter !== undefined) constriction.diameter.value = diameter;
+
+                constriction._enable();
+                return true;
+            }
+        });
+    };
+
+    audioNode.removeConstriction = function (constriction) {
+        constriction._disable();
+    };
+
+    Object.defineProperty(audioNode, "constrictions", {
+        get: function () {
+            return this._constrictions.filter((constriction) => constriction._isEnabled);
+        },
+    });
+
+    audioNode._parameters = {};
+
+    audioNode.tongue = audioNode._parameters.tongue = {
+        index: null,
+        diameter: null,
+    };
+    audioNode.vibrato = audioNode._parameters.vibrato = {
+        frequency: null,
+        gain: null,
+        wobble: null,
+    };
+}
+function assignAudioParam(audioNode, audioParam, paramName) {
+    if (paramName.includes("constriction")) {
+        const constrictionIndex = Number(paramName.match(/[0-9]+/g)[0]);
+        const constriction = audioNode._constrictions[constrictionIndex];
+
+        constriction[paramName.includes("index") ? "index" : "diameter"] = audioParam;
+
+        audioNode.constrictions[constrictionIndex] = constriction;
+    } else if (paramName.includes("vibrato")) {
+        audioNode.vibrato[paramName.replace("vibrato", "").toLowerCase()] = audioParam;
+    } else if (paramName.includes("tongue")) {
+        audioNode.tongue[paramName.replace("tongue", "").toLowerCase()] = audioParam;
+    } else {
+        audioNode[paramName] = audioNode._parameters[paramName] = audioParam;
+    }
+}
+
+if (window.AudioWorklet !== undefined) {
+    class PinkTromboneNode extends AudioWorkletNode {
+        constructor(audioContext) {
+            super(audioContext, "pink-trombone-worklet-processor");
+
+            setupNode(this);
+
+            this.parameters.forEach((audioParam, paramName) => {
+                assignAudioParam(this, audioParam, paramName);
+            });
+
+            this.port.onmessage = (event) => {
+                switch (event.data.name) {
+                                    }
+            };
+        }
+
+        _postMessage(eventData) {
+            eventData.id = Math.random();
+
+            return new Promise((resolve, reject) => {
+                const resolveCallback = (event) => {
+                    if (eventData.id == Number(event.data.id)) {
+                        this.port.removeEventListener("message", resolveCallback);
+                        resolve(event);
+                    }
+                };
+
+                this.port.addEventListener("message", resolveCallback);
+                this.port.postMessage(eventData);
+            });
+        }
+
+        _enableConstriction(constrictionIndex) {
+            return this._postMessage({
+                name: "enableConstriction",
+                constrictionIndex: constrictionIndex,
+            }).then(() => {
+                this._constrictions[constrictionIndex]._isEnabled = true;
+            });
+        }
+
+        _disableConstriction(constrictionIndex) {
+            return this._postMessage({
+                name: "disableConstriction",
+                constrictionIndex: constrictionIndex,
+            }).then(() => {
+                this._constrictions[constrictionIndex]._isEnabled = false;
+            });
+        }
+
+        getProcessor() {
+            return this._postMessage({
+                name: "getProcessor",
+            }).then((event) => {
+                return JSON.parse(event.data.processor);
+            });
+        }
+    }
+
+    window.AudioContext.prototype.createPinkTromboneNode = function () {
+        return new PinkTromboneNode(this, ...arguments);
+    };
+} else {
+    window.AudioContext.prototype.createPinkTromboneNode = function () {
+        const pinkTromboneNode = this.createScriptProcessor(Math.pow(2, 11), ParameterDescriptors.length, 1);
+        pinkTromboneNode.processor = new Processor();
+
+        setupNode(pinkTromboneNode);
+
+        pinkTromboneNode.channelMerger = this.createChannelMerger(ParameterDescriptors.length);
+        pinkTromboneNode.channelMerger.channels = [];
+        pinkTromboneNode.channelMerger.connect(pinkTromboneNode);
+
+        ParameterDescriptors.forEach((parameterDescriptor, index) => {
+            const constantSource = this.createConstantSource();
+            constantSource.start();
+
+            const audioParam = constantSource.offset;
+            audioParam.automationRate = parameterDescriptor.automationRate || "a-rate";
+            audioParam.value = parameterDescriptor.defaultValue || 0;
+            constantSource.connect(pinkTromboneNode.channelMerger, 0, index);
+
+            pinkTromboneNode.channelMerger.channels[index] = parameterDescriptor.name;
+
+            assignAudioParam(pinkTromboneNode, audioParam, parameterDescriptor.name);
+        });
+
+        pinkTromboneNode._getParameterChannels = function (inputBuffer) {
+            const parameterChannels = {};
+
+            for (let channelIndex = 0; channelIndex < inputBuffer.numberOfChannels; channelIndex++) {
+                parameterChannels[this.channelMerger.channels[channelIndex]] = inputBuffer.getChannelData(channelIndex);
+            }
+
+            return parameterChannels;
+        };
+
+        pinkTromboneNode._getParameterSamples = function (parameterChannels, sampleIndex) {
+            const parameterSamples = {};
+            const parameterNames = Object.keys(parameterChannels);
+
+            for (let channelIndex = 0; channelIndex < parameterNames.length; channelIndex++) {
+                const parameterName = parameterNames[channelIndex];
+
+                if (!parameterName.includes("constriction"))
+                    parameterSamples[parameterName] = parameterChannels[parameterName][sampleIndex];
+            }
+
+            return parameterSamples;
+        };
+
+        pinkTromboneNode._getConstrictions = function (parameterChannels) {
+            const constrictions = [];
+
+            for (let constrictionIndex = 0; constrictionIndex < this._constrictions.length; constrictionIndex++) {
+                const _constriction = this._constrictions[constrictionIndex];
+
+                if (_constriction._isEnabled) {
+                    const constriction = {
+                        index: parameterChannels["constriction" + constrictionIndex + "index"][0],
+                        diameter: parameterChannels["constriction" + constrictionIndex + "diameter"][0],
+                    };
+
+                    constrictions[constrictionIndex] = constriction;
+                }
+            }
+
+            return constrictions;
+        };
+
+        pinkTromboneNode.onaudioprocess = function (event) {
+            const inputChannel = event.inputBuffer.getChannelData(0);
+            const outputChannel = event.outputBuffer.getChannelData(0);
+
+            const parameterChannels = this._getParameterChannels(event.inputBuffer);
+            const constrictions = this._getConstrictions(parameterChannels);
+
+            for (let sampleIndex = 0; sampleIndex < outputChannel.length; sampleIndex++) {
+                const parameterSamples = this._getParameterSamples(parameterChannels, sampleIndex);
+                const bufferLength = outputChannel.length;
+                const seconds = event.playbackTime + sampleIndex / event.inputBuffer.sampleRate;
+
+                outputChannel[sampleIndex] = this.processor.process(
+                    inputChannel,
+                    parameterSamples,
+                    sampleIndex,
+                    bufferLength,
+                    seconds,
+                    constrictions
+                );
+            }
+
+            this.processor.update(
+                event.playbackTime + outputChannel.length / event.inputBuffer.sampleRate,
+                constrictions
+            );
+        };
+
+        pinkTromboneNode._enableConstriction = function (constrictionIndex) {
+            this._constrictions[constrictionIndex]._isEnabled = true;
+        };
+        pinkTromboneNode._disableConstriction = function (constrictionIndex) {
+            this._constrictions[constrictionIndex]._isEnabled = false;
+        };
+
+        pinkTromboneNode.getProcessor = function () {
+            return new Promise((resolve, reject) => {
+                resolve(this.processor);
+            });
+        };
+
+        return pinkTromboneNode;
+    };
+}
+
+/*
+    TODO
+        start/stop for the pinkTromboneNode
+*/
+
+
+window.AudioContext = window.AudioContext || window.webkitAudioContext;
+
+class PinkTrombone {
+  addModules(audioContext) {
+    if (audioContext.audioWorklet !== undefined) {
+      return audioContext.audioWorklet.addModule("./script/audio/nodes/pinkTrombone/processors/WorkletProcessor.js");
+    } else {
+      return new Promise((resolve, reject) => {
+        resolve();
+      });
+    }
+  }
+
+  constructor(audioContext) {
+    this.loadPromise = this.addModules(audioContext).then(() => {
+      this.audioContext = audioContext;
+      this.setupAudioGraph();
+      return this.audioContext;
+    });
+  }
+
+  setupAudioGraph() {
+    this._noise = this.audioContext.createNoise();
+
+    this._aspirateFilter = this.audioContext.createBiquadFilter();
+    this._aspirateFilter.type = "bandpass";
+    this._aspirateFilter.frequency.value = 500;
+    this._aspirateFilter.Q.value = 0.5;
+
+    this._fricativeFilter = this.audioContext.createBiquadFilter();
+    this._fricativeFilter.type = "bandpass";
+    this._fricativeFilter.frequency.value = 1000;
+    this._fricativeFilter.Q.value = 0.5;
+
+    this._pinkTromboneNode = this.audioContext.createPinkTromboneNode();
+
+    this._noise.connect(this._aspirateFilter);
+    this._aspirateFilter.connect(this._pinkTromboneNode.noise);
+
+    this._noise.connect(this._fricativeFilter);
+    this._fricativeFilter.connect(this._pinkTromboneNode.noise);
+
+    this._gain = this.audioContext.createGain();
+    this._gain.gain.value = 0;
+    this._pinkTromboneNode.connect(this._gain);
+  }
+
+  get parameters() {
+    return this._pinkTromboneNode._parameters;
+  }
+
+  connect() {
+    return this._gain.connect(...arguments);
+  }
+  disconnect() {
+    return this._gain.disconnect(...arguments);
+  }
+
+  start() {
+    this._gain.gain.value = 1;
+  }
+  stop() {
+    this._gain.gain.value = 0;
+  }
+
+  get constrictions() {
+    return this._pinkTromboneNode.constrictions;
+  }
+  newConstriction() {
+    return this._pinkTromboneNode.newConstriction(...arguments);
+  }
+  removeConstriction(constriction) {
+    this._pinkTromboneNode.removeConstriction(constriction);
+  }
+
+  getProcessor() {
+    return this._pinkTromboneNode.getProcessor();
+  }
+}
+
+window.AudioContext.prototype.createPinkTrombone = function () {
+  return new PinkTrombone(this);
+};
+
+/*
+    TODO
+        throttle value setter
+        draw background stuff
+*/
+
+class TractUI {
+  constructor() {
+    this._container = document.createElement("div");
+    this._container.style.margin = 0;
+    this._container.style.padding = 0;
+
+    this._canvases = {};
+    this._contexts = {};
+
+    ["tract", "background"].forEach((id, index) => {
+      const canvas = document.createElement("canvas");
+      canvas.id = id;
+
+      canvas.style.position = "absolute";
+      canvas.height = 500;
+      canvas.width = 600;
+      canvas.style.backgroundColor = "transparent";
+      canvas.style.margin = 0;
+      canvas.style.padding = 0;
+      canvas.style.zIndex = 1 - index;
+
+      this._canvases[id] = canvas;
+      this._contexts[id] = canvas.getContext("2d");
+
+      this._container.appendChild(canvas);
+    });
+
+    this._canvas = this._canvases.tract;
+    this._context = this._contexts.tract;
+
+    this._tract = {
+      origin: {
+        x: 340,
+        y: 460,
+      },
+
+      radius: 298,
+      scale: 60,
+
+      scalar: 1,
+
+      angle: {
+        scale: 0.64,
+        offset: -0.25,
+      },
+    };
+    this._processor = null;
+    this._parameters = {};
+
+    this._touchConstrictionIndices = [];
+
+    // AnimationFrame
+    this._container.addEventListener("animationFrame", (event) => {
+      this._container.dispatchEvent(
+        new CustomEvent("getProcessor", {
+          bubbles: true,
+        })
+      );
+
+      this._container.dispatchEvent(
+        new CustomEvent("getParameter", {
+          bubbles: true,
+          detail: {
+            parameterName: "intensity",
+          },
+        })
+      );
+    });
+
+    this._container.addEventListener("didGetProcessor", (event) => {
+      this._processor = event.detail.processor;
+      this._resize();
+      this._drawTract();
+    });
+    this._container.addEventListener("didGetParameter", (event) => {
+      const parameterName = event.detail.parameterName;
+      const value = event.detail.value;
+
+      this._parameters[parameterName] = value;
+    });
+
+    // RequestAnimationFrame after being attached to the DOM
+    const mutationObserver = new MutationObserver((mutationsList, observer) => {
+      if (document.contains(this._container)) {
+        this._container.dispatchEvent(
+          new CustomEvent("requestAnimationFrame", {
+            bubbles: true,
+          })
+        );
+
+        observer.disconnect();
+      }
+    });
+    mutationObserver.observe(document.body, {
+      subtree: true,
+      childList: true,
+    });
+
+    // Mouse EventListeners
+    this._canvases.tract.addEventListener("mousedown", (event) => {
+      this._startEvent(event);
+    });
+    this._canvases.tract.addEventListener("mousemove", (event) => {
+      this._moveEvent(event);
+    });
+    this._canvases.tract.addEventListener("mouseup", (event) => {
+      this._endEvent(event);
+    });
+
+    // Touch EventListeners
+    this._canvases.tract.addEventListener("touchstart", (event) => {
+      event.preventDefault();
+      Array.from(event.changedTouches).forEach((touch) => this._startEvent(touch));
+    });
+    this._canvases.tract.addEventListener("touchmove", (event) => {
+      event.preventDefault();
+      Array.from(event.changedTouches).forEach((touch) => this._moveEvent(touch));
+    });
+    this._canvases.tract.addEventListener("touchend", (event) => {
+      event.preventDefault();
+      Array.from(event.changedTouches).forEach((touch) => this._endEvent(touch));
+    });
+    this._canvases.tract.addEventListener("touchcancel", (event) => {
+      event.preventDefault();
+      Array.from(event.changedTouches).forEach((touch) => this._endEvent(touch));
+    });
+
+    // Constriction EventLiteners
+    this._canvases.tract.addEventListener("didNewConstriction", (event) => {
+      this._touchConstrictionIndices[event.detail.touchIdentifier] = event.detail.constrictionIndex;
+    });
+    this._canvases.tract.addEventListener("didRemoveConstriction", (event) => {
+      this._touchConstrictionIndices[event.detail.touchIdentifier] = undefined;
+    });
+  }
+
+  get node() {
+    return this._container;
+  }
+
+  get width() {
+    return this._container.offsetWidth;
+  }
+  get height() {
+    return this._container.offsetHeight;
+  }
+
+  _resize() {
+    this._tract.scalar = this._canvases.tract.width / this._canvases.tract.offsetWidth;
+    this._resizeCanvases();
+  }
+
+  _resizeCanvases() {
+    for (let id in this._canvases) {
+      //this._canvases[id].style.width = this._container.offsetWidth;
+      this._canvases[id].style.height = this._container.offsetHeight;
+    }
+  }
+
+  _drawTract() {
+    if (this._isDrawing) return;
+
+    this._isDrawing = true;
+
+    this._context = this._contexts.tract;
+
+    this._context.clearRect(0, 0, this._canvas.width, this._canvas.height);
+    this._context.lineCap = this._context.lineJoin = "round";
+
+    this._drawTongueControl();
+
+    this._context.beginPath();
+    this._context.lineWidth = 2;
+    this._context.strokeStyle = this._context.fillStyle = "pink";
+    this._moveTo(1, 0);
+
+    for (let index = 1; index < this._processor.tract.length; index++)
+      this._lineTo(index, this._processor.tract.diameter[index]);
+
+    for (let index = this._processor.tract.length - 1; index >= 2; index--) this._lineTo(index, 0);
+
+    this._context.closePath();
+    this._context.stroke();
+    this._context.fill();
+
+    // NOSE
+    const velum = this._processor.tract.nose.diameter[0];
+    const velumAngle = velum * 4;
+
+    this._context.beginPath();
+    this._context.lineWidth = 2;
+    this._context.strokeStyle = this._context.fillStyle = "pink";
+    this._moveTo(this._processor.tract.nose.start, -this._processor.tract.nose.offset);
+
+    for (let index = 1; index < this._processor.tract.nose.length; index++)
+      this._lineTo(
+        index + this._processor.tract.nose.start,
+        -this._processor.tract.nose.offset - this._processor.tract.nose.diameter[index] * 0.9
+      );
+
+    for (let index = this._processor.tract.nose.length - 1; index >= 1; index--)
+      this._lineTo(index + this._processor.tract.nose.start, -this._processor.tract.nose.offset);
+
+    this._context.closePath();
+    this._context.fill();
+
+    this._context.beginPath();
+    this._context.lineWidth = 2;
+    this._context.strokeStyle = this._context.fillStyle = "pink";
+    this._moveTo(this._processor.tract.nose.start - 2, 0);
+    this._lineTo(this._processor.tract.nose.start, -this._processor.tract.nose.offset);
+    this._lineTo(this._processor.tract.nose.start + velumAngle, -this._processor.tract.nose.offset);
+    this._lineTo(this._processor.tract.nose.start + velumAngle - 2, 0);
+    this._context.closePath();
+    this._context.stroke();
+    this._context.fill();
+
+    this._context.fillStyle = "white";
+    this._context.font = "20px Arial";
+    this._context.textAlign = "center";
+    this._context.globalAlpha = 1;
+
+    this._drawText(this._processor.tract.length * 0.1, 0.425, "throat", false, false);
+    this._drawText(this._processor.tract.length * 0.71, -1.8, "nasal", false, false);
+    this._drawText(this._processor.tract.length * 0.71, -1.3, "cavity", false, false);
+
+    this._context.font = "22px Arial";
+    this._drawText(this._processor.tract.length * 0.6, 0.9, "oral", false, false);
+    this._drawText(this._processor.tract.length * 0.7, 0.9, "cavity", false, false);
+
+    this._drawAmplitudes();
+
+    this._context.beginPath();
+    this._context.lineWidth = 5;
+    this._context.strokeStyle = "#C070C6";
+    this._context.lineJoin = this._context.lineCap = "round";
+    this._moveTo(1, this._processor.tract.diameter[0]);
+    for (let index = 2; index < this._processor.tract.length; index++)
+      this._lineTo(index, this._processor.tract.diameter[index]);
+
+    this._moveTo(1, 0);
+    for (let index = 2; index <= this._processor.tract.nose.start - 2; index++) this._lineTo(index, 0);
+
+    this._moveTo(this._processor.tract.nose.start + velumAngle - 2, 0);
+    for (
+      let index = this._processor.tract.nose.start + Math.ceil(velumAngle) - 2;
+      index < this._processor.tract.length;
+      index++
+    )
+      this._lineTo(index, 0);
+
+    this._context.stroke();
+
+    this._context.beginPath();
+    this._context.lineWidth = 5;
+    this._context.strokeStyle = "#C070C6";
+    this._context.lineJoin = "round";
+
+    this._moveTo(this._processor.tract.nose.start, -this._processor.tract.nose.offset);
+    for (let index = 1; index < this._processor.tract.nose.length; index++)
+      this._lineTo(
+        index + this._processor.tract.nose.start,
+        -this._processor.tract.nose.offset - this._processor.tract.nose.diameter[index] * 0.9
+      );
+
+    this._moveTo(this._processor.tract.nose.start + velumAngle, -this._processor.tract.nose.offset);
+    for (let index = Math.ceil(velumAngle); index < this._processor.tract.nose.length; index++)
+      this._lineTo(index + this._processor.tract.nose.start, -this._processor.tract.nose.offset);
+
+    this._context.stroke();
+
+    this._context.globalAlpha = velum * 5;
+    this._context.beginPath();
+    this._moveTo(this._processor.tract.nose.start - 2, 0);
+    this._lineTo(this._processor.tract.nose.start, -this._processor.tract.nose.offset);
+    this._lineTo(this._processor.tract.nose.start + velumAngle, -this._processor.tract.nose.offset);
+    this._lineTo(this._processor.tract.nose.start + velumAngle - 2, 0);
+    this._context.stroke();
+
+    this._context.fillStyle = "orchid";
+    this._context.font = "20px Arial";
+    this._context.textAlign = "center";
+    this._context.globalAlpha = 0.7;
+    this._drawText(
+      this._processor.tract.length * 0.95,
+      0.8 + 0.8 * this._processor.tract.diameter[this._processor.tract.length - 1],
+      " lip",
+      false,
+      false
+    );
+
+    this._context.globalAlpha = 1;
+    this._context.fillStyle = "black";
+    this._context.textAlign = "left";
+
+    this._drawPositions();
+
+    this._isDrawing = false;
+  }
+
+  _drawCircle(index, diameter, arcRadius) {
+    const angle = this._getAngle(index);
+    const radius = this._getRadius(index, diameter);
+
+    this._context.beginPath();
+    this._context.arc(this._getX(angle, radius), this._getY(angle, radius), arcRadius, 0, 2 * Math.PI);
+    this._context.fill();
+  }
+  _drawTongueControl() {
+    this._context.lineCap = this._context.lineJoin = "round";
+    this._context.strokeStyle = this._context.fillStyle = "#FFEEF5"; // palePink
+    this._context.globalAlpha = 1.0;
+    this._context.beginPath();
+    this._context.lineWidth = 45;
+
+    this._moveTo(this._processor.tract.tongue.range.index.minValue, this._processor.tract.tongue.diameter.minValue); // diameter/2?
+    for (
+      let index = this._processor.tract.tongue.range.index.minValue + 1;
+      index <= this._processor.tract.tongue.range.maxValue;
+      index++
+    ) {
+      this._lineTo(index, this._processor.tract.tongue.range.diameter.minValue);
+    }
+    this._lineTo(this._processor.tract.tongue.range.index.center, this._processor.tract.tongue.range.diameter.maxValue);
+    this._context.closePath();
+    this._context.stroke();
+    this._context.fill();
+
+    this._context.fillStyle = "orchid";
+    this._context.globalAlpha = 0.3;
+
+    [0, -4.25, -8.5, 4.25, 8.5, -6.1, 6.1, 0, 0].forEach((indexOffset, _index) => {
+      const diameter =
+        _index < 5
+          ? this._processor.tract.tongue.range.diameter.minValue
+          : _index < 8
+          ? this._processor.tract.tongue.range.diameter.center
+          : this._processor.tract.tongue.range.diameter.maxValue;
+
+      indexOffset *= this._processor.tract.length / 44;
+
+      this._drawCircle(this._processor.tract.tongue.range.index.center + indexOffset, diameter, 3);
+    });
+
+    const tongueAngle = this._getAngle(this._processor.tract.tongue.index);
+    const tongueRadius = this._getRadius(this._processor.tract.tongue.index, this._processor.tract.tongue.diameter);
+
+    this._context.lineWidth = 4;
+    this._context.strokeStyle = "orchid";
+    this._context.globalAlpha = 0.7;
+    this._context.beginPath();
+    this._context.arc(this._getX(tongueAngle, tongueRadius), this._getY(tongueAngle, tongueRadius), 18, 0, 2 * Math.PI);
+    this._context.stroke();
+    this._context.globalAlpha = 0.15;
+    this._context.fill();
+    this._context.globalAlpha = 1;
+    this._context.fillStyle = "orchid";
+  }
+  _drawAmplitudes() {
+    this._context.strokeStyle = "orchid";
+    this._context.lineCap = "butt";
+    this._context.globalAlpha = 0.3;
+
+    for (let index = 2; index < this._processor.tract.length - 1; index++) {
+      this._context.beginPath();
+      this._context.lineWidth = Math.sqrt(this._processor.tract.amplitude.max[index]) * 3;
+
+      this._moveTo(index, 0);
+      this._lineTo(index, this._processor.tract.diameter[index]);
+
+      this._context.stroke();
+    }
+
+    for (let index = 1; index < this._processor.tract.nose.length - 1; index++) {
+      this._context.beginPath();
+      this._context.lineWidth = Math.sqrt(this._processor.tract.nose.amplitude.max[index]) * 3;
+
+      this._moveTo(this._processor.tract.nose.start + index, -this._processor.tract.nose.offset);
+      this._lineTo(
+        this._processor.tract.nose.start + index,
+        -this._processor.tract.nose.offset - this._processor.tract.nose.diameter[index] * 0.9
+      );
+
+      this._context.stroke();
+    }
+
+    this._context.globalAlpha = 1;
+  }
+  _drawPositions() {
+    this._context.fillStyle = "orchid";
+    this._context.font = "24px Arial";
+    this._context.textAlign = "center";
+    this._context.globalAlpha = 0.6;
+
+    [
+      [15, 0.6, "æ"], // pat
+      [13, 0.27, "a"], // part
+      [12, 0, "ɒ"], // pot
+      [17.7, 0.05, "(ɔ)"], // port (rounded)
+      [27, 0.65, "ɪ"], // pit
+      [27.4, 0.21, "i"], // peat
+      [20, 1.0, "e"], // pet
+      [18.1, 0.37, "ʌ"], // putt
+      [23, 0.1, "(u)"], // poot (rounded)
+      [21, 0.6, "ə"], // pert [should be ɜ]
+    ].forEach((position) => {
+      const angle = position[0];
+      const radius = position[1] * 1.5 + 2;
+      const phoneme = position[2];
+      this._drawText(angle, radius, phoneme, false);
+    });
+
+    this._context.globalAlpha = 0.8;
+
+    const approximants = 1.1;
+    this._drawText(38, approximants, "l", false);
+    this._drawText(41, approximants, "w", false);
+
+    this._drawText(4.5, 0.37, "h", false);
+
+    // setting up phoneme stuff
+    const phonemes = this._parameters.intensity > 0 ? ["ʒ", "z", "v", "g", "d", "b"] : ["ʃ", "s", "f", "k", "t", "p"];
+    phonemes.push("ŋ", "n", "m");
+
+    const fricatives = 0.3;
+    const stops = -0.4;
+    const nasals = -1.1;
+    [31.5, 36, 41, 22, 36, 41, 22, 36, 41].forEach((angle, _index) => {
+      const radius = _index < 4 ? fricatives : _index < 6 ? stops : nasals;
+
+      this._drawText(angle, radius, phonemes[_index], false);
+    });
+  }
+
+  _drawText(index, diameter, text, isStraight = true, normalize = true) {
+    if (normalize) {
+      index *= this._processor.tract.length / 44;
+    }
+    const angle = this._getAngle(index);
+    const radius = this._getRadius(index, diameter);
+
+    this._context.save();
+    this._context.translate(this._getX(angle, radius), this._getY(angle, radius) + 2);
+
+    if (!isStraight) this._context.rotate(angle - Math.PI / 2);
+
+    this._context.fillText(text, 0, 0);
+    this._context.restore();
+  }
+  _moveTo(index, diameter) {
+    this.__to(index, diameter, true);
+  }
+  _lineTo(index, diameter) {
+    this.__to(index, diameter, false);
+  }
+  __to(index, diameter, moveTo = true) {
+    const wobble = this._getWobble(index);
+    const angle = this._getAngle(index, diameter) + wobble;
+    const radius = this._getRadius(index, diameter) + 100 * wobble;
+
+    const x = this._getX(angle, radius);
+    const y = this._getY(angle, radius);
+
+    if (moveTo) this._context.moveTo(x, y);
+    else this._context.lineTo(x, y);
+  }
+
+  _getX(angle, radius) {
+    return this._tract.origin.x - radius * Math.cos(angle);
+  }
+  _getY(angle, radius) {
+    return this._tract.origin.y - radius * Math.sin(angle);
+  }
+
+  _getAngle(index) {
+    const angle =
+      this._tract.angle.offset + (index * this._tract.angle.scale * Math.PI) / (this._processor.tract.lip.start - 1);
+    return angle;
+  }
+  _getWobble(index) {
+    var wobble =
+      this._processor.tract.amplitude.max[this._processor.tract.length - 1] +
+      this._processor.tract.nose.amplitude.max[this._processor.tract.nose.length - 1];
+    wobble *= (0.03 * Math.sin(2 * index - 50 * (Date.now() / 1000)) * index) / this._processor.tract.length;
+    return wobble;
+  }
+  _getRadius(index, diameter) {
+    var radius = this._tract.radius - this._tract.scale * diameter;
+
+    return radius;
+  }
+
+  _getIndex(x, y) {
+    var angle = Math.atan2(y, x);
+    while (angle > 0) angle -= 2 * Math.PI;
+
+    const index =
+      ((Math.PI + angle - this._tract.angle.offset) * (this._processor.tract.lip.start - 1)) /
+      (this._tract.angle.scale * Math.PI);
+    return index;
+  }
+  _getDiameter(x, y) {
+    const diameter = (this._tract.radius - Math.sqrt(Math.pow(x, 2) + Math.pow(y, 2))) / this._tract.scale;
+    return diameter;
+  }
+
+  _isNearTongue(index, diameter) {
+    var isTongue = true;
+    isTongue =
+      isTongue &&
+      this._processor.tract.tongue.range.index.minValue - 4 <= index &&
+      index <= this._processor.tract.tongue.range.index.maxValue + 4;
+    isTongue =
+      isTongue &&
+      this._processor.tract.tongue.range.diameter.minValue - 0.5 <= diameter &&
+      diameter <= this._processor.tract.tongue.range.diameter.maxValue + 0.5;
+    return isTongue;
+  }
+
+  _getEventX(event) {
+    const x = (event.pageX - event.target.offsetLeft) * this._tract.scalar - this._tract.origin.x;
+    return x;
+  }
+  _getEventY(event) {
+    const y = (event.pageY - event.target.offsetTop) * this._tract.scalar - this._tract.origin.y;
+    return y;
+  }
+
+  _getEventPosition(event) {
+    const x = this._getEventX(event);
+    const y = this._getEventY(event);
+
+    return {
+      index: this._getIndex(x, y),
+      diameter: this._getDiameter(x, y),
+    };
+  }
+
+  _setTongue(event, position) {
+    Object.keys(position).forEach((parameterNameSuffix) => {
+      event.target.dispatchEvent(
+        new CustomEvent("setParameter", {
+          bubbles: true,
+          detail: {
+            parameterName: "tongue." + parameterNameSuffix,
+            newValue: position[parameterNameSuffix],
+          },
+        })
+      );
+    });
+  }
+
+  _startEvent(event) {
+    const touchIdentifier = event instanceof Touch ? event.identifier : -1;
+    if (this._touchConstrictionIndices[touchIdentifier] == undefined) {
+      const position = this._getEventPosition(event);
+      const isNearTongue = this._isNearTongue(position.index, position.diameter);
+      if (isNearTongue) {
+        this._touchConstrictionIndices[touchIdentifier] = -1;
+        this._setTongue(event, position);
+      } else {
+        event.target.dispatchEvent(
+          new CustomEvent("newConstriction", {
+            bubbles: true,
+            detail: {
+              touchIdentifier: touchIdentifier,
+              index: position.index,
+              diameter: position.diameter,
+            },
+          })
+        );
+      }
+    }
+  }
+  _moveEvent(event) {
+    const touchIdentifier = event instanceof Touch ? event.identifier : -1;
+
+    if (this._touchConstrictionIndices[touchIdentifier] !== undefined) {
+      const position = this._getEventPosition(event);
+      const constrictionIndex = this._touchConstrictionIndices[touchIdentifier];
+      const isTongue = constrictionIndex == -1;
+
+      if (isTongue) {
+        this._setTongue(event, position);
+      } else {
+        event.target.dispatchEvent(
+          new CustomEvent("setConstriction", {
+            bubbles: true,
+            detail: {
+              constrictionIndex: constrictionIndex,
+              index: position.index,
+              diameter: position.diameter,
+            },
+          })
+        );
+      }
+    }
+  }
+  _endEvent(event) {
+    const touchIdentifier = event instanceof Touch ? event.identifier : -1;
+
+    if (this._touchConstrictionIndices[touchIdentifier] !== undefined) {
+      const constrictionIndex = this._touchConstrictionIndices[touchIdentifier];
+      const isTongue = constrictionIndex == -1;
+
+      if (isTongue) ; else {
+        event.target.dispatchEvent(
+          new CustomEvent("removeConstriction", {
+            bubbles: true,
+            detail: {
+              constrictionIndex: constrictionIndex,
+              touchIdentifier: touchIdentifier,
+            },
+          })
+        );
+      }
+
+      this._touchConstrictionIndices[touchIdentifier] = undefined;
+    }
+  }
+}
+
+/*
+    TODO        
+        throttle value setter
+        set actual frequency range
+*/
+
+Math.clamp = function(value, min = 0, max = 1) {
+    return value < min?
+        min :
+        value < max?
+            value :
+            max;
+};
+
+class GlottisUI {
+    constructor() {
+        this._frequency = {
+            min : 20,
+            max : 1000,
+            get range() {
+                return (this.max - this.min);
+            },
+
+            interpolate(interpolation) {
+                return this.min + (this.range * interpolation);
+            },
+        };
+        
+        this._isActive = false;
+        this._alwaysVoice = true;
+
+        this._container = document.createElement("div");
+            this._container.style.border = "solid red 1px";
+            this._container.style.backgroundColor = "pink";
+            this._container.style.borderRadius = "20px";
+        
+        this._slider = document.createElement("div");
+            this._slider.style.position = "relative";
+            this._slider.style.flex = 0;
+            this._slider.style.width = "20px";
+            this._slider.style.height = "20px";
+            this._slider.style.borderRadius = "20px";
+            this._slider.style.border = "solid red 5px";
+            this._slider.style.top = "50%";
+            this._slider.style.left = "50%";
+        this._container.appendChild(this._slider);
+
+        // EventListeners for setting the Parameters
+        this._container.addEventListener("mousedown", event => {
+            this._isActive = true;
+            this._eventCallback(event);
+
+            if(!this._alwaysVoice)
+                this._container.dispatchEvent(new CustomEvent("setParameter", {
+                    bubbles : true,
+                    detail : {
+                        parameterName : "intensity",
+                        newValue : 1,
+                        // type : "linear"
+                        // time : ?
+                    },
+                }));
+        });
+        this._container.addEventListener("mousemove", event => {
+            this._eventCallback(event);
+        });
+        this._container.addEventListener("mouseup", event => {
+            this._isActive = false;
+
+            if(this._alwaysVoice == false)
+                this._container.dispatchEvent(new CustomEvent("setParameter", {
+                    bubbles : true,
+                    detail : {
+                        parameterName : "intensity",
+                        newValue : 0,
+                        // type : "linear"
+                        // time : ?
+                    },
+                }));
+        });
+
+        this._container.addEventListener("touchstart", event => {
+            event.preventDefault();
+
+            if(!this._isActive) {
+                this._isActive = true;
+                const touch = event.changedTouches[0];
+                this._touchIdentifier = touch.identifier;
+                this._eventCallback(touch);
+
+                if(!this._alwaysVoice)
+                    this._container.dispatchEvent(new CustomEvent("setParameter", {
+                        bubbles : true,
+                        detail : {
+                            parameterName : "intensity",
+                            newValue : 1,
+                            // type : "linear"
+                            // time : ?
+                        },
+                    }));
+            }
+        });
+        this._container.addEventListener("touchmove", event => {
+            event.preventDefault();
+
+            const touch = Array.from(event.changedTouches).find(touch => touch.identifier == this._touchIdentifier);
+            
+            if(touch !== undefined)
+                this._eventCallback(touch);
+        });
+        this._container.addEventListener("touchend", event => {
+            event.preventDefault();
+
+            if(this._isActive &&Array.from(event.changedTouches).some(touch => touch.identifier == this._touchIdentifier)) {
+                this._isActive = false;
+                this._touchIdentifier = -1;
+            }
+
+            if(!this._alwaysVoice)
+                this._container.dispatchEvent(new CustomEvent("setParameter", {
+                    bubbles : true,
+                    detail : {
+                        parameterName : "intensity",
+                        newValue : 0,
+                        // type : "linear"
+                        // time : ?
+                    },
+                }));
+        });
+
+        this._container.addEventListener("message", event => {
+            if(event.detail.type == "toggleButton") {
+                if(event.detail.parameterName == "voice") {
+                    this._alwaysVoice = event.detail.newValue == "true";
+                }
+            }
+        });
+
+
+        // Observe AnimationFrame
+        const mutationObserver = new MutationObserver((mutationsList, observer) => {
+            if(document.contains(this._container)) {
+
+                const customEvent = new CustomEvent("requestAnimationFrame", {
+                    bubbles : true,
+                });
+                this._container.dispatchEvent(customEvent);
+
+                observer.disconnect();
+            }
+        });
+        mutationObserver.observe(document.body, {
+            subtree : true,
+            childList : true,
+        });
+
+
+        // AnimationFrame EventListener
+        this._container.addEventListener("animationFrame", event => {
+            ["frequency", "tenseness"].forEach(parameterName => {
+                const customEvent = new CustomEvent("getParameter", {
+                    bubbles : true,
+                    detail : {
+                        parameterName : parameterName,
+                        render : true,
+                    },
+                });
+                event.target.dispatchEvent(customEvent);
+            });
+        });
+
+
+        // EventListeners for Getting Parameters
+        this._container.addEventListener("didGetParameter", event => {
+            if(event.detail.render == true) {
+                const parameterName = event.detail.parameterName;
+                const value = event.detail.value;
+
+                if(["frequency", "tenseness"].includes(parameterName)) {
+                    var interpolation;
+
+                    if(parameterName == "frequency") {
+                        interpolation = Math.clamp(((value-this._frequency.min)/this._frequency.range));
+                        this._slider.style.left = interpolation * this._container.offsetWidth - (this._slider.offsetWidth/2);
+                    }
+                    else {
+                        interpolation = 1 - ((Math.acos(1 - value) / (Math.PI*0.5)));
+                        this._slider.style.top = interpolation * this._container.offsetHeight - (this._slider.offsetHeight/2);
+                    }
+                }    
+            }
+            
+        });
+    }
+
+    get node() {
+        return this._container;
+    }
+
+    _eventCallback(event) {
+        if(this._isActive) {
+            const interpolation = {
+                vertical : Math.clamp((event.pageY - this._container.offsetTop)/this._container.offsetHeight, 0, 0.99),
+                horizontal : Math.clamp((event.pageX - this._container.offsetLeft)/this._container.offsetWidth, 0, 0.99),
+            };
+
+            const frequency = this._frequency.interpolate(interpolation.horizontal);
+            const tenseness = 1 - Math.cos((1 - interpolation.vertical) * Math.PI * 0.5);
+            const loudness = Math.pow(tenseness, 0.25);
+
+            const parameters = {
+                frequency : frequency,
+                tenseness : tenseness,
+                loudness : loudness,
+            };
+            
+            Object.keys(parameters).forEach(parameterName => {
+                this._container.dispatchEvent(new CustomEvent("setParameter", {
+                    bubbles : true,
+                    detail : {
+                        parameterName : parameterName,
+                        newValue : parameters[parameterName],
+                    },
+                }));
+            });
+        }
+    }
+}
+
+/*
+    TODO
+        Toggle phonemes (voice/voiceless/none)
+        refactor button creation
+*/
+
+class ButtonsUI {
+    constructor() {
+        this._container = document.createElement("div");
+        this._container.style.display = "flex";
+        this._container.style.flexDirection = "column";
+
+        this._buttons = {
+            start : this._createButton("start"),
+            wobble : this._createButton("wobble", true, "vibrato.wobble"),
+            voice : this._createButton("voice", true, "intensity"),
+        };
+
+        this._buttons.start.addEventListener("didResume", event => {
+            event.target.parentElement.removeChild(event.target);
+        });
+        this._buttons.start.addEventListener("click", event => {
+            event.target.dispatchEvent(new CustomEvent("resume", {
+                bubbles : true,
+            }));
+
+        });
+    }
+
+    get node() {
+        return this._container;
+    }
+
+    _createButton(buttonName, isParameter = false, parameterPath) {
+        const button = document.createElement("button");
+                button.id = buttonName;
+                button.value = true;
+                button.innerText = (isParameter? "disable":'') + buttonName;
+                button.style.width = "100%";
+                button.style.flex = 1;
+                button.style.margin = "2px";
+                button.style.borderRadius = "20px";
+                button.style.backgroundColor = "pink";
+                button.style.border = "solid red";
+            this._container.appendChild(button);
+
+            if(isParameter) {
+                button.addEventListener("click", event => {
+                    button.value = (button.value == "false");
+
+                    const prefix = (button.value == "true")?
+                        "disable" :
+                        "enable";
+                    button.innerText = prefix + ' ' + button.id;
+                    
+                    button.dispatchEvent(new CustomEvent("setParameter", {
+                        bubbles : true,
+                        detail : {
+                            parameterName : parameterPath || buttonName,
+                            newValue : (button.value == "true")? 1:0,
+                        }
+                    }));
+
+                    button.dispatchEvent(new CustomEvent("message", {
+                        bubbles : true,
+                        detail : {
+                            type : "toggleButton",
+                            parameterName : buttonName,
+                            newValue : button.value,
+                        }
+                    }));
+                });
+            }
+        return button;
+    }
+}
+
+/*
+    TODO
+        .setFreqeuncyRange(min, max)
+*/
+
+
+class PinkTromboneUI {
+    constructor() {
+        this._tractUI = new TractUI();
+        this._glottisUI = new GlottisUI();
+        this._buttonsUI = new ButtonsUI();
+
+        this._container = document.createElement("div");
+            this._container.style.height = "100%";
+            this._container.style.width = "100%";
+
+            this._container.style.display = "grid";
+                this._container.style.gridTemplateRows = "auto 200px 100px";
+                this._container.style.gridTemplateColumns = "auto 100px";
+                this._container.style.gridRowGap = "5px";
+
+            this._container.appendChild(this._tractUI.node);
+                this._tractUI.node.id = "tractUI";
+                this._tractUI.node.style.gridColumn = "1 / span 2";
+                this._tractUI.node.style.gridRow = "1 / span 2";
+
+            this._container.appendChild(this._glottisUI.node);
+                this._glottisUI.node.id = "glottisUI";
+                this._glottisUI.node.style.gridColumn = "1 / span 2";
+                this._glottisUI.node.style.gridRow = "3";
+            
+            this._container.appendChild(this._buttonsUI.node);
+                this._buttonsUI.node.id = "buttonsUI";
+                this._buttonsUI.node.style.zIndex = 1;
+                this._buttonsUI.node.style.gridColumn = "2";
+                this._buttonsUI.node.style.gridRow = "2";
+            
+            this._container.addEventListener("message", event => {
+                event.stopPropagation();
+                Array.from(this._container.children).forEach(child => {
+                    if(child !== event.target) {
+                        child.dispatchEvent(new CustomEvent("message", {
+                            detail : event.detail,
+                        }));
+                    }
+                });
+            });
+    }
+
+    get node() {
+        return this._container;
+    }
+
+    show() {
+        this.node.style.display = "grid";
+    }
+    hide() {
+        this.node.style.display = "none";
+    }
+}
+
+/*
+    TODO
+        *
+*/
+
+
+window.AudioContext = window.AudioContext || window.webkitAudioContext;
+
+class PinkTromboneElement extends HTMLElement {
+  constructor() {
+    super();
+
+    this._animationFrameObservers = [];
+
+    window.customElements.whenDefined("pink-trombone").then(() => {
+      // RequestAnimationFrame
+      this.addEventListener("requestAnimationFrame", (event) => {
+        if (!this._animationFrameObservers.includes(event.target)) this._animationFrameObservers.push(event.target);
+
+        const customEvent = new CustomEvent("didRequestAnimationFrame");
+        event.target.dispatchEvent(customEvent);
+
+        event.stopPropagation();
+      });
+
+      this.addEventListener("resume", (event) => {
+        this.audioContext.resume();
+        this.pinkTrombone.start();
+        event.target.dispatchEvent(new CustomEvent("didResume"));
+      });
+
+      // Audio Parameters
+      this.addEventListener("setParameter", (event) => {
+        const parameterName = event.detail.parameterName;
+        const audioParam = parameterName
+          .split(".")
+          .reduce((audioParam, propertyName) => audioParam[propertyName], this.parameters);
+        const newValue = Number(event.detail.newValue);
+
+        switch (event.detail.type) {
+          case "linear":
+            audioParam.linearRampToValueAtTime(newValue, this.audioContext.currentTime + event.detail.timeOffset);
+            break;
+          default:
+            audioParam.value = newValue;
+        }
+
+        event.target.dispatchEvent(
+          new CustomEvent("didSetParameter", {
+            detail: event.detail,
+          })
+        );
+
+        event.stopPropagation();
+      });
+
+      this.addEventListener("getParameter", (event) => {
+        const parameterName = event.detail.parameterName;
+        const audioParam = parameterName
+          .split(".")
+          .reduce((audioParam, propertyName) => audioParam[propertyName], this.parameters);
+
+        const value = audioParam.value;
+
+        const detail = event.detail;
+        detail.value = value;
+
+        event.target.dispatchEvent(
+          new CustomEvent("didGetParameter", {
+            detail: detail,
+          })
+        );
+
+        event.stopPropagation();
+      });
+
+      // Constrictions
+      this.addEventListener("newConstriction", (event) => {
+        const { index, diameter } = event.detail;
+        const constriction = this.newConstriction(index, diameter);
+
+        const detail = event.detail;
+        detail.constrictionIndex = constriction._index;
+        event.target.dispatchEvent(
+          new CustomEvent("didNewConstriction", {
+            detail: detail,
+          })
+        );
+
+        event.stopPropagation();
+      });
+      this.addEventListener("setConstriction", (event) => {
+        const constrictionIndex = Number(event.detail.constrictionIndex);
+        const constriction = this.constrictions[constrictionIndex];
+
+        if (constriction) {
+          const { index, diameter } = event.detail;
+
+          const indexValue = index || constriction.index.value;
+          const diameterValue = diameter || constriction.diameter.value;
+
+          switch (event.detail.type) {
+            case "linear":
+              constriction.index.linearRampToValueAtTime(indexValue, event.detail.endTime);
+              constriction.diameter.linearRampToValueAtTime(diameterValue, event.detail.endTime);
+              break;
+            default:
+              constriction.index.value = indexValue;
+              constriction.diameter.value = diameterValue;
+          }
+
+          event.target.dispatchEvent(new CustomEvent("didSetConstriction"));
+        }
+
+        event.stopPropagation();
+      });
+      this.addEventListener("getConstriction", (event) => {
+        const constrictionIndex = Number(event.detail.constrictionIndex);
+        const constriction = this.constrictions[constrictionIndex];
+
+        event.target.dispatchEvent(
+          new CustomEvent("didGetConstriction", {
+            detail: {
+              index: constriction.index.value,
+              diameter: constriction.diameter.value,
+            },
+          })
+        );
+
+        event.stopPropagation();
+      });
+      this.addEventListener("removeConstriction", (event) => {
+        const constrictionIndex = Number(event.detail.constrictionIndex);
+        const constriction = this.constrictions[constrictionIndex];
+        this.removeConstriction(constriction);
+
+        const detail = event.detail;
+
+        event.target.dispatchEvent(
+          new CustomEvent("didRemoveConstriction", {
+            detail: detail,
+          })
+        );
+
+        event.stopPropagation();
+      });
+
+      this.addEventListener("getProcessor", (event) => {
+        this.getProcessor().then((processor) => {
+          event.target.dispatchEvent(
+            new CustomEvent("didGetProcessor", {
+              detail: {
+                processor: processor,
+              },
+            })
+          );
+        });
+
+        event.stopPropagation();
+      });
+    });
+
+    if (this.getAttribute("UI") !== null) this.enableUI();
+
+    const loadEvent = new Event("load");
+    this.dispatchEvent(loadEvent);
+  }
+
+  enableUI() {
+    if (this.UI == undefined) {
+      this.UI = new PinkTromboneUI();
+      this.appendChild(this.UI.node);
+    }
+
+    this.UI.show();
+  }
+  disableUI() {
+    if (this.UI !== undefined) {
+      this.UI.hide();
+      this.stopUI();
+    }
+  }
+
+  startUI() {
+    if (this.UI !== undefined) {
+      this._isRunning = true;
+      window.requestAnimationFrame((highResTimeStamp) => {
+        this._requestAnimationFrameCallback(highResTimeStamp);
+      });
+    }
+  }
+  stopUI() {
+    this._isRunning = false;
+  }
+
+  // getAttribute getter?
+  static get observedAttributes() {
+    return ["UI"];
+  }
+
+  attributeChangedCallback(name, oldValue, newValue) {
+    switch (name) {
+      case "UI":
+        if (newValue !== null) this.enableUI();
+        else this.disableUI();
+        break;
+    }
+  }
+
+  setAudioContext(audioContext = new window.AudioContext()) {
+    this.pinkTrombone = audioContext.createPinkTrombone();
+
+    this.loadPromise = this.pinkTrombone.loadPromise.then((audioContext) => {
+      this.parameters = this.pinkTrombone.parameters;
+
+      for (let parameterName in this.pinkTrombone.parameters)
+        this[parameterName] = this.pinkTrombone.parameters[parameterName];
+
+      return this.pinkTrombone;
+    });
+    return this.loadPromise;
+  }
+
+  get audioContext() {
+    if (this.pinkTrombone) return this.pinkTrombone.audioContext;
+    else throw "Audio Context has not been set";
+  }
+  set audioContext(audioContext) {
+    this.setAudioContext(audioContext);
+  }
+
+  connect() {
+    if (this.pinkTrombone) return this.pinkTrombone.connect(...arguments);
+  }
+  disconnect() {
+    if (this.pinkTrombone) return this.pinkTrombone.disconnect(...arguments);
+  }
+
+  start() {
+    if (this.pinkTrombone) {
+      this.pinkTrombone.start();
+      this.startUI();
+    } else throw "Pink Trombone hasn't been set yet";
+  }
+  stop() {
+    if (this.pinkTrombone) {
+      this.pinkTrombone.stop();
+      this.stopUI();
+    } else throw "Pink Trombone hasn't been set yet";
+  }
+
+  _requestAnimationFrameCallback(highResTimeStamp) {
+    if (this._isRunning) {
+      this._animationFrameObservers.forEach((element) => {
+        const customEvent = new CustomEvent("animationFrame", {
+          detail: {
+            highResTimeStamp: highResTimeStamp,
+          },
+        });
+        element.dispatchEvent(customEvent);
+      });
+      window.requestAnimationFrame((_highResTimeStamp) =>
+        this._requestAnimationFrameCallback.call(this, _highResTimeStamp)
+      );
+    }
+  }
+
+  // CONSTRICTIONS
+  get constrictions() {
+    return this.pinkTrombone.constrictions;
+  }
+  newConstriction() {
+    return this.pinkTrombone.newConstriction(...arguments);
+  }
+  removeConstriction(constriction) {
+    return this.pinkTrombone.removeConstriction(constriction);
+  }
+
+  getProcessor() {
+    return this.pinkTrombone.getProcessor();
+  }
+}
+
+if (document.createElement("pink-trombone").constructor == HTMLElement) {
+  window.customElements.define("pink-trombone", PinkTromboneElement);
+}
+
+export { PinkTromboneElement as default };
