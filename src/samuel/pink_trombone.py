@@ -244,7 +244,8 @@ def glottis(
 
     # ---- aspiration noise ----
     sn_asp = (0.02 * simplex.simplex1(t * 1.99) + 0.2).unsqueeze(0)
-    noise = noise_param * noise_mod
+    white_noise = torch.randn(B, S, device=device)
+    noise = white_noise * noise_param * noise_mod
     noise = noise * intensity * intensity
     noise = noise * (1 - torch.sqrt(torch.clamp(tenseness, min=1e-10)))
     noise = noise * sn_asp
