@@ -1,0 +1,294 @@
+<html>
+  <head>
+    <script src="./script/component.js" type="module"></script>
+    <style>
+      body { margin: 0; overflow: hidden; }
+
+      pink-trombone { display: block; width: calc(100vw - 290px); height: 100vh; }
+
+      #debug-panel {
+        position: fixed;
+        right: 0;
+        top: 0;
+        width: 290px;
+        height: 100vh;
+        overflow-y: auto;
+        background: rgba(0, 0, 0, 0.88);
+        color: #eee;
+        padding: 10px 12px;
+        font: 12px monospace;
+        box-sizing: border-box;
+        z-index: 200;
+      }
+
+      #debug-panel h3 {
+        margin: 0 0 8px 0;
+        font-size: 13px;
+        color: #adf;
+        border-bottom: 1px solid #444;
+        padding-bottom: 4px;
+      }
+
+      .section-label {
+        color: #fa0;
+        font-size: 11px;
+        margin: 10px 0 4px 0;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+      }
+
+      .param-row {
+        display: flex;
+        align-items: center;
+        margin: 3px 0;
+        gap: 4px;
+      }
+
+      .param-row label {
+        width: 110px;
+        flex-shrink: 0;
+        color: #ccc;
+        font-size: 11px;
+      }
+
+      .param-row input[type="range"] {
+        flex: 1;
+        min-width: 0;
+        height: 14px;
+        accent-color: #adf;
+      }
+
+      .param-row .val {
+        width: 42px;
+        text-align: right;
+        color: #adf;
+        font-size: 11px;
+      }
+
+      .bypass-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 0 10px 0;
+        border-bottom: 1px solid #444;
+        margin-bottom: 4px;
+      }
+
+      .bypass-row label {
+        color: #f88;
+        font-size: 12px;
+        cursor: pointer;
+      }
+
+      .bypass-row input[type="checkbox"] {
+        width: 16px;
+        height: 16px;
+        accent-color: #f88;
+        cursor: pointer;
+      }
+
+      .presets {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+        margin: 6px 0 10px 0;
+        padding-bottom: 10px;
+        border-bottom: 1px solid #444;
+      }
+
+      .presets button {
+        background: #224;
+        color: #adf;
+        border: 1px solid #446;
+        border-radius: 3px;
+        padding: 3px 8px;
+        font: 12px monospace;
+        cursor: pointer;
+      }
+
+      .presets button:hover {
+        background: #336;
+      }
+    </style>
+  </head>
+
+  <body>
+    <div style="position: absolute; left: 0; top: 0; z-index: 100">
+      <button id="toggleMicrophone">enable microphone</button>
+    </div>
+
+    <pink-trombone></pink-trombone>
+
+    <div id="debug-panel">
+      <h3>Pink Trombone Debug</h3>
+
+      <div class="bypass-row">
+        <input type="checkbox" id="bypassTract">
+        <label for="bypassTract">Bypass tract (glottis only)</label>
+      </div>
+
+      <div class="section-label">Vowel presets</div>
+      <div class="presets">
+        <button onclick="setVowel(12.9, 2.43)">ɑ</button>
+        <button onclick="setVowel(27.2, 2.05)">i</button>
+        <button onclick="setVowel(22.8, 2.05)">u</button>
+        <button onclick="setVowel(20.0, 2.3)">ɛ</button>
+        <button onclick="setVowel(17.0, 2.3)">ʌ</button>
+      </div>
+
+      <div class="section-label">Voice</div>
+      <div id="params-voice"></div>
+
+      <div class="section-label">Tongue</div>
+      <div id="params-tongue"></div>
+
+      <div class="section-label">Vibrato</div>
+      <div id="params-vibrato"></div>
+
+      <div class="section-label">Tract</div>
+      <div id="params-tract"></div>
+
+      <div class="section-label">Constriction</div>
+      <div id="params-constriction"></div>
+    </div>
+
+    <script>
+      const pinkTromboneElement = document.querySelector("pink-trombone");
+
+      // Parameter definitions: [name, min, max, default, step, jsPath, container]
+      const PARAMS = [
+        // Voice
+        { name: "noise",          min: -1,    max: 1,    def: 0.1,  step: 0.01,  path: p => p.noise,                    set: (p,v) => { p.noise.value = v; },            container: "params-voice" },
+        { name: "frequency",      min: 50,    max: 500,  def: 350,  step: 1,     path: p => p.frequency,                set: (p,v) => { p.frequency.value = v; },        container: "params-voice" },
+        { name: "tenseness",      min: 0,     max: 1,    def: 0.6,  step: 0.01,  path: p => p.tenseness,                set: (p,v) => { p.tenseness.value = v; },        container: "params-voice" },
+        { name: "intensity",      min: 0,     max: 1,    def: 1.0,  step: 0.01,  path: p => p.intensity,                set: (p,v) => { p.intensity.value = v; },        container: "params-voice" },
+        { name: "loudness",       min: 0,     max: 1,    def: 1.0,  step: 0.01,  path: p => p.loudness,                 set: (p,v) => { p.loudness.value = v; },         container: "params-voice" },
+        // Tongue
+        { name: "tongueIndex",    min: 5,     max: 35,   def: 12.9, step: 0.1,   path: p => p.tongue.index,             set: (p,v) => { p.tongue.index.value = v; },     container: "params-tongue" },
+        { name: "tongueDiameter", min: 2.05,  max: 3.5,  def: 2.43, step: 0.01,  path: p => p.tongue.diameter,          set: (p,v) => { p.tongue.diameter.value = v; },  container: "params-tongue" },
+        // Vibrato
+        { name: "vibratoWobble",  min: 0,     max: 1,    def: 0.0,  step: 0.01,  path: p => p.vibrato.wobble,           set: (p,v) => { p.vibrato.wobble.value = v; },   container: "params-vibrato" },
+        { name: "vibratoFreq",    min: 0,     max: 20,   def: 6.0,  step: 0.1,   path: p => p.vibrato.frequency,        set: (p,v) => { p.vibrato.frequency.value = v; },container: "params-vibrato" },
+        { name: "vibratoGain",    min: 0,     max: 0.1,  def: 0.0,  step: 0.001, path: p => p.vibrato.gain,             set: (p,v) => { p.vibrato.gain.value = v; },     container: "params-vibrato" },
+        // Tract
+        { name: "tractLength",    min: 15,    max: 88,   def: 44,   step: 1,     path: p => p.tractLength,              set: (p,v) => { p.tractLength.value = v; },      container: "params-tract" },
+        // Constriction (uses c0, set after init)
+        { name: "constrIndex",    min: 0,     max: 44,   def: 25.0, step: 0.1,   path: null,                            set: null,                                       container: "params-constriction", isConstrIndex: true },
+        { name: "constrDiam",     min: -1,    max: 3,    def: 2.0,  step: 0.01,  path: null,                            set: null,                                       container: "params-constriction", isConstrDiam: true },
+      ];
+
+      let _params = null;
+      let _c0 = null;
+
+      // Build slider rows before audio is ready (disabled until ready)
+      const sliders = {};
+      PARAMS.forEach(p => {
+        const container = document.getElementById(p.container);
+        const row = document.createElement("div");
+        row.className = "param-row";
+
+        const label = document.createElement("label");
+        label.textContent = p.name;
+
+        const slider = document.createElement("input");
+        slider.type = "range";
+        slider.min = p.min;
+        slider.max = p.max;
+        slider.step = p.step;
+        slider.value = p.def;
+        slider.disabled = true;
+
+        const val = document.createElement("span");
+        val.className = "val";
+        val.textContent = p.def.toFixed(p.step < 0.01 ? 3 : p.step < 0.1 ? 2 : p.step < 1 ? 1 : 0);
+
+        slider.oninput = () => {
+          const v = parseFloat(slider.value);
+          val.textContent = v.toFixed(p.step < 0.01 ? 3 : p.step < 0.1 ? 2 : p.step < 1 ? 1 : 0);
+          if (!_params) return;
+          if (p.isConstrIndex && _c0) { _c0.index.value = v; }
+          else if (p.isConstrDiam && _c0) { _c0.diameter.value = v; }
+          else if (p.set) { p.set(_params, v); }
+        };
+
+        row.appendChild(label);
+        row.appendChild(slider);
+        row.appendChild(val);
+        container.appendChild(row);
+
+        sliders[p.name] = { slider, val, p };
+      });
+
+      // Bypass tract checkbox
+      const bypassCheckbox = document.getElementById("bypassTract");
+      bypassCheckbox.disabled = true;
+      bypassCheckbox.onchange = () => {
+        if (!_params) return;
+        _params.bypassTract.value = bypassCheckbox.checked ? 1 : 0;
+      };
+
+      // Vowel preset helper (called from buttons)
+      window.setVowel = (tongueIndex, tongueDiameter) => {
+        if (!_params) return;
+        _params.tongue.index.value = tongueIndex;
+        _params.tongue.diameter.value = tongueDiameter;
+        // Sync sliders
+        const ti = sliders["tongueIndex"];
+        ti.slider.value = tongueIndex;
+        ti.val.textContent = tongueIndex.toFixed(1);
+        const td = sliders["tongueDiameter"];
+        td.slider.value = tongueDiameter;
+        td.val.textContent = tongueDiameter.toFixed(2);
+      };
+
+      pinkTromboneElement.addEventListener("load", () => {
+        pinkTromboneElement.setAudioContext().then((pinkTrombone) => {
+          pinkTromboneElement.enableUI();
+          pinkTromboneElement.startUI();
+          pinkTromboneElement.connect(pinkTromboneElement.audioContext.destination);
+          window.audioContext = pinkTromboneElement.audioContext;
+
+          _params = pinkTromboneElement.parameters;
+          _c0 = pinkTromboneElement.newConstriction(25, 2);
+
+          // Apply defaults and enable all sliders
+          PARAMS.forEach(p => {
+            const { slider, val } = sliders[p.name];
+            slider.disabled = false;
+            const v = p.def;
+            if (p.isConstrIndex) { _c0.index.value = v; }
+            else if (p.isConstrDiam) { _c0.diameter.value = v; }
+            else if (p.set) { p.set(_params, v); }
+          });
+
+          bypassCheckbox.disabled = false;
+        });
+      });
+    </script>
+
+    <script>
+      // Microphone support (same as index.html)
+      var mediaStream;
+      var mediaStreamSourceNode;
+      const toggleMicrophoneButton = document.getElementById("toggleMicrophone");
+      toggleMicrophoneButton.addEventListener("click", async () => {
+        if (mediaStream) {
+          mediaStream.getTracks().forEach(t => t.stop());
+          mediaStream = undefined;
+          mediaStreamSourceNode?.disconnect();
+          mediaStreamSourceNode = undefined;
+          toggleMicrophoneButton.innerText = "enable microphone";
+          pinkTromboneElement.pinkTrombone._fricativeFilter.connect(pinkTromboneElement.pinkTrombone._pinkTromboneNode.noise);
+          pinkTromboneElement.pinkTrombone._aspirateFilter.connect(pinkTromboneElement.pinkTrombone._pinkTromboneNode.noise);
+        } else {
+          mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { autoGainControl: false, noiseSuppression: false, echoCancellation: false } });
+          mediaStreamSourceNode = audioContext.createMediaStreamSource(mediaStream);
+          mediaStreamSourceNode.connect(pinkTromboneElement.pinkTrombone._pinkTromboneNode);
+          pinkTromboneElement.pinkTrombone._fricativeFilter.disconnect();
+          pinkTromboneElement.pinkTrombone._aspirateFilter.disconnect();
+          toggleMicrophoneButton.innerText = "disable microphone";
+        }
+      });
+    </script>
+  </body>
+</html>

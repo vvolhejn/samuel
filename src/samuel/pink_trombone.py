@@ -168,7 +168,7 @@ def _upsample_params(params: Tensor) -> Tensor:
 # ---------------------------------------------------------------------------
 
 
-def _glottis(
+def glottis(
     noise_param: Tensor,  # [B, S]
     frequency: Tensor,
     tenseness: Tensor,
@@ -486,8 +486,10 @@ def _tract(
     nose_left = torch.zeros(B, M, device=device, dtype=glottis_out.dtype)
 
     outputs = []
+    zeros_turb = torch.zeros(B, N, device=device, dtype=glottis_out.dtype)
     for s in range(S):
-        right, left, nose_right, nose_left, out = _waveguide_step(
+        # First pass: inject glottis + turbulence
+        right, left, nose_right, nose_left, out1 = _waveguide_step(
             right,
             left,
             nose_right,
@@ -503,7 +505,24 @@ def _tract(
             M,
             ns,
         )
-        outputs.append(out)
+        # Second pass: same glottis input, no additional turbulence (matches JS double-pass)
+        right, left, nose_right, nose_left, out2 = _waveguide_step(
+            right,
+            left,
+            nose_right,
+            nose_left,
+            glottis_out[:, s],
+            r[:, s, :],
+            r_L[:, s],
+            r_R[:, s],
+            r_N[:, s],
+            nose_r,
+            zeros_turb,
+            N,
+            M,
+            ns,
+        )
+        outputs.append(out1 + out2)
 
     return torch.stack(outputs, dim=1) * 0.125  # [B, S]
 
@@ -513,7 +532,7 @@ def _tract(
 # ---------------------------------------------------------------------------
 
 
-def pink_trombone(params: Tensor) -> Tensor:
+def pink_trombone(params: Tensor, seed: int | None = None) -> Tensor:
     """Differentiable Pink Trombone vocal synthesizer.
 
     Args:
@@ -529,12 +548,15 @@ def pink_trombone(params: Tensor) -> Tensor:
     B, T, P = params.shape
     assert P == N_PARAMS, f"Expected {N_PARAMS} parameters, got {P}"
 
-    simplex = SimplexNoise(device=params.device)
+    if seed is None:
+        seed = torch.randint(0, 2**31, (1,)).item()
+
+    simplex = SimplexNoise(device=params.device, seed=seed)
     params_up = _upsample_params(params)  # [B, T*1920, P]
 
     p = {name: params_up[..., i] for i, name in enumerate(PARAM_NAMES)}
 
-    glottis_out, noise_mod = _glottis(
+    glottis_out, noise_mod = glottis(
         noise_param=p["noise"],
         frequency=p["frequency"],
         tenseness=p["tenseness"],

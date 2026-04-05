@@ -1,5 +1,3 @@
-import math
-
 import pytest
 import torch
 
@@ -9,8 +7,8 @@ from samuel.pink_trombone import (
     SAMPLE_RATE,
     SAMPLES_PER_FRAME,
     SimplexNoise,
-    _glottis,
     _upsample_params,
+    glottis,
     pink_trombone,
 )
 
@@ -131,13 +129,13 @@ class TestGlottis:
 
     def test_output_shape(self):
         params = self._default_params(B=2, S=4800)
-        out, noise_mod = _glottis(**params)
+        out, noise_mod = glottis(**params)
         assert out.shape == (2, 4800)
         assert noise_mod.shape == (2, 4800)
 
     def test_output_finite(self):
         params = self._default_params()
-        out, noise_mod = _glottis(**params)
+        out, noise_mod = glottis(**params)
         assert torch.isfinite(out).all(), (
             f"Non-finite glottis output: {out[~torch.isfinite(out)]}"
         )
@@ -146,13 +144,13 @@ class TestGlottis:
     def test_not_silent(self):
         """With default params (intensity=1, loudness=1, freq=140), output should be non-zero."""
         params = self._default_params(S=SAMPLE_RATE)  # 1 second
-        out, _ = _glottis(**params)
+        out, _ = glottis(**params)
         assert out.abs().max() > 0.01
 
     def test_silent_at_zero_intensity(self):
         params = self._default_params()
         params["intensity"] = torch.zeros_like(params["intensity"])
-        out, _ = _glottis(**params)
+        out, _ = glottis(**params)
         assert out.abs().max() < 1e-6
 
     def test_frequency_affects_pitch(self):
@@ -168,8 +166,8 @@ class TestGlottis:
         params_hi["vibrato_gain"] = torch.zeros(1, S)
         params_hi["vibrato_wobble"] = torch.zeros(1, S)
 
-        out_lo, _ = _glottis(**params_lo)
-        out_hi, _ = _glottis(**params_hi)
+        out_lo, _ = glottis(**params_lo)
+        out_hi, _ = glottis(**params_hi)
 
         def count_zero_crossings(x):
             signs = torch.sign(x[0])
@@ -193,8 +191,8 @@ class TestGlottis:
         params_tense["vibrato_gain"] = torch.zeros(1, S)
         params_tense["vibrato_wobble"] = torch.zeros(1, S)
 
-        out_breathy, _ = _glottis(**params_breathy)
-        out_tense, _ = _glottis(**params_tense)
+        out_breathy, _ = glottis(**params_breathy)
+        out_tense, _ = glottis(**params_tense)
         assert not torch.allclose(out_breathy, out_tense, atol=1e-3)
 
     def test_loudness_scales_linearly(self):
@@ -209,8 +207,8 @@ class TestGlottis:
         params_half["vibrato_gain"] = torch.zeros(1, S)
         params_half["vibrato_wobble"] = torch.zeros(1, S)
 
-        out1, _ = _glottis(**params1)
-        out_half, _ = _glottis(**params_half)
+        out1, _ = glottis(**params1)
+        out_half, _ = glottis(**params_half)
         # With noise_param=0, output is purely voice, which scales with loudness
         # voice *= intensity * loudness, then output = voice * intensity
         # So out1 = voice * 1 * 1 * 1, out_half = voice * 1 * 0.5 * 1
@@ -224,7 +222,7 @@ class TestGlottis:
         inten = torch.ones(1, S, requires_grad=True)
         loud = torch.ones(1, S, requires_grad=True)
 
-        out, _ = _glottis(
+        out, _ = glottis(
             noise_param=torch.zeros(1, S),
             frequency=freq,
             tenseness=tens,
@@ -252,7 +250,7 @@ class TestGlottis:
         params["frequency"][0] = 100.0
         params["frequency"][1] = 200.0
 
-        out, _ = _glottis(**params)
+        out, _ = glottis(**params)
         assert not torch.allclose(out[0], out[1], atol=1e-3)
 
     def test_aspiration_noise(self):
@@ -262,8 +260,8 @@ class TestGlottis:
         params_with_noise = self._default_params(S=S)
         params_with_noise["noise_param"] = torch.ones(1, S)
 
-        out_clean, _ = _glottis(**params_no_noise)
-        out_noisy, _ = _glottis(**params_with_noise)
+        out_clean, _ = glottis(**params_no_noise)
+        out_noisy, _ = glottis(**params_with_noise)
         assert not torch.allclose(out_clean, out_noisy, atol=1e-3)
 
 

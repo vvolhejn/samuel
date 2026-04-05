@@ -22,6 +22,10 @@ class Processor {
             parameterSamples.glottis = glottisSample;
         }
 
+        if (parameterSamples.bypassTract >= 0.5) {
+            return inputSamples ? 0 : parameterSamples.glottis * 0.125;
+        }
+
         outputSample += this.tract.process(...arguments);
         sampleIndex += 0.5; // process twice - note the "...arguments" doesn't read this
         outputSample += this.tract.process(inputSamples, parameterSamples, sampleIndex, bufferLength, seconds);

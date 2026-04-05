@@ -64,6 +64,13 @@ const ParameterDescriptors = [
     minValue: 15,
     maxValue: 88,
   },
+
+  {
+    name: "bypassTract",
+    defaultValue: 0,
+    minValue: 0,
+    maxValue: 1,
+  },
 ];
 
 ParameterDescriptors.numberOfConstrictions = 4;
