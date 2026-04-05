@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-SAMPLE_RATE = 24000
+SAMPLE_RATE = 44100
 CONTROL_RATE = 12.5
 SAMPLES_PER_FRAME = int(SAMPLE_RATE / CONTROL_RATE)  # 1920
 BLOCK_SIZE = 128
