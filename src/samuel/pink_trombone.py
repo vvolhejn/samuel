@@ -640,11 +640,16 @@ def _compute_batch_irs_eig(
     and velum logic never gets duplicated.
 
     Numerical notes:
-    - Uses complex64. 0.999-per-pass damping keeps |λ| ≤ 0.998; at L=4096,
-      |λ|^L ≈ 3e-4, safely above underflow.
-    - `torch.linalg.eig` backward can be ill-conditioned when eigenvalues
-      cluster (near-coincident formants). Fine for forward use; training
-      gradients may need `_compute_batch_irs` as a fallback.
+    - Uses complex128 for the eig path. The waveguide routinely produces
+      eigenvalues that differ by ~1e-8 (due to near-symmetric geometry), which
+      is at the edge of complex64 precision and causes `torch.linalg.eig`
+      backward to return NaN on those frames. complex128 has ~1e-15 precision,
+      so the gap is huge and gradients are clean.
+    - 0.999-per-pass damping keeps |λ| ≤ 0.998; |λ|^4096 ≈ 3e-4, no underflow
+      concerns.
+    - Even with complex128, eig backward is less robust than the sequential
+      path when eigenvalues are very nearly exactly equal. If training becomes
+      unstable, fall back to `_compute_batch_irs`.
     """
     BT = r.shape[0]
     N = r.shape[1]
@@ -774,20 +779,17 @@ def _compute_batch_irs_eig(
     c_col = c.view(1, d, 1).expand(BT, d, 1)  # [BT, d, 1]
     c_tilde = ((A_step + A_full).transpose(-1, -2) @ c_col).squeeze(-1)  # [BT, d]
 
-    # --- Step 5: eigendecomposition and closed-form IR ---
-    A_full_c = A_full.to(torch.complex64)
+    # --- Step 5: eigendecomposition and closed-form IR (complex128) ---
+    cdtype = torch.complex128
+    A_full_c = A_full.to(cdtype)
     evals, evecs = torch.linalg.eig(A_full_c)  # [BT, d], [BT, d, d]
 
-    alpha = torch.linalg.solve(evecs, b_full.to(torch.complex64).unsqueeze(-1)).squeeze(
-        -1
-    )  # V⁻¹ b_full, [BT, d]
-    beta = (c_tilde.to(torch.complex64).unsqueeze(-2) @ evecs).squeeze(-2)  # c̃ᵀ V
+    alpha = torch.linalg.solve(evecs, b_full.to(cdtype).unsqueeze(-1)).squeeze(-1)
+    beta = (c_tilde.to(cdtype).unsqueeze(-2) @ evecs).squeeze(-2)  # c̃ᵀ V
     residues = alpha * beta  # [BT, d]  (complex)
 
     # Powers λ^0 ... λ^(L-2)  → [BT, d, L-1]
-    exponents = torch.arange(L - 1, device=device, dtype=torch.float32).to(
-        torch.complex64
-    )
+    exponents = torch.arange(L - 1, device=device, dtype=torch.float64).to(cdtype)
     powers = evals.unsqueeze(-1) ** exponents
     ir_tail = (residues.unsqueeze(-1) * powers).sum(-2).real.to(dtype)  # [BT, L-1]
 

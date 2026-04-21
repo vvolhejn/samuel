@@ -498,13 +498,16 @@ class TestComputeBatchIrsEig:
     def test_gradient_matches_glottis(self):
         """Backward pass: ∂loss/∂r must agree between the two implementations.
 
-        Uses a short L to keep eig backward well-conditioned. Tolerance is looser
-        than forward because `torch.linalg.eig` backward is less numerically
-        stable than forward (especially when eigenvalues cluster).
+        Exercised at BT=17 and L=4096 — realistic full-clip dimensions and the
+        regime where the eig formulation must be run in complex128 to keep
+        gradients clean (complex64 underflows on the ~1e-8 eigenvalue gaps the
+        near-symmetric waveguide geometry produces, giving NaN grads on some
+        frames). Tolerance is looser than forward since eig backward still has
+        more noise than the sequential path.
         """
-        r0, r_L, r_R, r_N = self._realistic_coefs(BT=2, seed=2)
-        L = 256
-        inject_pos = torch.zeros(2, dtype=torch.long)
+        r0, r_L, r_R, r_N = self._realistic_coefs(BT=17, seed=0)
+        L = 4096
+        inject_pos = torch.zeros(17, dtype=torch.long)
 
         def grad_of(impl):
             r = r0.clone().requires_grad_(True)
