@@ -7,6 +7,12 @@ from samuel.pink_trombone import (
     SAMPLE_RATE,
     SAMPLES_PER_FRAME,
     SimplexNoise,
+    _NOSE_R_CPU,
+    _NOSE_START,
+    _TRACT_N,
+    _compute_batch_irs,
+    _compute_batch_irs_eig,
+    _compute_diameter_profile,
     _upsample_params,
     glottis,
     pink_trombone,
@@ -421,3 +427,95 @@ class TestPinkTromboneOla:
         assert err_rms / ref_rms < 0.05, (
             f"relative error {err_rms / ref_rms:.3f} exceeds 5%"
         )
+
+
+class TestComputeBatchIrsEig:
+    """Eigendecomposition-based IR must match the sequential reference."""
+
+    def _realistic_coefs(self, BT=4, seed=0):
+        """Reflection coefficients derived from a realistic diameter profile.
+
+        Mirrors the setup in `_tract_ola`: takes (tongueIndex, tongueDiameter,
+        constrictionIndex, constrictionDiameter) → diameter → area → reflection
+        coefficients. Varies tongue position across the batch for diversity.
+        """
+        N = _TRACT_N
+        ns = _NOSE_START
+        g = torch.Generator().manual_seed(seed)
+
+        tongue_idx = 10 + 20 * torch.rand(BT, 1, generator=g)  # ~vowel range
+        tongue_dia = 1.8 + 1.0 * torch.rand(BT, 1, generator=g)
+        constr_idx = 20 + 20 * torch.rand(BT, 1, generator=g)
+        constr_dia = 1.5 + 1.5 * torch.rand(BT, 1, generator=g)  # open — no turb
+
+        diameter = _compute_diameter_profile(
+            tongue_idx, tongue_dia, constr_idx, constr_dia, N
+        ).squeeze(1)  # [BT, N]
+        amplitude = diameter**2
+        r_inner = (amplitude[:, :-1] - amplitude[:, 1:]) / (
+            amplitude[:, :-1] + amplitude[:, 1:] + 1e-10
+        )
+        r = torch.cat([torch.zeros(BT, 1), r_inner], dim=1)  # [BT, N]
+
+        velum = torch.full((BT,), 0.01)  # closed-velum default
+        A_L = amplitude[:, ns]
+        A_R = amplitude[:, ns + 1]
+        A_N = velum**2
+        sum_A = A_L + A_R + A_N + 1e-10
+        r_L = (2 * A_L - sum_A) / sum_A
+        r_R = (2 * A_R - sum_A) / sum_A
+        r_N = (2 * A_N - sum_A) / sum_A
+        return r, r_L, r_R, r_N
+
+    def test_matches_sequential_glottis(self):
+        """Glottis impulse IR: eig must match sequential to ~1e-4."""
+        r, r_L, r_R, r_N = self._realistic_coefs(BT=4, seed=0)
+        L = 512
+        inject_pos = torch.zeros(4, dtype=torch.long)  # unused in glottis mode
+        ref = _compute_batch_irs(r, r_L, r_R, r_N, _NOSE_R_CPU, True, inject_pos, L)
+        eig = _compute_batch_irs_eig(r, r_L, r_R, r_N, _NOSE_R_CPU, True, inject_pos, L)
+        assert ref.shape == eig.shape == (4, L)
+        torch.testing.assert_close(ref, eig, atol=1e-4, rtol=1e-4)
+
+    def test_matches_sequential_turbulence(self):
+        """Turbulence IR with varying inject_pos — the edge case.
+
+        In turb mode `b` is a one-hot at a tube position (not at the glottis)
+        and pass 2 does NOT re-inject turbulence, so `b_full = A_step · b_turb`
+        without the `+ b_turb` term. Position-independent bugs would pass a
+        uniform-inject_pos test, so we vary it across the batch.
+        """
+        r, r_L, r_R, r_N = self._realistic_coefs(BT=4, seed=1)
+        L = 512
+        inject_pos = torch.tensor([5, 12, 24, 35], dtype=torch.long)
+        ref = _compute_batch_irs(r, r_L, r_R, r_N, _NOSE_R_CPU, False, inject_pos, L)
+        eig = _compute_batch_irs_eig(
+            r, r_L, r_R, r_N, _NOSE_R_CPU, False, inject_pos, L
+        )
+        assert ref.shape == eig.shape == (4, L)
+        torch.testing.assert_close(ref, eig, atol=1e-4, rtol=1e-4)
+
+    def test_gradient_matches_glottis(self):
+        """Backward pass: ∂loss/∂r must agree between the two implementations.
+
+        Uses a short L to keep eig backward well-conditioned. Tolerance is looser
+        than forward because `torch.linalg.eig` backward is less numerically
+        stable than forward (especially when eigenvalues cluster).
+        """
+        r0, r_L, r_R, r_N = self._realistic_coefs(BT=2, seed=2)
+        L = 256
+        inject_pos = torch.zeros(2, dtype=torch.long)
+
+        def grad_of(impl):
+            r = r0.clone().requires_grad_(True)
+            ir = impl(r, r_L, r_R, r_N, _NOSE_R_CPU, True, inject_pos, L)
+            ir.pow(2).sum().backward()
+            return r.grad.clone()
+
+        g_ref = grad_of(_compute_batch_irs)
+        g_eig = grad_of(_compute_batch_irs_eig)
+
+        cos_sim = (g_ref * g_eig).sum() / (g_ref.norm() * g_eig.norm() + 1e-30)
+        rel_err = (g_ref - g_eig).norm() / (g_ref.norm() + 1e-30)
+        assert cos_sim > 0.999, f"cosine similarity {cos_sim:.4f} < 0.999"
+        assert rel_err < 0.05, f"relative L2 error {rel_err:.4f} > 0.05"

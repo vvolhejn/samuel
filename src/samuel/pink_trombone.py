@@ -619,6 +619,181 @@ def _compute_batch_irs(
     return torch.stack(outputs, dim=1)  # [BT, L]
 
 
+def _compute_batch_irs_eig(
+    r: Tensor,  # [BT, N]
+    r_L: Tensor,  # [BT]
+    r_R: Tensor,  # [BT]
+    r_N: Tensor,  # [BT]
+    nose_r: Tensor,  # [M]
+    inject_glottis: bool,
+    inject_pos: Tensor,  # [BT] long  (used only when inject_glottis=False)
+    L: int,
+) -> Tensor:  # [BT, L]
+    """Eigendecomposition-based IR, mathematically equivalent to `_compute_batch_irs`.
+
+    The waveguide step is linear: x_{t+1} = A x_t + b u_t, so the IR is a sum of
+    poles — A = V diag(λ) V⁻¹ gives ir[t] = Σᵢ residueᵢ · λᵢᵗ. This replaces the
+    L-step Python loop (and L-deep autograd graph) in `_compute_batch_irs` with
+    one 144×144 eigendecomposition per frame plus a batched outer product.
+
+    A is built by probing `_waveguide_step` on the identity basis so boundary
+    and velum logic never gets duplicated.
+
+    Numerical notes:
+    - Uses complex64. 0.999-per-pass damping keeps |λ| ≤ 0.998; at L=4096,
+      |λ|^L ≈ 3e-4, safely above underflow.
+    - `torch.linalg.eig` backward can be ill-conditioned when eigenvalues
+      cluster (near-coincident formants). Fine for forward use; training
+      gradients may need `_compute_batch_irs` as a fallback.
+    """
+    BT = r.shape[0]
+    N = r.shape[1]
+    M = nose_r.shape[0]
+    d = 2 * N + 2 * M
+    ns = _NOSE_START
+    device = r.device
+    dtype = r.dtype
+
+    # --- Step 1: probe A_step by running _waveguide_step on the d basis states ---
+    # State layout in the concatenated vector:
+    #   [0,   N)       -> right
+    #   [N,   2N)      -> left
+    #   [2N,  2N+M)    -> nose_right
+    #   [2N+M, d)      -> nose_left
+    eye = torch.eye(d, device=device, dtype=dtype)  # [d, d]
+    # Expand to batch BT*d: for each frame i, rows (i*d + j) test basis state e_j.
+    eye_rep = eye.unsqueeze(0).expand(BT, d, d).reshape(BT * d, d)
+    r0 = eye_rep[:, :N]
+    l0 = eye_rep[:, N : 2 * N]
+    nr0 = eye_rep[:, 2 * N : 2 * N + M]
+    nl0 = eye_rep[:, 2 * N + M :]
+
+    r_rep = r.repeat_interleave(d, dim=0)  # [BT*d, N]
+    r_L_rep = r_L.repeat_interleave(d)
+    r_R_rep = r_R.repeat_interleave(d)
+    r_N_rep = r_N.repeat_interleave(d)
+    zero_g_bd = torch.zeros(BT * d, device=device, dtype=dtype)
+    zero_t_bd = torch.zeros(BT * d, N, device=device, dtype=dtype)
+
+    r_a, l_a, nr_a, nl_a, _ = _waveguide_step(
+        r0,
+        l0,
+        nr0,
+        nl0,
+        zero_g_bd,
+        r_rep,
+        r_L_rep,
+        r_R_rep,
+        r_N_rep,
+        nose_r,
+        zero_t_bd,
+        N,
+        M,
+        ns,
+    )
+    # Row (i*d + j) holds A_step[i] @ e_j, i.e., column j of A_step[i].
+    out_cat = torch.cat([r_a, l_a, nr_a, nl_a], dim=-1)  # [BT*d, d]
+    A_step = out_cat.reshape(BT, d, d).transpose(-1, -2)  # [BT, d, d]
+
+    # --- Step 2: probe b_glottis (state=0, glottis_s=1, turb=0) ---
+    z_N = torch.zeros(BT, N, device=device, dtype=dtype)
+    z_M = torch.zeros(BT, M, device=device, dtype=dtype)
+    ones_B = torch.ones(BT, device=device, dtype=dtype)
+    zero_B = torch.zeros(BT, device=device, dtype=dtype)
+
+    r_g, l_g, nr_g, nl_g, _ = _waveguide_step(
+        z_N,
+        z_N,
+        z_M,
+        z_M,
+        ones_B,
+        r,
+        r_L,
+        r_R,
+        r_N,
+        nose_r,
+        z_N,
+        N,
+        M,
+        ns,
+    )
+    b_glottis_step = torch.cat([r_g, l_g, nr_g, nl_g], dim=-1)  # [BT, d]
+
+    # --- Step 3: probe b_turb_step (state=0, glottis=0, turb=one-hot@inject_pos) ---
+    # Only used in turbulence mode, but always computed if needed.
+    if not inject_glottis:
+        turb_impulse = torch.zeros(BT, N, device=device, dtype=dtype)
+        turb_impulse.scatter_(1, inject_pos.clamp(0, N - 1).unsqueeze(1), 1.0)
+        r_t, l_t, nr_t, nl_t, _ = _waveguide_step(
+            z_N,
+            z_N,
+            z_M,
+            z_M,
+            zero_B,
+            r,
+            r_L,
+            r_R,
+            r_N,
+            nose_r,
+            turb_impulse,
+            N,
+            M,
+            ns,
+        )
+        b_turb_step = torch.cat([r_t, l_t, nr_t, nl_t], dim=-1)  # [BT, d]
+
+    # --- Step 4: two-pass effective system. Per step s with input δ[s]:
+    #   x_mid = A_step X_{s-1} + b_mid · δ[s]
+    #   X_s   = A_step x_mid + b_pass2 · δ[s]
+    #   out_s = cᵀ (x_mid + X_s)
+    # Pass 2 re-injects glottis but not turbulence; this asymmetry is why the
+    # turbulence case (b_pass2 = 0) needs a different b_full than glottis.
+    A_full = A_step @ A_step  # [BT, d, d]
+
+    if inject_glottis:
+        b_mid = b_glottis_step
+        # b_full = X_0 = (I + A_step) · b_glottis_step
+        b_full = b_glottis_step + (A_step @ b_glottis_step.unsqueeze(-1)).squeeze(-1)
+    else:
+        b_mid = b_turb_step
+        # b_full = X_0 = A_step · b_turb_step  (pass 2 does not re-inject turb)
+        b_full = (A_step @ b_turb_step.unsqueeze(-1)).squeeze(-1)
+
+    # Readout: out = right_new[-1] + nose_right_new[-1]  →  indices (N-1) and (2N+M-1).
+    c = torch.zeros(d, device=device, dtype=dtype)
+    c[N - 1] = 1.0
+    c[2 * N + M - 1] = 1.0
+
+    # ir[0] = cᵀ (b_mid + b_full) — both passes contribute at t=0.
+    ir_0 = ((b_mid + b_full) * c).sum(-1)  # [BT]
+
+    if L <= 1:
+        return ir_0.unsqueeze(-1)
+
+    # For s ≥ 1: ir[s] = c̃ᵀ A_full^{s-1} b_full, where c̃ = (A_step + A_full)ᵀ c.
+    c_col = c.view(1, d, 1).expand(BT, d, 1)  # [BT, d, 1]
+    c_tilde = ((A_step + A_full).transpose(-1, -2) @ c_col).squeeze(-1)  # [BT, d]
+
+    # --- Step 5: eigendecomposition and closed-form IR ---
+    A_full_c = A_full.to(torch.complex64)
+    evals, evecs = torch.linalg.eig(A_full_c)  # [BT, d], [BT, d, d]
+
+    alpha = torch.linalg.solve(evecs, b_full.to(torch.complex64).unsqueeze(-1)).squeeze(
+        -1
+    )  # V⁻¹ b_full, [BT, d]
+    beta = (c_tilde.to(torch.complex64).unsqueeze(-2) @ evecs).squeeze(-2)  # c̃ᵀ V
+    residues = alpha * beta  # [BT, d]  (complex)
+
+    # Powers λ^0 ... λ^(L-2)  → [BT, d, L-1]
+    exponents = torch.arange(L - 1, device=device, dtype=torch.float32).to(
+        torch.complex64
+    )
+    powers = evals.unsqueeze(-1) ** exponents
+    ir_tail = (residues.unsqueeze(-1) * powers).sum(-2).real.to(dtype)  # [BT, L-1]
+
+    return torch.cat([ir_0.unsqueeze(-1), ir_tail], dim=-1)  # [BT, L]
+
+
 def _ola_convolve(source: Tensor, h: Tensor, hop: int) -> Tensor:
     """Overlap-add convolution with per-frame FIR filters.
 
