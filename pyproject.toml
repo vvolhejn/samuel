@@ -11,6 +11,7 @@ dependencies = [
     "librosa>=0.11.0",
     "numpy>=2.4.4",
     "plotly>=6.7.0",
+    "pydantic>=2.0",
     "scipy>=1.17.1",
     "torch==2.8.*",
     "tqdm>=4.67.3",
