@@ -10,6 +10,7 @@ from samuel.pink_trombone import (
     _upsample_params,
     glottis,
     pink_trombone,
+    pink_trombone_ola,
 )
 
 # ---------------------------------------------------------------------------
@@ -347,3 +348,76 @@ class TestPinkTrombone:
     def test_wrong_param_count(self):
         with pytest.raises(AssertionError):
             pink_trombone(torch.randn(1, 5, 10))
+
+
+# ---------------------------------------------------------------------------
+# OLA FIR pink_trombone
+# ---------------------------------------------------------------------------
+
+
+class TestPinkTromboneOla:
+    def _default_params_tensor(self, B=1, T=5):
+        params = torch.zeros(B, T, N_PARAMS)
+        defaults = {
+            "noise": 0,
+            "frequency": 140,
+            "tenseness": 0.6,
+            "intensity": 1,
+            "loudness": 1,
+            "tongueIndex": 12.9,
+            "tongueDiameter": 2.43,
+            "vibratoWobble": 1,
+            "vibratoFrequency": 6,
+            "vibratoGain": 0.005,
+            "tractLength": 44,
+        }
+        for i, name in enumerate(PARAM_NAMES):
+            if name in defaults:
+                params[..., i] = defaults[name]
+        return params
+
+    def test_output_shape(self):
+        params = self._default_params_tensor(B=2, T=3)
+        audio = pink_trombone_ola(params)
+        assert audio.shape == (2, 3 * SAMPLES_PER_FRAME)
+
+    def test_output_finite(self):
+        params = self._default_params_tensor()
+        audio = pink_trombone_ola(params)
+        assert torch.isfinite(audio).all()
+
+    def test_differentiable(self):
+        params = self._default_params_tensor(B=1, T=2)
+        params.requires_grad_(True)
+        audio = pink_trombone_ola(params)
+        loss = audio.pow(2).mean()
+        loss.backward()
+        assert params.grad is not None
+        assert params.grad.abs().sum() > 0
+
+    def test_equivalence(self):
+        """OLA output should approximate the reference for static params."""
+        params = self._default_params_tensor(B=1, T=4)
+        # Disable stochastic elements for a clean comparison
+        params[..., PARAM_NAMES.index("vibratoGain")] = 0.0
+        params[..., PARAM_NAMES.index("vibratoWobble")] = 0.0
+        params[..., PARAM_NAMES.index("noise")] = 0.0
+
+        seed = 0
+        ref = pink_trombone(params, seed=seed)
+        ola = pink_trombone_ola(params, seed=seed, ir_length=4096)
+
+        assert ref.shape == ola.shape
+
+        # Skip first frame (initial waveguide startup transient)
+        skip = SAMPLES_PER_FRAME
+        ref_s = ref[:, skip:]
+        ola_s = ola[:, skip:]
+
+        ref_rms = ref_s.pow(2).mean().sqrt().item()
+        err_rms = (ref_s - ola_s).pow(2).mean().sqrt().item()
+
+        assert ref_rms > 1e-4, "reference signal is silent"
+        assert err_rms / ref_rms < 0.05, (
+            f"relative error {err_rms / ref_rms:.3f} exceeds 5%"
+        )

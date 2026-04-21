@@ -529,6 +529,241 @@ def _tract(
 
 
 # ---------------------------------------------------------------------------
+# OLA FIR vocal tract
+# ---------------------------------------------------------------------------
+
+
+def _compute_batch_irs(
+    r: Tensor,  # [BT, N]
+    r_L: Tensor,  # [BT]
+    r_R: Tensor,  # [BT]
+    r_N: Tensor,  # [BT]
+    nose_r: Tensor,  # [M]
+    inject_glottis: bool,
+    inject_pos: Tensor,  # [BT] long  (tube index; used when inject_glottis=False)
+    L: int,
+) -> Tensor:  # [BT, L]
+    """Compute impulse responses for a batch of waveguide configurations.
+
+    Each entry starts from zero state.  At step 0 a unit impulse is injected
+    either at the glottis or at a tube position (turbulence IR).  Uses the
+    same double-pass structure as ``_tract``.
+    """
+    BT = r.shape[0]
+    N = r.shape[1]
+    M = nose_r.shape[0]
+    ns = _NOSE_START
+    device = r.device
+    dtype = r.dtype
+
+    right = torch.zeros(BT, N, device=device, dtype=dtype)
+    left = torch.zeros(BT, N, device=device, dtype=dtype)
+    nose_right = torch.zeros(BT, M, device=device, dtype=dtype)
+    nose_left = torch.zeros(BT, M, device=device, dtype=dtype)
+
+    zeros_B = torch.zeros(BT, device=device, dtype=dtype)
+    zeros_turb = torch.zeros(BT, N, device=device, dtype=dtype)
+    ones_B = torch.ones(BT, device=device, dtype=dtype)
+
+    # Pre-build turbulence impulse (one-hot at inject_pos)
+    if inject_glottis:
+        turb_impulse = zeros_turb
+    else:
+        turb_impulse = torch.zeros(BT, N, device=device, dtype=dtype)
+        turb_impulse.scatter_(1, inject_pos.clamp(0, N - 1).unsqueeze(1), 1.0)
+
+    outputs: list[Tensor] = []
+    for s in range(L):
+        if s == 0:
+            glottis_s = ones_B if inject_glottis else zeros_B
+            turb_s = zeros_turb if inject_glottis else turb_impulse
+        else:
+            glottis_s = zeros_B
+            turb_s = zeros_turb
+
+        # Double pass — matches _tract
+        right, left, nose_right, nose_left, out1 = _waveguide_step(
+            right,
+            left,
+            nose_right,
+            nose_left,
+            glottis_s,
+            r,
+            r_L,
+            r_R,
+            r_N,
+            nose_r,
+            turb_s,
+            N,
+            M,
+            ns,
+        )
+        right, left, nose_right, nose_left, out2 = _waveguide_step(
+            right,
+            left,
+            nose_right,
+            nose_left,
+            glottis_s,
+            r,
+            r_L,
+            r_R,
+            r_N,
+            nose_r,
+            zeros_turb,
+            N,
+            M,
+            ns,
+        )
+        outputs.append(out1 + out2)
+
+    return torch.stack(outputs, dim=1)  # [BT, L]
+
+
+def _ola_convolve(source: Tensor, h: Tensor, hop: int) -> Tensor:
+    """Overlap-add convolution with per-frame FIR filters.
+
+    Args:
+        source: [B, S]
+        h:      [B, T, L] — per-frame causal FIR filters (h[..., 0] = immediate)
+        hop:    samples per frame; must divide S evenly
+
+    Returns:
+        [B, S]
+    """
+    B, S = source.shape
+    T = h.shape[1]
+    L = h.shape[2]
+    device = source.device
+
+    output = torch.zeros(B, S + L - 1, device=device, dtype=source.dtype)
+
+    # Flip: conv1d does cross-correlation; flip gives causal convolution
+    h_flip = h.flip(-1)  # [B, T, L]
+
+    for i in range(T):
+        start = i * hop
+        end = min(start + hop, S)
+        seg = source[:, start:end]
+        if seg.shape[1] < hop:
+            seg = F.pad(seg, (0, hop - seg.shape[1]))
+
+        # Per-batch-item linear convolution via grouped conv1d
+        # input [1, B, hop] × weight [B, 1, L] with groups=B → [B, hop+L-1]
+        conv_out = F.conv1d(
+            seg.unsqueeze(0),
+            h_flip[:, i, :].unsqueeze(1),
+            groups=B,
+            padding=L - 1,
+        ).squeeze(0)  # [B, hop + L - 1]
+
+        output[:, start : start + hop + L - 1] += conv_out
+
+    return output[:, :S]
+
+
+def _tract_ola(
+    glottis_out: Tensor,  # [B, S]
+    noise_mod: Tensor,  # [B, S]
+    tongue_index: Tensor,  # [B, S]
+    tongue_diameter: Tensor,  # [B, S]
+    constriction_index: Tensor,  # [B, S]
+    constriction_diameter: Tensor,  # [B, S]
+    ir_length: int = 4096,
+) -> Tensor:  # [B, S]
+    B, S = glottis_out.shape
+    N = _TRACT_N
+    ns = _NOSE_START
+    device = glottis_out.device
+    dtype = glottis_out.dtype
+    hop = SAMPLES_PER_FRAME
+    T = S // hop  # S is always a multiple of hop
+
+    # --- Per-frame parameters sampled at frame midpoints ---
+    mid = torch.arange(T, device=device) * hop + hop // 2  # [T]
+    ti_f = tongue_index[:, mid]  # [B, T]
+    td_f = tongue_diameter[:, mid]
+    ci_f = constriction_index[:, mid]
+    cd_f = constriction_diameter[:, mid]
+
+    # Oral reflection coefficients [B, T, N]
+    diameter_f = _compute_diameter_profile(ti_f, td_f, ci_f, cd_f, N)
+    amplitude_f = diameter_f**2
+    r_inner = (amplitude_f[:, :, :-1] - amplitude_f[:, :, 1:]) / (
+        amplitude_f[:, :, :-1] + amplitude_f[:, :, 1:] + 1e-10
+    )
+    r_f = torch.cat(
+        [torch.zeros(B, T, 1, device=device, dtype=dtype), r_inner], dim=2
+    )  # [B, T, N]
+
+    # Velum and 3-way junction [B, T]
+    velum_f = torch.where(
+        (ci_f > ns) & (cd_f < -_NOSE_OFFSET),
+        torch.full_like(ci_f, 0.4),
+        torch.full_like(ci_f, 0.01),
+    )
+    A_L_f = amplitude_f[:, :, ns]
+    A_R_f = amplitude_f[:, :, ns + 1]
+    A_N_f = velum_f**2
+    sum_A_f = A_L_f + A_R_f + A_N_f + 1e-10
+    r_L_f = (2 * A_L_f - sum_A_f) / sum_A_f
+    r_R_f = (2 * A_R_f - sum_A_f) / sum_A_f
+    r_N_f = (2 * A_N_f - sum_A_f) / sum_A_f
+
+    # --- Turbulence source at full sample rate ---
+    thinness = torch.clamp(8 * (0.7 - constriction_diameter), 0.0, 1.0)
+    openness = torch.clamp(30 * (constriction_diameter - 0.3), 0.0, 1.0)
+    valid_mask = (
+        (constriction_index >= 2)
+        & (constriction_index <= N)
+        & (constriction_diameter > 0)
+    ).to(dtype)
+    turb_source = (
+        noise_mod * glottis_out * 0.66 * (thinness * openness) / 2 * valid_mask
+    )
+
+    # --- Impulse responses (parallel over B×T) ---
+    BT = B * T
+    r_flat = r_f.reshape(BT, N)
+    r_L_flat = r_L_f.reshape(BT)
+    r_R_flat = r_R_f.reshape(BT)
+    r_N_flat = r_N_f.reshape(BT)
+    # Primary turbulence injection site: floor(constriction_index) + 1 (matches _tract)
+    ci_flat = (ci_f.reshape(BT).detach().floor().long() + 1).clamp(0, N - 1)
+
+    nose_r = _NOSE_R_CPU.to(device=device, dtype=dtype)
+
+    h_glottis_flat = _compute_batch_irs(
+        r_flat,
+        r_L_flat,
+        r_R_flat,
+        r_N_flat,
+        nose_r,
+        inject_glottis=True,
+        inject_pos=ci_flat,
+        L=ir_length,
+    )  # [BT, L]
+    h_turb_flat = _compute_batch_irs(
+        r_flat,
+        r_L_flat,
+        r_R_flat,
+        r_N_flat,
+        nose_r,
+        inject_glottis=False,
+        inject_pos=ci_flat,
+        L=ir_length,
+    )  # [BT, L]
+
+    h_glottis = h_glottis_flat.reshape(B, T, ir_length)
+    h_turb = h_turb_flat.reshape(B, T, ir_length)
+
+    # --- OLA synthesis ---
+    oral = _ola_convolve(glottis_out, h_glottis, hop)
+    turb_out = _ola_convolve(turb_source, h_turb, hop)
+
+    return (oral + turb_out) * 0.125
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -576,4 +811,62 @@ def pink_trombone(params: Tensor, seed: int | None = None) -> Tensor:
         tongue_diameter=p["tongueDiameter"],
         constriction_index=p["constrictionIndex"],
         constriction_diameter=p["constrictionDiameter"],
+    )
+
+
+def pink_trombone_ola(
+    params: Tensor,
+    seed: int | None = None,
+    ir_length: int = 4096,
+) -> Tensor:
+    """OLA FIR approximation of the Pink Trombone vocal synthesizer.
+
+    Replaces the sequential waveguide loop in ``pink_trombone`` with an
+    overlap-add FIR approach: one impulse response is computed per control
+    frame (all B×T in parallel), then applied via grouped conv1d.
+
+    Substantially faster than ``pink_trombone`` on GPU because the sequential
+    depth is O(ir_length) rather than O(T * SAMPLES_PER_FRAME).
+
+    Args:
+        params:    [B, T, 13] at 12.5 Hz control rate (same as ``pink_trombone``).
+        seed:      Random seed for SimplexNoise (same as ``pink_trombone``).
+        ir_length: FIR approximation length in samples.  Default 4096 (~93 ms
+                   at 44.1 kHz).  Larger → more accurate but slower and more
+                   memory.
+
+    Returns:
+        [B, T_samples] audio at 44.1 kHz.  T_samples = T * SAMPLES_PER_FRAME.
+    """
+    B, T, P = params.shape
+    assert P == N_PARAMS, f"Expected {N_PARAMS} parameters, got {P}"
+
+    if seed is None:
+        seed = torch.randint(0, 2**31, (1,)).item()
+
+    simplex = SimplexNoise(device=params.device, seed=seed)
+    params_up = _upsample_params(params)
+
+    p = {name: params_up[..., i] for i, name in enumerate(PARAM_NAMES)}
+
+    glottis_out, noise_mod = glottis(
+        noise_param=p["noise"],
+        frequency=p["frequency"],
+        tenseness=p["tenseness"],
+        intensity=p["intensity"],
+        loudness=p["loudness"],
+        vibrato_wobble=p["vibratoWobble"],
+        vibrato_freq=p["vibratoFrequency"],
+        vibrato_gain=p["vibratoGain"],
+        simplex=simplex,
+    )
+
+    return _tract_ola(
+        glottis_out=glottis_out,
+        noise_mod=noise_mod,
+        tongue_index=p["tongueIndex"],
+        tongue_diameter=p["tongueDiameter"],
+        constriction_index=p["constrictionIndex"],
+        constriction_diameter=p["constrictionDiameter"],
+        ir_length=ir_length,
     )
