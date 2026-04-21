@@ -522,3 +522,89 @@ class TestComputeBatchIrsEig:
         rel_err = (g_ref - g_eig).norm() / (g_ref.norm() + 1e-30)
         assert cos_sim > 0.999, f"cosine similarity {cos_sim:.4f} < 0.999"
         assert rel_err < 0.05, f"relative L2 error {rel_err:.4f} > 0.05"
+
+
+# ---------------------------------------------------------------------------
+# New API: control_rate, ir_impl, per-sample seeds
+# ---------------------------------------------------------------------------
+
+
+class TestNewApi:
+    def test_control_rate_changes_output_length(self):
+        """Doubling the control rate halves the samples-per-frame hop."""
+        T = 3
+        params = torch.zeros(1, T, N_PARAMS)
+        params[..., PARAM_NAMES.index("frequency")] = 140.0
+        params[..., PARAM_NAMES.index("tenseness")] = 0.6
+        params[..., PARAM_NAMES.index("intensity")] = 1.0
+        params[..., PARAM_NAMES.index("loudness")] = 1.0
+        params[..., PARAM_NAMES.index("tongueIndex")] = 20.0
+        params[..., PARAM_NAMES.index("tongueDiameter")] = 2.4
+        params[..., PARAM_NAMES.index("tractLength")] = 44.0
+        params[..., PARAM_NAMES.index("constrictionIndex")] = 30.0
+        params[..., PARAM_NAMES.index("constrictionDiameter")] = 3.0
+        params[..., PARAM_NAMES.index("vibratoFrequency")] = 6.0
+
+        out_125 = pink_trombone_ola(params, seed=0, ir_length=64, control_rate=12.5)
+        out_25 = pink_trombone_ola(params, seed=0, ir_length=64, control_rate=25.0)
+        spf_125 = int(round(SAMPLE_RATE / 12.5))
+        spf_25 = int(round(SAMPLE_RATE / 25.0))
+        assert out_125.shape == (1, T * spf_125)
+        assert out_25.shape == (1, T * spf_25)
+        assert spf_125 == 2 * spf_25
+
+    def test_ir_impl_toggle_matches(self):
+        """Sequential and eig IR impls agree within loose tolerance on a short clip."""
+        T = 2
+        B = 1
+        params = torch.zeros(B, T, N_PARAMS)
+        params[..., PARAM_NAMES.index("frequency")] = 140.0
+        params[..., PARAM_NAMES.index("tenseness")] = 0.6
+        params[..., PARAM_NAMES.index("intensity")] = 1.0
+        params[..., PARAM_NAMES.index("loudness")] = 1.0
+        params[..., PARAM_NAMES.index("tongueIndex")] = 20.0
+        params[..., PARAM_NAMES.index("tongueDiameter")] = 2.4
+        params[..., PARAM_NAMES.index("tractLength")] = 44.0
+        params[..., PARAM_NAMES.index("constrictionIndex")] = 30.0
+        params[..., PARAM_NAMES.index("constrictionDiameter")] = 3.0
+        params[..., PARAM_NAMES.index("vibratoFrequency")] = 6.0
+
+        out_seq = pink_trombone_ola(params, seed=0, ir_length=256, ir_impl="sequential")
+        out_eig = pink_trombone_ola(params, seed=0, ir_length=256, ir_impl="eig")
+        # Skip the first OLA frame where edge effects dominate.
+        hop = SAMPLES_PER_FRAME
+        rel = (out_seq[:, hop:] - out_eig[:, hop:]).abs().mean() / (
+            out_seq[:, hop:].abs().mean() + 1e-10
+        )
+        assert rel.item() < 0.05
+
+    def test_per_sample_seeds_differ(self):
+        """Different per-batch seeds produce different simplex-noise-driven outputs."""
+        B, T = 2, 2
+        params = torch.zeros(B, T, N_PARAMS)
+        # intensity=0 zeroes voice but noise still goes through vibrato/tenseness paths.
+        # Use a realistic config so the synth actually moves.
+        params[..., PARAM_NAMES.index("frequency")] = 140.0
+        params[..., PARAM_NAMES.index("tenseness")] = 0.6
+        params[..., PARAM_NAMES.index("intensity")] = 1.0
+        params[..., PARAM_NAMES.index("loudness")] = 1.0
+        params[..., PARAM_NAMES.index("tongueIndex")] = 20.0
+        params[..., PARAM_NAMES.index("tongueDiameter")] = 2.4
+        params[..., PARAM_NAMES.index("tractLength")] = 44.0
+        params[..., PARAM_NAMES.index("constrictionIndex")] = 30.0
+        params[..., PARAM_NAMES.index("constrictionDiameter")] = 3.0
+        params[..., PARAM_NAMES.index("vibratoFrequency")] = 6.0
+        params[..., PARAM_NAMES.index("vibratoGain")] = 0.1  # engage simplex vib
+        params[..., PARAM_NAMES.index("vibratoWobble")] = 1.0
+
+        torch.manual_seed(0)
+        seeds = torch.tensor([1, 2], dtype=torch.long)
+        out = pink_trombone_ola(params, seed=seeds, ir_length=64)
+        diff = (out[0] - out[1]).abs().mean()
+        assert diff.item() > 1e-5, "per-sample seeds did not produce distinct audio"
+
+        # Same seed repeated -> identical outputs (given fixed torch.manual_seed)
+        torch.manual_seed(0)
+        same_seeds = torch.tensor([3, 3], dtype=torch.long)
+        out_same = pink_trombone_ola(params, seed=same_seeds, ir_length=64)
+        assert torch.allclose(out_same[0], out_same[1], atol=1e-5)

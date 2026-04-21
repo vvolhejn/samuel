@@ -1,6 +1,7 @@
 """Differentiable Pink Trombone vocal synthesizer in PyTorch."""
 
 import math
+from typing import Literal
 
 import torch
 import torch.nn.functional as F
@@ -75,18 +76,15 @@ def _make_nose_r() -> Tensor:
 _NOSE_R_CPU = _make_nose_r()
 
 
-class SimplexNoise:
-    """Simplex noise matching Pink Trombone's JS implementation.
-
-    All outputs are detached (no gradient flows through noise).
-    """
-
-    def __init__(self, device: torch.device = torch.device("cpu"), seed: int = 0):
-        p = _P_TABLE
+def _build_perm_tables(seeds: list[int]) -> tuple[list[list[int]], list[list[int]]]:
+    """Replicate the JS seed -> perm-table construction for a list of seeds."""
+    p = _P_TABLE
+    all_perm: list[list[int]] = []
+    all_grad_idx: list[list[int]] = []
+    for seed in seeds:
         seed = int(seed)
         if seed < 256:
             seed |= seed << 8
-
         perm = [0] * 512
         grad_idx = [0] * 512
         for i in range(256):
@@ -94,15 +92,59 @@ class SimplexNoise:
             v = p[i] ^ ((seed >> shift) & 255)
             perm[i] = perm[i + 256] = v
             grad_idx[i] = grad_idx[i + 256] = v % 12
+        all_perm.append(perm)
+        all_grad_idx.append(grad_idx)
+    return all_perm, all_grad_idx
 
-        self.perm = torch.tensor(perm, dtype=torch.long, device=device)
+
+class SimplexNoise:
+    """Simplex noise matching Pink Trombone's JS implementation.
+
+    Supports per-batch-element seeds: if ``seed`` is a 1-D ``Tensor`` of length
+    ``B`` (or a Python sequence of ints), the internal permutation tables are
+    shaped ``[B, 512]`` and every simplex evaluation returns a ``[B, S]`` tensor
+    where each row uses its own permutation table. With a scalar ``seed`` the
+    permutation table is ``[1, 512]`` and results broadcast across the batch.
+
+    All outputs are detached (no gradient flows through noise).
+    """
+
+    def __init__(
+        self,
+        device: torch.device = torch.device("cpu"),
+        seed: int | Tensor | list[int] = 0,
+    ):
+        if isinstance(seed, Tensor):
+            assert seed.ndim == 1, "batched seed must be 1-D"
+            seeds_list = [int(s) for s in seed.tolist()]
+            self._scalar = False
+        elif isinstance(seed, (list, tuple)):
+            seeds_list = [int(s) for s in seed]
+            self._scalar = False
+        else:
+            seeds_list = [int(seed)]
+            self._scalar = True
+
+        perm, grad_idx = _build_perm_tables(seeds_list)
+        self.perm = torch.tensor(perm, dtype=torch.long, device=device)  # [Bp, 512]
+        self.grad_idx = torch.tensor(
+            grad_idx, dtype=torch.long, device=device
+        )  # [Bp, 512]
         self.grad3 = torch.tensor(_GRAD3_XY, dtype=torch.float32, device=device)
-        self.grad_idx = torch.tensor(grad_idx, dtype=torch.long, device=device)
         self.F2 = 0.5 * (math.sqrt(3) - 1)
         self.G2 = (3 - math.sqrt(3)) / 6
+        self.Bp = self.perm.shape[0]
+        self._batch_idx = torch.arange(self.Bp, device=device).view(self.Bp, 1)
 
     @torch.no_grad()
     def simplex2(self, xin: Tensor, yin: Tensor) -> Tensor:
+        # Broadcast to [Bp, S] so we can do per-batch table lookups.
+        # Squeeze Bp=1 on the way out when the caller used a scalar seed, so
+        # backward-compatible callers still see the original 1-D shape.
+        squeeze_out = self._scalar and xin.ndim == 1
+        if xin.ndim == 1:
+            xin = xin.unsqueeze(0).expand(self.Bp, -1)
+            yin = yin.unsqueeze(0).expand(self.Bp, -1)
         s = (xin + yin) * self.F2
         i = torch.floor(xin + s).long()
         j = torch.floor(yin + s).long()
@@ -122,9 +164,10 @@ class SimplexNoise:
         ii = i & 255
         jj = j & 255
 
-        gi0 = self.grad3[self.grad_idx[ii + self.perm[jj]]]
-        gi1 = self.grad3[self.grad_idx[ii + i1 + self.perm[jj + j1]]]
-        gi2 = self.grad3[self.grad_idx[ii + 1 + self.perm[jj + 1]]]
+        b = self._batch_idx  # [Bp, 1]
+        gi0 = self.grad3[self.grad_idx[b, ii + self.perm[b, jj]]]
+        gi1 = self.grad3[self.grad_idx[b, ii + i1 + self.perm[b, jj + j1]]]
+        gi2 = self.grad3[self.grad_idx[b, ii + 1 + self.perm[b, jj + 1]]]
 
         d0 = gi0[..., 0] * x0 + gi0[..., 1] * y0
         d1 = gi1[..., 0] * x1 + gi1[..., 1] * y1
@@ -139,7 +182,10 @@ class SimplexNoise:
         t2 = 0.5 - x2**2 - y2**2
         n2 = torch.where(t2 < 0, torch.zeros_like(t2), t2**4 * d2)
 
-        return 70.0 * (n0 + n1 + n2)
+        out = 70.0 * (n0 + n1 + n2)
+        if squeeze_out:
+            out = out.squeeze(0)
+        return out
 
     def simplex1(self, x: Tensor) -> Tensor:
         return self.simplex2(x * 1.2, -x * 0.7)
@@ -150,10 +196,12 @@ class SimplexNoise:
 # ---------------------------------------------------------------------------
 
 
-def _upsample_params(params: Tensor) -> Tensor:
-    """[B, T, P] at 12.5 Hz -> [B, T_samples, P] at 24 kHz."""
+def _upsample_params(
+    params: Tensor, samples_per_frame: int = SAMPLES_PER_FRAME
+) -> Tensor:
+    """[B, T, P] at control rate -> [B, T_samples, P] at SAMPLE_RATE."""
     B, T, P = params.shape
-    T_samples = T * SAMPLES_PER_FRAME
+    T_samples = T * samples_per_frame
     if T == 1:
         return params.expand(B, T_samples, P)
     # F.interpolate wants [B, C, L]
@@ -161,6 +209,11 @@ def _upsample_params(params: Tensor) -> Tensor:
         params.permute(0, 2, 1), size=T_samples, mode="linear", align_corners=True
     )
     return up.permute(0, 2, 1)
+
+
+def _samples_per_frame(control_rate: float) -> int:
+    """Discrete hop in samples for a given control rate."""
+    return int(round(SAMPLE_RATE / control_rate))
 
 
 # ---------------------------------------------------------------------------
@@ -185,18 +238,19 @@ def glottis(
     t = torch.arange(S, device=device, dtype=torch.float32) / SAMPLE_RATE  # [S]
 
     # ---- vibrato ----
+    # simplex.simplex1 returns [Bp, S] with Bp in {1, B}; broadcasts cleanly.
     vibrato = vibrato_gain * torch.sin(2 * math.pi * t.unsqueeze(0) * vibrato_freq)
     sn_vib = 0.02 * simplex.simplex1(t * 4.07) + 0.04 * simplex.simplex1(t * 2.15)
-    vibrato = vibrato + sn_vib.unsqueeze(0)
+    vibrato = vibrato + sn_vib
 
     wobble = 0.2 * simplex.simplex1(t * 0.98) + 0.4 * simplex.simplex1(t * 0.5)
-    vibrato = vibrato + wobble.unsqueeze(0) * vibrato_wobble
+    vibrato = vibrato + wobble * vibrato_wobble
 
     freq_mod = frequency * (1 + vibrato)
 
     # ---- tenseness (with simplex jitter) ----
     sn_tens = 0.1 * simplex.simplex1(t * 0.46) + 0.05 * simplex.simplex1(t * 0.36)
-    tenseness = tenseness + sn_tens.unsqueeze(0)
+    tenseness = tenseness + sn_tens
     tenseness = tenseness + (3 - tenseness) * (1 - intensity)
 
     # ---- phase via cumulative frequency integration ----
@@ -243,7 +297,7 @@ def glottis(
     noise_mod = noise_mod + (1 - tenseness * intensity) * 3
 
     # ---- aspiration noise ----
-    sn_asp = (0.02 * simplex.simplex1(t * 1.99) + 0.2).unsqueeze(0)
+    sn_asp = 0.02 * simplex.simplex1(t * 1.99) + 0.2  # [Bp, S]
     white_noise = torch.randn(B, S, device=device)
     noise = white_noise * noise_param * noise_mod
     noise = noise * intensity * intensity
@@ -846,13 +900,15 @@ def _tract_ola(
     constriction_index: Tensor,  # [B, S]
     constriction_diameter: Tensor,  # [B, S]
     ir_length: int = 4096,
+    samples_per_frame: int = SAMPLES_PER_FRAME,
+    ir_impl: Literal["eig", "sequential"] = "sequential",
 ) -> Tensor:  # [B, S]
     B, S = glottis_out.shape
     N = _TRACT_N
     ns = _NOSE_START
     device = glottis_out.device
     dtype = glottis_out.dtype
-    hop = SAMPLES_PER_FRAME
+    hop = samples_per_frame
     T = S // hop  # S is always a multiple of hop
 
     # --- Per-frame parameters sampled at frame midpoints ---
@@ -909,7 +965,8 @@ def _tract_ola(
 
     nose_r = _NOSE_R_CPU.to(device=device, dtype=dtype)
 
-    h_glottis_flat = _compute_batch_irs(
+    _ir_fn = _compute_batch_irs_eig if ir_impl == "eig" else _compute_batch_irs
+    h_glottis_flat = _ir_fn(
         r_flat,
         r_L_flat,
         r_R_flat,
@@ -919,7 +976,7 @@ def _tract_ola(
         inject_pos=ci_flat,
         L=ir_length,
     )  # [BT, L]
-    h_turb_flat = _compute_batch_irs(
+    h_turb_flat = _ir_fn(
         r_flat,
         r_L_flat,
         r_R_flat,
@@ -945,27 +1002,36 @@ def _tract_ola(
 # ---------------------------------------------------------------------------
 
 
-def pink_trombone(params: Tensor, seed: int | None = None) -> Tensor:
+def pink_trombone(
+    params: Tensor,
+    seed: int | Tensor | None = None,
+    control_rate: float = CONTROL_RATE,
+) -> Tensor:
     """Differentiable Pink Trombone vocal synthesizer.
 
     Args:
-        params: [B, T, 13] at 12.5 Hz control rate.
+        params: [B, T, 13] at ``control_rate`` Hz.
             Parameters (in order): noise, frequency, tenseness, intensity,
             loudness, tongueIndex, tongueDiameter, vibratoWobble,
             vibratoFrequency, vibratoGain, tractLength,
             constrictionIndex, constrictionDiameter.
+        seed: scalar int (all batch items share noise), a ``[B]`` int tensor
+            (per-batch independent simplex noise), or ``None`` which draws
+            a fresh ``[B]`` int tensor on every call.
+        control_rate: Frames-per-second of ``params``. Default 12.5 Hz.
 
     Returns:
-        [B, T_samples] audio at 24 kHz.  T_samples = T * 1920.
+        [B, T_samples] audio at 44.1 kHz.  T_samples = T * round(44100 / control_rate).
     """
     B, T, P = params.shape
     assert P == N_PARAMS, f"Expected {N_PARAMS} parameters, got {P}"
 
     if seed is None:
-        seed = torch.randint(0, 2**31, (1,)).item()
+        seed = torch.randint(0, 2**31, (B,))
 
     simplex = SimplexNoise(device=params.device, seed=seed)
-    params_up = _upsample_params(params)  # [B, T*1920, P]
+    spf = _samples_per_frame(control_rate)
+    params_up = _upsample_params(params, spf)  # [B, T*spf, P]
 
     p = {name: params_up[..., i] for i, name in enumerate(PARAM_NAMES)}
 
@@ -993,8 +1059,10 @@ def pink_trombone(params: Tensor, seed: int | None = None) -> Tensor:
 
 def pink_trombone_ola(
     params: Tensor,
-    seed: int | None = None,
+    seed: int | Tensor | None = None,
     ir_length: int = 4096,
+    control_rate: float = CONTROL_RATE,
+    ir_impl: Literal["eig", "sequential"] = "sequential",
 ) -> Tensor:
     """OLA FIR approximation of the Pink Trombone vocal synthesizer.
 
@@ -1003,26 +1071,32 @@ def pink_trombone_ola(
     frame (all B×T in parallel), then applied via grouped conv1d.
 
     Substantially faster than ``pink_trombone`` on GPU because the sequential
-    depth is O(ir_length) rather than O(T * SAMPLES_PER_FRAME).
+    depth is O(ir_length) rather than O(T * samples_per_frame).
 
     Args:
-        params:    [B, T, 13] at 12.5 Hz control rate (same as ``pink_trombone``).
-        seed:      Random seed for SimplexNoise (same as ``pink_trombone``).
+        params:    [B, T, 13] at ``control_rate`` Hz (same as ``pink_trombone``).
+        seed:      Same semantics as ``pink_trombone``: scalar, ``[B]`` tensor,
+                   or ``None`` for fresh per-sample seeds.
         ir_length: FIR approximation length in samples.  Default 4096 (~93 ms
                    at 44.1 kHz).  Larger → more accurate but slower and more
                    memory.
+        control_rate: Frames-per-second of ``params``. Default 12.5 Hz.
+        ir_impl:   ``"sequential"`` (default, matches exact synth) or ``"eig"``
+                   (eigendecomposition-based; faster on GPU, equivalent to
+                   <~1e-5 for numerically stable reflection sets).
 
     Returns:
-        [B, T_samples] audio at 44.1 kHz.  T_samples = T * SAMPLES_PER_FRAME.
+        [B, T_samples] audio at 44.1 kHz.  T_samples = T * round(44100 / control_rate).
     """
     B, T, P = params.shape
     assert P == N_PARAMS, f"Expected {N_PARAMS} parameters, got {P}"
 
     if seed is None:
-        seed = torch.randint(0, 2**31, (1,)).item()
+        seed = torch.randint(0, 2**31, (B,))
 
     simplex = SimplexNoise(device=params.device, seed=seed)
-    params_up = _upsample_params(params)
+    spf = _samples_per_frame(control_rate)
+    params_up = _upsample_params(params, spf)
 
     p = {name: params_up[..., i] for i, name in enumerate(PARAM_NAMES)}
 
@@ -1046,4 +1120,6 @@ def pink_trombone_ola(
         constriction_index=p["constrictionIndex"],
         constriction_diameter=p["constrictionDiameter"],
         ir_length=ir_length,
+        samples_per_frame=spf,
+        ir_impl=ir_impl,
     )

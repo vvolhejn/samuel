@@ -2,3 +2,6 @@
 __pycache__/
 
 .nfs*
+
+runs/
+manifests/
