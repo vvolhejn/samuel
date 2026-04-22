@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -113,15 +114,21 @@ def _param_traj_figure(
     return fig
 
 
-def _mel_fig(audio: np.ndarray, sr: int, title: str) -> go.Figure:
+def _mel_fig_stacked(audios: list[tuple[str, np.ndarray]], sr: int) -> go.Figure:
     import librosa
+    from plotly.subplots import make_subplots
 
-    mel = librosa.feature.melspectrogram(y=audio.astype(np.float32), sr=sr, n_mels=80)
-    log_mel = librosa.power_to_db(mel, ref=np.max)
-    fig = go.Figure(data=go.Heatmap(z=log_mel, colorscale="Viridis"))
-    fig.update_layout(
-        title=title, height=300, yaxis_title="mel bin", xaxis_title="frame"
-    )
+    titles = [name for name, _ in audios]
+    fig = make_subplots(rows=len(audios), cols=1, subplot_titles=titles)
+    for row, (_, audio) in enumerate(audios, start=1):
+        mel = librosa.feature.melspectrogram(
+            y=audio.astype(np.float32), sr=sr, n_mels=80
+        )
+        log_mel = librosa.power_to_db(mel, ref=np.max)
+        fig.add_trace(
+            go.Heatmap(z=log_mel, colorscale="Viridis", showscale=False), row=row, col=1
+        )
+    fig.update_layout(height=250 * len(audios))
     return fig
 
 
@@ -206,24 +213,27 @@ def _evaluate(
 
         # Audio + figures to wandb
         sr = cfg.data.sample_rate
+        gap = np.zeros(int(sr * 0.1), dtype=np.float32)
         wandb_logs: dict[str, object] = {}
         trainable_names = model.trainable_names_
         for i, name in enumerate(eval_names):
             tgt_np = target[i].detach().cpu().numpy()
             ola_np = pred_ola[i, :S].detach().cpu().numpy()
             ex_np = pred_exact[i, :S_ex].detach().cpu().numpy()
-            tag = f"eval/{i:02d}_{name}"
-            wandb_logs[f"{tag}/target"] = wandb.Audio(tgt_np, sample_rate=sr)
-            wandb_logs[f"{tag}/pred_ola"] = wandb.Audio(_norm(ola_np), sample_rate=sr)
-            wandb_logs[f"{tag}/pred_exact"] = wandb.Audio(_norm(ex_np), sample_rate=sr)
+            short_name = name[:10]
+            tag = f"eval/{i:02d}_{short_name}"
+            combined = np.concatenate(
+                [tgt_np.astype(np.float32), gap, _norm(ola_np), gap, _norm(ex_np)]
+            )
+            wandb_logs[f"{tag}/audio"] = wandb.Audio(combined, sample_rate=sr)
             wandb_logs[f"{tag}/params"] = wandb.Plotly(
                 _param_traj_figure(params[i], trainable_names, frame_rate)
             )
-            wandb_logs[f"{tag}/mel_target"] = wandb.Plotly(
-                _mel_fig(tgt_np, sr, "target")
+            wandb_logs[f"{tag}/mel"] = wandb.Plotly(
+                _mel_fig_stacked(
+                    [("target", tgt_np), ("ola", ola_np), ("exact", ex_np)], sr
+                )
             )
-            wandb_logs[f"{tag}/mel_ola"] = wandb.Plotly(_mel_fig(ola_np, sr, "ola"))
-            wandb_logs[f"{tag}/mel_exact"] = wandb.Plotly(_mel_fig(ex_np, sr, "exact"))
         wandb.log(wandb_logs, step=step)
 
     if model_was_training:
@@ -300,6 +310,7 @@ def main(hydra_cfg: DictConfig) -> None:
     if rank == 0:
         wandb.init(
             project=cfg.log.wandb_project,
+            entity=cfg.log.wandb_entity,
             name=run_dir.name,
             dir=str(run_dir),
             config=json.loads(cfg.model_dump_json()),
@@ -311,6 +322,23 @@ def main(hydra_cfg: DictConfig) -> None:
 
     data_iter = iter(loader)
     epoch = 0
+
+    throughput_t0 = time.perf_counter()
+    throughput_audio_s = 0.0
+
+    if rank == 0 and eval_clips is not None:
+        metrics = _evaluate(
+            module,
+            ddp_module,
+            eval_clips,
+            eval_names,
+            loss_fn,
+            cfg,
+            step,
+            run_expensive=True,
+        )
+        wandb.log(metrics, step=step)
+        tqdm.write(f"[eval] step={step} loss_ola={metrics['eval/loss_ola']:.4f}")
 
     while step < cfg.optim.max_steps:
         try:
@@ -361,13 +389,22 @@ def main(hydra_cfg: DictConfig) -> None:
             loss=f"{loss.item():.4f}", lr=f"{optimizer.param_groups[0]['lr']:.2e}"
         )
 
+        throughput_audio_s += wav.shape[0] * wav.shape[-1] / cfg.data.sample_rate
+
         if rank == 0 and step % cfg.log.log_every == 0:
+            elapsed = time.perf_counter() - throughput_t0
+            throughput_per_gpu = throughput_audio_s / elapsed if elapsed > 0 else 0.0
+            throughput_total = throughput_per_gpu * world_size
+            throughput_t0 = time.perf_counter()
+            throughput_audio_s = 0.0
             wandb.log(
                 {
                     "train/loss": loss.item(),
                     "train/lr": optimizer.param_groups[0]["lr"],
                     "train/grad_norm": float(grad_norm),
                     "train/epoch": epoch,
+                    "System/throughput_per_gpu": throughput_per_gpu,
+                    "System/throughput_total": throughput_total,
                 },
                 step=step,
             )
@@ -384,6 +421,7 @@ def main(hydra_cfg: DictConfig) -> None:
                 run_expensive=(step % cfg.log.eval_every == 0),
             )
             wandb.log(metrics, step=step)
+            tqdm.write(f"[eval] step={step} loss_ola={metrics['eval/loss_ola']:.4f}")
 
         if rank == 0 and step % cfg.log.ckpt_every == 0:
             ckpt_path = run_dir / "checkpoints" / f"{step:07d}.pt"

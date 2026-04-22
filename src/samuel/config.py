@@ -60,6 +60,7 @@ class LogConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     wandb_project: str = "samuel-trombone"
+    wandb_entity: str | None = None
     wandb_mode: Literal["online", "offline", "disabled"] = "online"
     log_every: int = 50
     val_every: int = 1_000

@@ -135,7 +135,9 @@ class PinkTromboneController(nn.Module):
         raw = self.head(z.transpose(1, 2))  # [B, T_ctrl, n_trainable]
         constrained = torch.sigmoid(raw) * (self._hi - self._lo) + self._lo
 
-        out = torch.zeros(B, T_ctrl, N_PARAMS, device=wav.device, dtype=raw.dtype)
+        out = torch.zeros(
+            B, T_ctrl, N_PARAMS, device=wav.device, dtype=constrained.dtype
+        )
         train_idx = self._trainable_idx.view(1, 1, -1).expand(B, T_ctrl, -1)
         out = out.scatter(2, train_idx, constrained)
 

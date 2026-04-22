@@ -2,7 +2,7 @@ defaults:
   - model
   - _self_
 
-batch_size: 8
+batch_size: 128
 
 data:
   manifest_path: manifests/librilight_10h.jsonl
@@ -12,23 +12,24 @@ data:
 
 synth:
   ir_length: 256
-  ir_impl: eig
+  ir_impl: sequential
 
 optim:
   lr: 3.0e-4
   betas: [0.9, 0.95]
   weight_decay: 0.0
   grad_clip: 1.0
-  max_steps: 100000
-  warmup_steps: 1000
+  max_steps: 40000
+  warmup_steps: 800
 
 log:
   wandb_project: samuel
+  wandb_entity: moboehle-kyutai
   wandb_mode: online
   log_every: 50
-  val_every: 1000
-  eval_every: 10000
-  ckpt_every: 5000
+  val_every: 400
+  eval_every: 400
+  ckpt_every: 2000
   n_audio_samples: 4
   pitch_fmin: 70.0
   pitch_fmax: 500.0
