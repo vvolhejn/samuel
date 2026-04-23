@@ -12,17 +12,20 @@ from torch import Tensor, nn
 from samuel.encoder import SEANetEncoder, SEANetEncoderConfig
 from samuel.pink_trombone import N_PARAMS, PARAM_NAMES, SAMPLE_RATE
 
-# Defaults mirror notebooks/tract_fit.ipynb (9 trainable, 4 frozen).
+# (lo, hi, init) per trainable param. init values are placed in the interior
+# of each range (not at lo or hi) so that bias_init = logit(init_norm) is
+# moderate and sigmoid gradient stays well-conditioned during training.
+# A boundary init → |bias_init|≈9.2 → sigmoid'≈1e-4 → dead gradient.
 _DEFAULT_PARAM_SPEC: dict[str, tuple[float, float, float]] = {
     "noise": (0.0, 0.5, 0.1),
     "frequency": (80.0, 400.0, 140.0),
     "tenseness": (0.0, 1.0, 0.6),
-    "intensity": (0.0, 1.0, 1.0),
-    "loudness": (0.0, 1.0, 1.0),
+    "intensity": (0.0, 1.0, 0.5),
+    "loudness": (0.0, 1.0, 0.5),
     "tongueIndex": (10.0, 35.0, 20.0),
     "tongueDiameter": (1.5, 3.5, 2.4),
     "constrictionIndex": (0.0, 44.0, 30.0),
-    "constrictionDiameter": (-0.5, 3.0, 3.0),
+    "constrictionDiameter": (-0.5, 3.0, 1.25),
 }
 _DEFAULT_FROZEN_VALUES: dict[str, float] = {
     "vibratoWobble": 0.0,
