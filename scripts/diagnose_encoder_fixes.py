@@ -110,6 +110,92 @@ def main(hydra_cfg: DictConfig) -> None:
         z = enc(wav)
     collapse_stats(z, "SimpleEncoder (Conv+GN+ReLU)")
 
+    # 4. Same SimpleEncoder but with BatchNorm (normalizes across batch)
+    class SimpleEncoderBN(nn.Module):
+        def __init__(self, dimension: int = 128):
+            super().__init__()
+            self.hop_length = 320
+            c = [1, 32, 64, 128, dimension]
+            s = [2, 4, 5, 8]
+            layers = []
+            for i in range(4):
+                layers += [
+                    nn.Conv1d(
+                        c[i],
+                        c[i + 1],
+                        kernel_size=s[i] * 2,
+                        stride=s[i],
+                        padding=s[i] // 2,
+                    ),
+                    nn.BatchNorm1d(c[i + 1]),
+                    nn.ReLU(),
+                ]
+            self.model = nn.Sequential(*layers)
+
+        def forward(self, x):
+            return self.model(x)
+
+    torch.manual_seed(0)
+    enc = (
+        SimpleEncoderBN(dimension=cfg.model.encoder.dimension).to(device).eval()
+    )  # eval=use running stats
+    with torch.no_grad():
+        z = enc(wav)
+    collapse_stats(z, "SimpleEncoder + BatchNorm (eval)")
+
+    torch.manual_seed(0)
+    enc = SimpleEncoderBN(dimension=cfg.model.encoder.dimension).to(
+        device
+    )  # train mode
+    with torch.no_grad():
+        z = enc(wav)
+    collapse_stats(z, "SimpleEncoder + BatchNorm (train)")
+
+    # 4c. SEANet + BatchNorm injected after every Conv1d
+    def inject_bn_after_convs(root: nn.Module) -> nn.Module:
+        for name, child in list(root.named_children()):
+            if isinstance(child, nn.Sequential):
+                new_layers = []
+                for sub in child:
+                    new_layers.append(sub)
+                    if isinstance(sub, CausalConv1d):
+                        new_layers.append(nn.BatchNorm1d(sub.conv.out_channels))
+                setattr(root, name, nn.Sequential(*new_layers))
+            else:
+                inject_bn_after_convs(child)
+        return root
+
+    from samuel.encoder import CausalConv1d
+
+    torch.manual_seed(0)
+    enc = SEANetEncoder(SEANetEncoderConfig(**cfg.model.encoder.model_dump())).to(
+        device
+    )
+    enc = inject_bn_after_convs(enc).to(device)
+    with torch.no_grad():
+        z = enc(wav)
+    collapse_stats(z, "SEANet + BatchNorm (train)")
+
+    # 5. A very shallow 2-layer encoder
+    class ShallowEncoder(nn.Module):
+        def __init__(self, dimension: int = 128):
+            super().__init__()
+            self.hop_length = 320
+            self.model = nn.Sequential(
+                nn.Conv1d(1, 64, kernel_size=40, stride=20, padding=10),  # x20
+                nn.ReLU(),
+                nn.Conv1d(64, dimension, kernel_size=32, stride=16, padding=8),  # x320
+            )
+
+        def forward(self, x):
+            return self.model(x)
+
+    torch.manual_seed(0)
+    enc = ShallowEncoder(dimension=cfg.model.encoder.dimension).to(device)
+    with torch.no_grad():
+        z = enc(wav)
+    collapse_stats(z, "ShallowEncoder (2-layer)")
+
 
 if __name__ == "__main__":
     main()
