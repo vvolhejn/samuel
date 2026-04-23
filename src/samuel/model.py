@@ -95,7 +95,7 @@ class PinkTromboneController(nn.Module):
 
         self.head = nn.Linear(config.encoder.dimension, n_trainable)
         with torch.no_grad():
-            self.head.weight.zero_()
+            nn.init.normal_(self.head.weight, std=0.01)
             self.head.bias.copy_(bias_init)
 
         trainable_idx = torch.tensor(
@@ -132,7 +132,8 @@ class PinkTromboneController(nn.Module):
         if z.shape[-1] != T_ctrl:
             z = F.interpolate(z, size=T_ctrl, mode="linear", align_corners=True)
 
-        raw = self.head(z.transpose(1, 2))  # [B, T_ctrl, n_trainable]
+        # Head + sigmoid in fp32 so small bf16-range gradients don't underflow.
+        raw = self.head(z.transpose(1, 2)).float()  # [B, T_ctrl, n_trainable]
         constrained = torch.sigmoid(raw) * (self._hi - self._lo) + self._lo
 
         out = torch.zeros(
