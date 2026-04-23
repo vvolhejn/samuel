@@ -31,7 +31,7 @@ import wandb
 from samuel.config import TrainConfig
 from samuel.data import _load_resampled, build_dataloader, load_manifest
 from samuel.evals.pitch import pitch_mae_cents
-from samuel.losses import MultiScaleLogMagSTFTLoss
+from samuel.losses import MultiScaleLogMagSTFTLoss, MultiScaleLogMagSTFTLossWithEnvelope
 from samuel.model import PinkTromboneController
 from samuel.pink_trombone import PARAM_NAMES, pink_trombone, pink_trombone_ola
 
@@ -268,7 +268,7 @@ def main(hydra_cfg: DictConfig) -> None:
     # Model
     model = PinkTromboneController(cfg.model).to(device)
     frame_rate = cfg.model.frame_rate
-    loss_fn = MultiScaleLogMagSTFTLoss().to(device)
+    loss_fn = MultiScaleLogMagSTFTLossWithEnvelope().to(device)
 
     ddp_module: nn.Module
     if is_ddp:

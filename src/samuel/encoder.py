@@ -94,7 +94,7 @@ class SEANetResnetBlock(nn.Module):
                 CausalConv1d(
                     in_chs, out_chs, kernel_size=k, dilation=d, pad_mode=pad_mode
                 ),
-                nn.BatchNorm1d(out_chs),
+                nn.GroupNorm(8, out_chs),
             ]
         self.block = nn.Sequential(*layers)
 
@@ -125,7 +125,7 @@ class SEANetEncoder(nn.Module):
             CausalConv1d(
                 config.channels, mult * n_filters, config.kernel_size, pad_mode=pad_mode
             ),
-            nn.BatchNorm1d(mult * n_filters),
+            nn.GroupNorm(8, mult * n_filters),
         ]
         for ratio in ratios:
             for j in range(config.n_residual_layers):
@@ -147,7 +147,7 @@ class SEANetEncoder(nn.Module):
                     stride=ratio,
                     pad_mode=pad_mode,
                 ),
-                nn.BatchNorm1d(mult * n_filters * 2),
+                nn.GroupNorm(8, mult * n_filters * 2),
             ]
             mult *= 2
 
