@@ -93,9 +93,12 @@ class PinkTromboneController(nn.Module):
         self.register_buffer("_lo", lo)
         self.register_buffer("_hi", hi)
 
+        # Keep default Kaiming-uniform weight init (fan_in=encoder.dim) — gives
+        # std ≈ 1/sqrt(dim), enough for encoder activations to meaningfully move
+        # the output from the start. bias is overridden so the initial param
+        # output is centered around the configured init values.
         self.head = nn.Linear(config.encoder.dimension, n_trainable)
         with torch.no_grad():
-            nn.init.normal_(self.head.weight, std=0.01)
             self.head.bias.copy_(bias_init)
 
         trainable_idx = torch.tensor(
