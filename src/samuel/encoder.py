@@ -12,6 +12,7 @@ import numpy as np
 import torch.nn.functional as F
 from pydantic import BaseModel, Field
 from torch import Tensor, nn
+from torch.nn.utils.parametrizations import weight_norm
 
 PadMode = Literal["constant", "replicate"]
 
@@ -55,14 +56,16 @@ class CausalConv1d(nn.Module):
         self.stride = stride
         effective_kernel = (kernel_size - 1) * dilation + 1
         self.left_pad = effective_kernel - stride
-        self.conv = nn.Conv1d(
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride=stride,
-            dilation=dilation,
-            groups=groups,
-            bias=bias,
+        self.conv = weight_norm(
+            nn.Conv1d(
+                in_channels,
+                out_channels,
+                kernel_size,
+                stride=stride,
+                dilation=dilation,
+                groups=groups,
+                bias=bias,
+            )
         )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -94,7 +97,6 @@ class SEANetResnetBlock(nn.Module):
                 CausalConv1d(
                     in_chs, out_chs, kernel_size=k, dilation=d, pad_mode=pad_mode
                 ),
-                nn.GroupNorm(8, out_chs),
             ]
         self.block = nn.Sequential(*layers)
 
@@ -125,7 +127,6 @@ class SEANetEncoder(nn.Module):
             CausalConv1d(
                 config.channels, mult * n_filters, config.kernel_size, pad_mode=pad_mode
             ),
-            nn.GroupNorm(8, mult * n_filters),
         ]
         for ratio in ratios:
             for j in range(config.n_residual_layers):
@@ -147,7 +148,6 @@ class SEANetEncoder(nn.Module):
                     stride=ratio,
                     pad_mode=pad_mode,
                 ),
-                nn.GroupNorm(8, mult * n_filters * 2),
             ]
             mult *= 2
 
