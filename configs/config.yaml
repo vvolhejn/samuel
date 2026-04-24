@@ -22,6 +22,14 @@ optim:
   max_steps: 40000
   warmup_steps: 800
 
+whisper:
+  enabled: false
+  model_name: openai/whisper-large-v3
+  perceptual_layers: [7, 15, 23, 31]
+  distill_weight: 1.0
+  perceptual_weight: 1.0
+  stft_weight: 1.0
+
 log:
   wandb_project: samuel
   wandb_entity: moboehle-kyutai
