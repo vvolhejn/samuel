@@ -119,7 +119,13 @@ def _mel_fig_stacked(audios: list[tuple[str, np.ndarray]], sr: int) -> go.Figure
     from plotly.subplots import make_subplots
 
     titles = [name for name, _ in audios]
-    fig = make_subplots(rows=len(audios), cols=1, subplot_titles=titles)
+    fig = make_subplots(
+        rows=len(audios),
+        cols=1,
+        subplot_titles=titles,
+        vertical_spacing=0.04,
+        horizontal_spacing=0.0,
+    )
     for row, (_, audio) in enumerate(audios, start=1):
         mel = librosa.feature.melspectrogram(
             y=audio.astype(np.float32), sr=sr, n_mels=80
@@ -128,7 +134,12 @@ def _mel_fig_stacked(audios: list[tuple[str, np.ndarray]], sr: int) -> go.Figure
         fig.add_trace(
             go.Heatmap(z=log_mel, colorscale="Viridis", showscale=False), row=row, col=1
         )
-    fig.update_layout(height=250 * len(audios))
+    fig.update_xaxes(showticklabels=False)
+    fig.update_yaxes(showticklabels=False)
+    fig.update_layout(
+        height=160 * len(audios),
+        margin=dict(l=10, r=10, t=24, b=10),
+    )
     return fig
 
 
@@ -230,9 +241,7 @@ def _evaluate(
                 _param_traj_figure(params[i], trainable_names, frame_rate)
             )
             wandb_logs[f"{tag}/mel"] = wandb.Plotly(
-                _mel_fig_stacked(
-                    [("target", tgt_np), ("ola", ola_np), ("exact", ex_np)], sr
-                )
+                _mel_fig_stacked([("target", tgt_np), ("ola", ola_np)], sr)
             )
         wandb.log(wandb_logs, step=step)
 
