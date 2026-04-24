@@ -12,17 +12,20 @@ from torch import Tensor, nn
 from samuel.encoder import SEANetEncoder, SEANetEncoderConfig
 from samuel.pink_trombone import N_PARAMS, PARAM_NAMES, SAMPLE_RATE
 
-# Defaults mirror notebooks/tract_fit.ipynb (9 trainable, 4 frozen).
+# (lo, hi, init) per trainable param. init values are placed in the interior
+# of each range (not at lo or hi) so that bias_init = logit(init_norm) is
+# moderate and sigmoid gradient stays well-conditioned during training.
+# A boundary init → |bias_init|≈9.2 → sigmoid'≈1e-4 → dead gradient.
 _DEFAULT_PARAM_SPEC: dict[str, tuple[float, float, float]] = {
     "noise": (0.0, 0.5, 0.1),
     "frequency": (80.0, 400.0, 140.0),
     "tenseness": (0.0, 1.0, 0.6),
-    "intensity": (0.0, 1.0, 1.0),
-    "loudness": (0.0, 1.0, 1.0),
+    "intensity": (0.0, 1.0, 0.5),
+    "loudness": (0.0, 1.0, 0.5),
     "tongueIndex": (10.0, 35.0, 20.0),
     "tongueDiameter": (1.5, 3.5, 2.4),
     "constrictionIndex": (0.0, 44.0, 30.0),
-    "constrictionDiameter": (-0.5, 3.0, 3.0),
+    "constrictionDiameter": (-0.5, 3.0, 1.25),
 }
 _DEFAULT_FROZEN_VALUES: dict[str, float] = {
     "vibratoWobble": 0.0,
@@ -93,9 +96,12 @@ class PinkTromboneController(nn.Module):
         self.register_buffer("_lo", lo)
         self.register_buffer("_hi", hi)
 
+        # Keep default Kaiming-uniform weight init (fan_in=encoder.dim) — gives
+        # std ≈ 1/sqrt(dim), enough for encoder activations to meaningfully move
+        # the output from the start. bias is overridden so the initial param
+        # output is centered around the configured init values.
         self.head = nn.Linear(config.encoder.dimension, n_trainable)
         with torch.no_grad():
-            self.head.weight.zero_()
             self.head.bias.copy_(bias_init)
 
         trainable_idx = torch.tensor(
@@ -132,7 +138,8 @@ class PinkTromboneController(nn.Module):
         if z.shape[-1] != T_ctrl:
             z = F.interpolate(z, size=T_ctrl, mode="linear", align_corners=True)
 
-        raw = self.head(z.transpose(1, 2))  # [B, T_ctrl, n_trainable]
+        # Head + sigmoid in fp32 so small bf16-range gradients don't underflow.
+        raw = self.head(z.transpose(1, 2)).float()  # [B, T_ctrl, n_trainable]
         constrained = torch.sigmoid(raw) * (self._hi - self._lo) + self._lo
 
         out = torch.zeros(
