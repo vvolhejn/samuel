@@ -2,7 +2,7 @@ defaults:
   - model
   - _self_
 
-batch_size: 128
+batch_size: 64
 
 data:
   manifest_path: manifests/librilight_10h.jsonl
