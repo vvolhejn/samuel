@@ -45,6 +45,31 @@ class MultiScaleLogMagSTFTLoss(nn.Module):
         return loss / len(self.n_ffts)
 
 
+class PitchCentsLoss(nn.Module):
+    """Masked L1 pitch error in cents.
+
+    The prediction is the model's commanded ``frequency`` parameter (in Hz)
+    per control frame, no pitch estimation needed on the synth output.
+    Target is pyin-extracted f0 at the same rate, with a voiced mask
+    indicating which frames to include.
+
+    When no voiced frames are present in the batch, returns zero.
+    """
+
+    def forward(
+        self,
+        pred_hz: Tensor,  # [B, T]
+        target_hz: Tensor,  # [B, T]
+        voiced_mask: Tensor,  # [B, T] bool
+    ) -> Tensor:
+        pred = pred_hz.clamp(min=1.0)
+        target = target_hz.clamp(min=1.0)
+        cents = 1200.0 * torch.log2(pred / target)
+        mask = (voiced_mask & (target_hz > 0)).to(cents.dtype)
+        denom = mask.sum().clamp_min(1.0)
+        return (cents.abs() * mask).sum() / denom
+
+
 class LoudnessEnvelopeLoss(nn.Module):
     """L1 between log-RMS envelopes of pred and target.
 

@@ -31,7 +31,7 @@ import wandb
 from samuel.config import TrainConfig
 from samuel.data import _load_resampled, build_dataloader, load_manifest
 from samuel.evals.pitch import pitch_mae_cents
-from samuel.losses import MultiScaleLogMagSTFTLoss
+from samuel.losses import MultiScaleLogMagSTFTLoss, PitchCentsLoss
 from samuel.model import PinkTromboneController
 from samuel.pink_trombone import PARAM_NAMES, pink_trombone, pink_trombone_ola
 
@@ -269,6 +269,9 @@ def main(hydra_cfg: DictConfig) -> None:
     model = PinkTromboneController(cfg.model).to(device)
     frame_rate = cfg.model.frame_rate
     loss_fn = MultiScaleLogMagSTFTLoss().to(device)
+    pitch_loss_fn = PitchCentsLoss().to(device)
+    # Index of the commanded "frequency" param in the output params vector.
+    _freq_idx = PARAM_NAMES.index("frequency")
 
     ddp_module: nn.Module
     if is_ddp:
@@ -298,6 +301,8 @@ def main(hydra_cfg: DictConfig) -> None:
         world_size=world_size,
         epoch=0,
         seed=cfg.run.seed,
+        pitch_cache_path=cfg.data.pitch_cache_path,
+        control_rate=frame_rate,
     )
 
     # Eval clips (rank 0 only)
@@ -349,7 +354,13 @@ def main(hydra_cfg: DictConfig) -> None:
             data_iter = iter(loader)
             batch = next(data_iter)
 
-        wav = batch.to(device, non_blocking=True)  # [B, S]
+        if isinstance(batch, dict):
+            wav = batch["audio"].to(device, non_blocking=True)
+            pitch_target = batch["pitch"].to(device, non_blocking=True)  # [B, T]
+            voiced_mask = batch["voiced"].to(device, non_blocking=True)  # [B, T]
+        else:
+            wav = batch.to(device, non_blocking=True)
+            pitch_target = voiced_mask = None
         target = wav
         wav_in = wav.unsqueeze(1)  # [B, 1, S]
 
@@ -375,7 +386,15 @@ def main(hydra_cfg: DictConfig) -> None:
             control_rate=frame_rate,
         )
         S = min(pred.shape[-1], target.shape[-1])
-        loss = loss_fn(pred[..., :S], target[..., :S])
+        stft_loss = loss_fn(pred[..., :S], target[..., :S])
+        pitch_loss_val = torch.zeros((), device=device)
+        if pitch_target is not None:
+            T_pitch = min(params.shape[1], pitch_target.shape[1])
+            pred_freq = params[:, :T_pitch, _freq_idx]  # [B, T]
+            pitch_loss_val = pitch_loss_fn(
+                pred_freq, pitch_target[:, :T_pitch], voiced_mask[:, :T_pitch]
+            )
+        loss = stft_loss + cfg.loss.pitch_weight * pitch_loss_val
 
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -400,6 +419,8 @@ def main(hydra_cfg: DictConfig) -> None:
             wandb.log(
                 {
                     "train/loss": loss.item(),
+                    "train/stft_loss": stft_loss.item(),
+                    "train/pitch_loss_cents": pitch_loss_val.item(),
                     "train/lr": optimizer.param_groups[0]["lr"],
                     "train/grad_norm": float(grad_norm),
                     "train/epoch": epoch,

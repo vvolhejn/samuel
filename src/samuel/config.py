@@ -29,11 +29,28 @@ class DataConfig(BaseModel):
     sample_rate: int = 44100
     chunk_seconds: float = 4.0
     num_workers: int = 4
+    pitch_cache_path: Path | None = None
 
     @field_validator("manifest_path")
     @classmethod
     def _resolve_manifest_path(cls, v: Path) -> Path:
         return _resolve_repo_relative(v)
+
+    @field_validator("pitch_cache_path")
+    @classmethod
+    def _resolve_pitch_cache_path(cls, v: Path | None) -> Path | None:
+        return _resolve_repo_relative(v) if v is not None else None
+
+
+class LossConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Weight on the pitch-cents loss (only active when data.pitch_cache_path
+    # is set). Units: total_loss = stft_loss + pitch_weight * mae_cents.
+    # Setting this to ~0.001 makes a 500-cent pitch error contribute 0.5 to
+    # the loss (~10x the STFT silence floor) — enough to pull training past
+    # the silence attractor without dominating spectral matching.
+    pitch_weight: float = 0.0
 
 
 class OptimConfig(BaseModel):
@@ -95,6 +112,7 @@ class TrainConfig(BaseModel):
     )
     synth: SynthConfig = Field(default_factory=SynthConfig)
     optim: OptimConfig = Field(default_factory=OptimConfig)
+    loss: LossConfig = Field(default_factory=LossConfig)
     log: LogConfig = Field(default_factory=LogConfig)
     batch_size: int = 8
 
