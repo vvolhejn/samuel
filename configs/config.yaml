@@ -9,7 +9,7 @@ data:
   sample_rate: 44100
   chunk_seconds: 4.0
   num_workers: 4
-  pitch_cache_path: null  # set to manifests/pitch_cache/librilight_10h.npz to enable pitch loss
+  pitch_cache_path: manifests/pitch_cache/librilight_10h.npz
 
 synth:
   ir_length: 256
@@ -18,7 +18,7 @@ synth:
 loss:
   # pitch_weight must be > 0 for pitch loss to fire; also needs
   # data.pitch_cache_path pointing at a precomputed npz.
-  pitch_weight: 0.0
+  pitch_weight: 0.001
 
 optim:
   lr: 3.0e-4
