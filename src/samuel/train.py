@@ -22,6 +22,7 @@ import numpy as np
 import plotly.graph_objects as go
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from omegaconf import DictConfig
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -34,6 +35,7 @@ from samuel.evals.pitch import pitch_mae_cents
 from samuel.losses import MultiScaleLogMagSTFTLoss
 from samuel.model import PinkTromboneController
 from samuel.pink_trombone import PARAM_NAMES, pink_trombone, pink_trombone_ola
+from samuel.whisper_distill import WhisperDistiller
 
 
 def _ddp_info() -> tuple[int, int, int, bool]:
@@ -279,6 +281,24 @@ def main(hydra_cfg: DictConfig) -> None:
     frame_rate = cfg.model.frame_rate
     loss_fn = MultiScaleLogMagSTFTLoss().to(device)
 
+    whisper: WhisperDistiller | None = None
+    if cfg.whisper.enabled:
+        if cfg.model.whisper_proj_dim == 0 and cfg.whisper.distill_weight > 0:
+            raise ValueError(
+                "whisper.enabled=true with distill_weight>0 requires "
+                "model.whisper_proj_dim>0 (projection head to whisper d_model)"
+            )
+        whisper = WhisperDistiller(
+            model_name=cfg.whisper.model_name,
+            perceptual_layers=cfg.whisper.perceptual_layers,
+            source_sample_rate=cfg.data.sample_rate,
+        ).to(device)
+        if cfg.model.whisper_proj_dim not in (0, whisper.d_model):
+            raise ValueError(
+                f"model.whisper_proj_dim ({cfg.model.whisper_proj_dim}) must "
+                f"match whisper d_model ({whisper.d_model})"
+            )
+
     ddp_module: nn.Module
     if is_ddp:
         ddp_module = DDP(
@@ -374,7 +394,11 @@ def main(hydra_cfg: DictConfig) -> None:
             dtype=torch.bfloat16,
             enabled=(device.type == "cuda"),
         ):
-            params = ddp_module(wav_in)
+            if whisper is not None:
+                params, z_proj = ddp_module(wav_in, return_latent=True)
+            else:
+                params = ddp_module(wav_in)
+                z_proj = None
         params = params.float()
 
         pred = pink_trombone_ola(
@@ -384,7 +408,38 @@ def main(hydra_cfg: DictConfig) -> None:
             control_rate=frame_rate,
         )
         S = min(pred.shape[-1], target.shape[-1])
-        loss = loss_fn(pred[..., :S], target[..., :S])
+        stft_loss = loss_fn(pred[..., :S], target[..., :S])
+        loss = cfg.whisper.stft_weight * stft_loss
+
+        loss_terms: dict[str, float] = {"train/loss_stft": stft_loss.item()}
+
+        if whisper is not None:
+            # Distill: project our latent -> whisper d_model, interp to whisper's
+            # 50 Hz, match whisper's last hidden state (no grad on target).
+            if cfg.whisper.distill_weight > 0 and z_proj is not None:
+                tgt_hidden = whisper.distill_target(target[..., :S])  # [B, T_w, d]
+                z_proj_f = z_proj.float()
+                # [B, T_enc, d] -> [B, d, T_enc] -> interp -> [B, T_w, d]
+                z_proj_t = z_proj_f.transpose(1, 2)
+                z_proj_t = F.interpolate(
+                    z_proj_t,
+                    size=tgt_hidden.shape[1],
+                    mode="linear",
+                    align_corners=True,
+                )
+                z_proj_interp = z_proj_t.transpose(1, 2)
+                # Normalize by target scale so distill loss is comparable across
+                # layers / init conditions and doesn't dominate from magnitude.
+                scale = tgt_hidden.float().abs().mean().clamp(min=1e-6)
+                distill = (z_proj_interp - tgt_hidden.float()).abs().mean() / scale
+                loss = loss + cfg.whisper.distill_weight * distill
+                loss_terms["train/loss_distill"] = distill.item()
+
+            # Perceptual: whisper(pred) vs whisper(target), L1 on hidden states.
+            if cfg.whisper.perceptual_weight > 0:
+                percep = whisper.perceptual_loss(pred[..., :S], target[..., :S])
+                loss = loss + cfg.whisper.perceptual_weight * percep
+                loss_terms["train/loss_perceptual"] = percep.item()
 
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -414,6 +469,7 @@ def main(hydra_cfg: DictConfig) -> None:
                     "train/epoch": epoch,
                     "System/throughput_per_gpu": throughput_per_gpu,
                     "System/throughput_total": throughput_total,
+                    **loss_terms,
                 },
                 step=step,
             )

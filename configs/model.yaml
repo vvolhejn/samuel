@@ -13,6 +13,7 @@ model:
     compress: 2
 
   frame_rate: 12.5
+  whisper_proj_dim: 0  # set to whisper d_model (1280) to enable distillation head
 
   # (lo, hi, init) per trainable parameter. Values not listed here must appear
   # in `frozen_values` below; every Pink Trombone param must be covered.

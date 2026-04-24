@@ -46,6 +46,10 @@ class PinkTromboneControllerConfig(BaseModel):
         default_factory=lambda: dict(_DEFAULT_FROZEN_VALUES)
     )
     frame_rate: float = 12.5  # parameter control rate, Hz
+    # When non-zero, build a linear projection from the encoder's latent
+    # dim to ``whisper_proj_dim`` so we can distill whisper-large-v3
+    # activations. Set to 0 to skip the head (saves ~0.8 M params).
+    whisper_proj_dim: int = 0
 
     def trainable_names(self) -> list[str]:
         """Trainable parameter names in PARAM_NAMES order."""
@@ -104,6 +108,15 @@ class PinkTromboneController(nn.Module):
         with torch.no_grad():
             self.head.bias.copy_(bias_init)
 
+        # Optional projection from encoder latent dim to whisper's residual dim.
+        # Applied to ``z`` before time-interpolation to the whisper rate.
+        if config.whisper_proj_dim > 0:
+            self.whisper_proj: nn.Module = nn.Linear(
+                config.encoder.dimension, config.whisper_proj_dim
+            )
+        else:
+            self.whisper_proj = nn.Identity()
+
         trainable_idx = torch.tensor(
             [PARAM_NAMES.index(n) for n in trainable], dtype=torch.long
         )
@@ -121,8 +134,15 @@ class PinkTromboneController(nn.Module):
         """Number of control frames the model will emit for a given waveform length."""
         return math.ceil(n_samples / self.samples_per_frame)
 
-    def forward(self, wav: Tensor) -> Tensor:
-        """``wav [B, 1, S]`` (float32, 44.1 kHz) -> ``params [B, T_ctrl, 13]``."""
+    def forward(
+        self, wav: Tensor, return_latent: bool = False
+    ) -> Tensor | tuple[Tensor, Tensor]:
+        """``wav [B, 1, S]`` (float32, 44.1 kHz) -> ``params [B, T_ctrl, 13]``.
+
+        If ``return_latent`` is True, also returns the pre-head latent
+        ``z_proj [B, T_enc, proj_dim]`` — projected by the whisper head if
+        configured, else the raw encoder output transposed.
+        """
         if wav.ndim != 3:
             raise ValueError(f"expected [B, 1, S], got {tuple(wav.shape)}")
         B, _C, S = wav.shape
@@ -134,9 +154,11 @@ class PinkTromboneController(nn.Module):
         if pad > 0:
             wav = F.pad(wav, (0, pad))
 
-        z = self.encoder(wav)  # [B, dim, T_enc]
-        if z.shape[-1] != T_ctrl:
-            z = F.interpolate(z, size=T_ctrl, mode="linear", align_corners=True)
+        z_enc = self.encoder(wav)  # [B, dim, T_enc]
+        if z_enc.shape[-1] != T_ctrl:
+            z = F.interpolate(z_enc, size=T_ctrl, mode="linear", align_corners=True)
+        else:
+            z = z_enc
 
         # Head + sigmoid in fp32 so small bf16-range gradients don't underflow.
         raw = self.head(z.transpose(1, 2)).float()  # [B, T_ctrl, n_trainable]
@@ -152,5 +174,12 @@ class PinkTromboneController(nn.Module):
             frozen_idx = self._frozen_idx.view(1, 1, -1).expand(B, T_ctrl, -1)
             frozen_vals = self._frozen_vals.view(1, 1, -1).expand(B, T_ctrl, -1)
             out = out.scatter(2, frozen_idx, frozen_vals.to(out.dtype))
+
+        if return_latent:
+            # Project the pre-interpolation encoder output so time resolution
+            # is native (T_enc, not T_ctrl) — gives finer detail to match
+            # whisper's 50 Hz frames.
+            z_proj = self.whisper_proj(z_enc.transpose(1, 2))  # [B, T_enc, proj_dim]
+            return out, z_proj
 
         return out

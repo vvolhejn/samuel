@@ -56,6 +56,20 @@ class SynthConfig(BaseModel):
     # (it drives T_ctrl) but the synth path reads it from the same field.
 
 
+class WhisperConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    model_name: str = "openai/whisper-large-v3"
+    # Layers (0-indexed) whose activations we match between pred and target.
+    # Defaults span low/mid/high-level features.
+    perceptual_layers: list[int] = Field(default_factory=lambda: [7, 15, 23, 31])
+    # Loss mix weights. 0 disables that term.
+    distill_weight: float = 1.0
+    perceptual_weight: float = 1.0
+    stft_weight: float = 1.0
+
+
 class LogConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -96,6 +110,7 @@ class TrainConfig(BaseModel):
     synth: SynthConfig = Field(default_factory=SynthConfig)
     optim: OptimConfig = Field(default_factory=OptimConfig)
     log: LogConfig = Field(default_factory=LogConfig)
+    whisper: WhisperConfig = Field(default_factory=WhisperConfig)
     batch_size: int = 8
 
     @classmethod
