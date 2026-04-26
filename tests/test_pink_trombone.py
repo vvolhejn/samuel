@@ -123,11 +123,9 @@ class TestGlottis:
         """Create default glottis parameters."""
         device = torch.device("cpu")
         return dict(
-            noise_param=torch.zeros(B, S, device=device),
             frequency=torch.full((B, S), 140.0, device=device),
-            tenseness=torch.full((B, S), 0.6, device=device),
+            voiceness=torch.full((B, S), 0.6, device=device),
             intensity=torch.ones(B, S, device=device),
-            loudness=torch.ones(B, S, device=device),
             vibrato_wobble=torch.ones(B, S, device=device),
             vibrato_freq=torch.full((B, S), 6.0, device=device),
             vibrato_gain=torch.full((B, S), 0.005, device=device),
@@ -149,7 +147,7 @@ class TestGlottis:
         assert torch.isfinite(noise_mod).all()
 
     def test_not_silent(self):
-        """With default params (intensity=1, loudness=1, freq=140), output should be non-zero."""
+        """With default params (intensity=1, voiceness=0.6, freq=140), output should be non-zero."""
         params = self._default_params(S=SAMPLE_RATE)  # 1 second
         out, _ = glottis(**params)
         assert out.abs().max() > 0.01
@@ -161,40 +159,48 @@ class TestGlottis:
         assert out.abs().max() < 1e-6
 
     def test_frequency_affects_pitch(self):
-        """Higher frequency should produce more zero crossings."""
+        """Spectral peak should track the requested fundamental."""
         S = SAMPLE_RATE  # 1 second
         params_lo = self._default_params(S=S)
         params_lo["frequency"] = torch.full((1, S), 100.0)
         params_lo["vibrato_gain"] = torch.zeros(1, S)  # no vibrato for clean test
         params_lo["vibrato_wobble"] = torch.zeros(1, S)
+        params_lo["voiceness"] = torch.full((1, S), 0.99)  # suppress aspiration
 
         params_hi = self._default_params(S=S)
         params_hi["frequency"] = torch.full((1, S), 200.0)
         params_hi["vibrato_gain"] = torch.zeros(1, S)
         params_hi["vibrato_wobble"] = torch.zeros(1, S)
+        params_hi["voiceness"] = torch.full((1, S), 0.99)
 
         out_lo, _ = glottis(**params_lo)
         out_hi, _ = glottis(**params_hi)
 
-        def count_zero_crossings(x):
-            signs = torch.sign(x[0])
-            return (signs[1:] != signs[:-1]).sum().item()
+        def estimated_period_samples(x):
+            """Return the lag of the autocorrelation peak in [SR/500, SR/50]."""
+            y = x[0] - x[0].mean()
+            n = y.shape[-1]
+            F = torch.fft.rfft(y, n=2 * n)
+            ac = torch.fft.irfft(F * F.conj(), n=2 * n)[:n]
+            lo_lag = SAMPLE_RATE // 500
+            hi_lag = SAMPLE_RATE // 50
+            return lo_lag + int(torch.argmax(ac[lo_lag:hi_lag]).item())
 
-        zc_lo = count_zero_crossings(out_lo)
-        zc_hi = count_zero_crossings(out_hi)
-        # Higher freq should have roughly 2x the zero crossings
-        assert zc_hi > zc_lo * 1.5
+        period_lo = estimated_period_samples(out_lo)
+        period_hi = estimated_period_samples(out_hi)
+        assert abs(period_lo - SAMPLE_RATE / 100) < 5
+        assert abs(period_hi - SAMPLE_RATE / 200) < 5
 
-    def test_tenseness_affects_waveform(self):
-        """Different tenseness values should produce different waveforms."""
+    def test_voiceness_affects_waveform(self):
+        """Different voiceness values should produce different waveforms."""
         S = 4800
         params_breathy = self._default_params(S=S)
-        params_breathy["tenseness"] = torch.full((1, S), 0.2)
+        params_breathy["voiceness"] = torch.full((1, S), 0.2)
         params_breathy["vibrato_gain"] = torch.zeros(1, S)
         params_breathy["vibrato_wobble"] = torch.zeros(1, S)
 
         params_tense = self._default_params(S=S)
-        params_tense["tenseness"] = torch.full((1, S), 0.9)
+        params_tense["voiceness"] = torch.full((1, S), 0.9)
         params_tense["vibrato_gain"] = torch.zeros(1, S)
         params_tense["vibrato_wobble"] = torch.zeros(1, S)
 
@@ -202,39 +208,42 @@ class TestGlottis:
         out_tense, _ = glottis(**params_tense)
         assert not torch.allclose(out_breathy, out_tense, atol=1e-3)
 
-    def test_loudness_scales_linearly(self):
-        """Halving loudness should halve the voice component."""
-        S = 4800
-        params1 = self._default_params(S=S)
-        params1["vibrato_gain"] = torch.zeros(1, S)
-        params1["vibrato_wobble"] = torch.zeros(1, S)
+    def test_voiceness_zero_silences_voice(self):
+        """voiceness=0 zeros the voiced component (loudness=voiceness^0.25=0).
+        Aspiration noise still flows; full silence requires intensity=0.
+        """
+        S = SAMPLE_RATE
+        params = self._default_params(S=S)
+        params["voiceness"] = torch.zeros(1, S)
+        params["vibrato_gain"] = torch.zeros(1, S)
+        params["vibrato_wobble"] = torch.zeros(1, S)
 
-        params_half = self._default_params(S=S)
-        params_half["loudness"] = torch.full((1, S), 0.5)
-        params_half["vibrato_gain"] = torch.zeros(1, S)
-        params_half["vibrato_wobble"] = torch.zeros(1, S)
-
-        out1, _ = glottis(**params1)
-        out_half, _ = glottis(**params_half)
-        # With noise_param=0, output is purely voice, which scales with loudness
-        # voice *= intensity * loudness, then output = voice * intensity
-        # So out1 = voice * 1 * 1 * 1, out_half = voice * 1 * 0.5 * 1
-        torch.testing.assert_close(out_half, out1 * 0.5, atol=1e-5, rtol=1e-4)
+        # Voiced component = voice * intensity * loudness; with loudness=0, voice
+        # contribution to output is exactly zero, leaving only aspiration noise.
+        # We can't isolate the voiced component without rewriting glottis(), so
+        # instead check that the output is dominated by broadband noise rather
+        # than a periodic (frequency-locked) waveform: autocorrelation at the
+        # period lag should be near zero.
+        out, _ = glottis(**params)
+        period = int(SAMPLE_RATE / 140)
+        x = out[0]
+        x = x - x.mean()
+        ac = (x[:-period] * x[period:]).mean() / (x.var() + 1e-10)
+        assert ac.abs().item() < 0.1, (
+            f"voiceness=0 still has periodic structure (ac={ac:.3f})"
+        )
 
     def test_differentiable(self):
-        """Gradients should flow through frequency, tenseness, intensity, loudness."""
+        """Gradients should flow through frequency, voiceness, intensity."""
         S = 1920
         freq = torch.full((1, S), 140.0, requires_grad=True)
-        tens = torch.full((1, S), 0.6, requires_grad=True)
+        voiced = torch.full((1, S), 0.6, requires_grad=True)
         inten = torch.ones(1, S, requires_grad=True)
-        loud = torch.ones(1, S, requires_grad=True)
 
         out, _ = glottis(
-            noise_param=torch.zeros(1, S),
             frequency=freq,
-            tenseness=tens,
+            voiceness=voiced,
             intensity=inten,
-            loudness=loud,
             vibrato_wobble=torch.ones(1, S),
             vibrato_freq=torch.full((1, S), 6.0),
             vibrato_gain=torch.full((1, S), 0.005),
@@ -245,9 +254,8 @@ class TestGlottis:
         loss.backward()
 
         assert freq.grad is not None and freq.grad.abs().sum() > 0
-        assert tens.grad is not None and tens.grad.abs().sum() > 0
+        assert voiced.grad is not None and voiced.grad.abs().sum() > 0
         assert inten.grad is not None and inten.grad.abs().sum() > 0
-        assert loud.grad is not None and loud.grad.abs().sum() > 0
 
     def test_batch_independence(self):
         """Each batch element should be processed independently."""
@@ -260,16 +268,30 @@ class TestGlottis:
         out, _ = glottis(**params)
         assert not torch.allclose(out[0], out[1], atol=1e-3)
 
-    def test_aspiration_noise(self):
-        """Non-zero noise param should add aspiration noise."""
+    def test_aspiration_noise_gated_by_voiceness(self):
+        """Lower voiceness opens the aspiration-noise gate (1 - sqrt(tenseness))."""
         S = SAMPLE_RATE
-        params_no_noise = self._default_params(S=S)
-        params_with_noise = self._default_params(S=S)
-        params_with_noise["noise_param"] = torch.ones(1, S)
+        params_breathy = self._default_params(S=S)
+        params_breathy["voiceness"] = torch.full((1, S), 0.05)
+        params_breathy["vibrato_gain"] = torch.zeros(1, S)
+        params_breathy["vibrato_wobble"] = torch.zeros(1, S)
 
-        out_clean, _ = glottis(**params_no_noise)
-        out_noisy, _ = glottis(**params_with_noise)
-        assert not torch.allclose(out_clean, out_noisy, atol=1e-3)
+        params_tense = self._default_params(S=S)
+        params_tense["voiceness"] = torch.full((1, S), 0.99)
+        params_tense["vibrato_gain"] = torch.zeros(1, S)
+        params_tense["vibrato_wobble"] = torch.zeros(1, S)
+
+        out_breathy, _ = glottis(**params_breathy)
+        out_tense, _ = glottis(**params_tense)
+
+        # Breathy output should have notably more high-frequency noise energy.
+        # Compare RMS in the upper-spectrum band where aspiration dominates.
+        def hf_rms(x):
+            X = torch.fft.rfft(x[0])
+            n = X.shape[-1]
+            return X[n // 4 :].abs().pow(2).mean().sqrt()
+
+        assert hf_rms(out_breathy) > 1.5 * hf_rms(out_tense)
 
 
 # ---------------------------------------------------------------------------
@@ -315,11 +337,9 @@ class TestPinkTrombone:
         """Create a params tensor with reasonable defaults."""
         params = torch.zeros(B, T, N_PARAMS)
         defaults = {
-            "noise": 0,
             "frequency": 140,
-            "tenseness": 0.6,
+            "voiceness": 0.6,
             "intensity": 1,
-            "loudness": 1,
             "tongueIndex": 12.9,
             "tongueDiameter": 2.43,
             "vibratoWobble": 1,
@@ -353,7 +373,7 @@ class TestPinkTrombone:
 
     def test_wrong_param_count(self):
         with pytest.raises(AssertionError):
-            pink_trombone(torch.randn(1, 5, 10))
+            pink_trombone(torch.randn(1, 5, 13))
 
 
 # ---------------------------------------------------------------------------
@@ -365,11 +385,9 @@ class TestPinkTromboneOla:
     def _default_params_tensor(self, B=1, T=5):
         params = torch.zeros(B, T, N_PARAMS)
         defaults = {
-            "noise": 0,
             "frequency": 140,
-            "tenseness": 0.6,
+            "voiceness": 0.6,
             "intensity": 1,
-            "loudness": 1,
             "tongueIndex": 12.9,
             "tongueDiameter": 2.43,
             "vibratoWobble": 1,
@@ -407,7 +425,8 @@ class TestPinkTromboneOla:
         # Disable stochastic elements for a clean comparison
         params[..., PARAM_NAMES.index("vibratoGain")] = 0.0
         params[..., PARAM_NAMES.index("vibratoWobble")] = 0.0
-        params[..., PARAM_NAMES.index("noise")] = 0.0
+        # Suppress aspiration noise (voiceness≈1 → 1 - sqrt(tenseness) ≈ 0)
+        params[..., PARAM_NAMES.index("voiceness")] = 0.999
 
         seed = 0
         ref = pink_trombone(params, seed=seed)
@@ -535,9 +554,8 @@ class TestNewApi:
         T = 3
         params = torch.zeros(1, T, N_PARAMS)
         params[..., PARAM_NAMES.index("frequency")] = 140.0
-        params[..., PARAM_NAMES.index("tenseness")] = 0.6
+        params[..., PARAM_NAMES.index("voiceness")] = 0.6
         params[..., PARAM_NAMES.index("intensity")] = 1.0
-        params[..., PARAM_NAMES.index("loudness")] = 1.0
         params[..., PARAM_NAMES.index("tongueIndex")] = 20.0
         params[..., PARAM_NAMES.index("tongueDiameter")] = 2.4
         params[..., PARAM_NAMES.index("tractLength")] = 44.0
@@ -559,9 +577,8 @@ class TestNewApi:
         B = 1
         params = torch.zeros(B, T, N_PARAMS)
         params[..., PARAM_NAMES.index("frequency")] = 140.0
-        params[..., PARAM_NAMES.index("tenseness")] = 0.6
+        params[..., PARAM_NAMES.index("voiceness")] = 0.6
         params[..., PARAM_NAMES.index("intensity")] = 1.0
-        params[..., PARAM_NAMES.index("loudness")] = 1.0
         params[..., PARAM_NAMES.index("tongueIndex")] = 20.0
         params[..., PARAM_NAMES.index("tongueDiameter")] = 2.4
         params[..., PARAM_NAMES.index("tractLength")] = 44.0
@@ -585,9 +602,8 @@ class TestNewApi:
         # intensity=0 zeroes voice but noise still goes through vibrato/tenseness paths.
         # Use a realistic config so the synth actually moves.
         params[..., PARAM_NAMES.index("frequency")] = 140.0
-        params[..., PARAM_NAMES.index("tenseness")] = 0.6
+        params[..., PARAM_NAMES.index("voiceness")] = 0.6
         params[..., PARAM_NAMES.index("intensity")] = 1.0
-        params[..., PARAM_NAMES.index("loudness")] = 1.0
         params[..., PARAM_NAMES.index("tongueIndex")] = 20.0
         params[..., PARAM_NAMES.index("tongueDiameter")] = 2.4
         params[..., PARAM_NAMES.index("tractLength")] = 44.0

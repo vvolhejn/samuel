@@ -13,11 +13,9 @@ SAMPLES_PER_FRAME = int(SAMPLE_RATE / CONTROL_RATE)  # 1920
 BLOCK_SIZE = 128
 
 PARAM_NAMES = [
-    "noise",
     "frequency",
-    "tenseness",
+    "voiceness",
     "intensity",
-    "loudness",
     "tongueIndex",
     "tongueDiameter",
     "vibratoWobble",
@@ -27,7 +25,7 @@ PARAM_NAMES = [
     "constrictionIndex",
     "constrictionDiameter",
 ]
-N_PARAMS = 13
+N_PARAMS = 11
 
 _TRACT_N = 44
 _NOSE_N = int(28 / 44 * _TRACT_N)  # 28
@@ -125,6 +123,7 @@ class SimplexNoise:
             seeds_list = [int(seed)]
             self._scalar = True
 
+        self.seeds_list = seeds_list
         perm, grad_idx = _build_perm_tables(seeds_list)
         self.perm = torch.tensor(perm, dtype=torch.long, device=device)  # [Bp, 512]
         self.grad_idx = torch.tensor(
@@ -221,12 +220,63 @@ def _samples_per_frame(control_rate: float) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _bandpass_pair_response(n_samples: int, device: torch.device) -> Tensor:
+    """Combined frequency response of the JS aspirate (500 Hz) + fricative (1000 Hz)
+    bandpass biquads, evaluated on rfft bins. Both Q=0.5; RBJ "constant 0 dB peak
+    gain" formulation matches Web Audio's BiquadFilterNode bandpass type. Returns a
+    complex tensor of shape [n_samples // 2 + 1].
+    """
+    freqs = torch.fft.rfftfreq(
+        n_samples, d=1.0, device=device
+    )  # cycles/sample, [0, 0.5]
+    omega = 2 * math.pi * freqs
+    z_inv = torch.exp(-1j * omega)
+    z_inv2 = z_inv * z_inv
+
+    H = torch.zeros_like(z_inv)
+    for f0 in (500.0, 1000.0):
+        Q = 0.5
+        w0 = 2 * math.pi * f0 / SAMPLE_RATE
+        alpha = math.sin(w0) / (2 * Q)
+        b0, b2 = alpha, -alpha
+        a0, a1, a2 = 1 + alpha, -2 * math.cos(w0), 1 - alpha
+        num = b0 + b2 * z_inv2
+        den = a0 + a1 * z_inv + a2 * z_inv2
+        H = H + num / den
+    return H
+
+
+def _bandpass_filtered_noise(
+    seeds_list: list[int], B: int, S: int, device: torch.device
+) -> Tensor:
+    """Match the JS noise carrier: uniform white noise in [-1, 1] passed through
+    parallel 500 Hz + 1000 Hz bandpass biquads (Q=0.5 each), summed at the output.
+
+    ``seeds_list`` must be either length 1 (a scalar seed; B independent rows are
+    drawn from one seeded generator) or length ``B`` (per-batch seeds; each row
+    gets its own generator). Equal seeds therefore produce equal rows.
+    """
+    if len(seeds_list) == 1:
+        gen = torch.Generator(device=device).manual_seed(int(seeds_list[0]))
+        white = torch.empty(B, S, device=device).uniform_(-1.0, 1.0, generator=gen)
+    else:
+        assert len(seeds_list) == B, (
+            f"seeds_list length {len(seeds_list)} does not match batch {B}"
+        )
+        rows = []
+        for s in seeds_list:
+            gen = torch.Generator(device=device).manual_seed(int(s))
+            row = torch.empty(S, device=device).uniform_(-1.0, 1.0, generator=gen)
+            rows.append(row)
+        white = torch.stack(rows, dim=0)
+    H = _bandpass_pair_response(S, device)
+    return torch.fft.irfft(torch.fft.rfft(white, dim=-1) * H, n=S, dim=-1)
+
+
 def glottis(
-    noise_param: Tensor,  # [B, S]
     frequency: Tensor,
-    tenseness: Tensor,
+    voiceness: Tensor,
     intensity: Tensor,
-    loudness: Tensor,
     vibrato_wobble: Tensor,
     vibrato_freq: Tensor,
     vibrato_gain: Tensor,
@@ -247,6 +297,10 @@ def glottis(
     vibrato = vibrato + wobble * vibrato_wobble
 
     freq_mod = frequency * (1 + vibrato)
+
+    # JS UI couples voicing as loudness = tenseness ** 0.25 (GlottisUI.js).
+    tenseness = voiceness
+    loudness = voiceness**0.25
 
     # ---- tenseness (with simplex jitter) ----
     sn_tens = 0.1 * simplex.simplex1(t * 0.46) + 0.05 * simplex.simplex1(t * 0.36)
@@ -297,9 +351,10 @@ def glottis(
     noise_mod = noise_mod + (1 - tenseness * intensity) * 3
 
     # ---- aspiration noise ----
+    # Match JS: bandpass-filtered white noise carrier (no learnable gain).
     sn_asp = 0.02 * simplex.simplex1(t * 1.99) + 0.2  # [Bp, S]
-    white_noise = torch.randn(B, S, device=device)
-    noise = white_noise * noise_param * noise_mod
+    carrier = _bandpass_filtered_noise(simplex.seeds_list, B, S, device)
+    noise = carrier * noise_mod
     noise = noise * intensity * intensity
     noise = noise * (1 - torch.sqrt(torch.clamp(tenseness, min=1e-10)))
     noise = noise * sn_asp
@@ -1010,11 +1065,10 @@ def pink_trombone(
     """Differentiable Pink Trombone vocal synthesizer.
 
     Args:
-        params: [B, T, 13] at ``control_rate`` Hz.
-            Parameters (in order): noise, frequency, tenseness, intensity,
-            loudness, tongueIndex, tongueDiameter, vibratoWobble,
-            vibratoFrequency, vibratoGain, tractLength,
-            constrictionIndex, constrictionDiameter.
+        params: [B, T, 11] at ``control_rate`` Hz.
+            Parameters (in order): frequency, voiceness, intensity,
+            tongueIndex, tongueDiameter, vibratoWobble, vibratoFrequency,
+            vibratoGain, tractLength, constrictionIndex, constrictionDiameter.
         seed: scalar int (all batch items share noise), a ``[B]`` int tensor
             (per-batch independent simplex noise), or ``None`` which draws
             a fresh ``[B]`` int tensor on every call.
@@ -1036,11 +1090,9 @@ def pink_trombone(
     p = {name: params_up[..., i] for i, name in enumerate(PARAM_NAMES)}
 
     glottis_out, noise_mod = glottis(
-        noise_param=p["noise"],
         frequency=p["frequency"],
-        tenseness=p["tenseness"],
+        voiceness=p["voiceness"],
         intensity=p["intensity"],
-        loudness=p["loudness"],
         vibrato_wobble=p["vibratoWobble"],
         vibrato_freq=p["vibratoFrequency"],
         vibrato_gain=p["vibratoGain"],
@@ -1074,7 +1126,7 @@ def pink_trombone_ola(
     depth is O(ir_length) rather than O(T * samples_per_frame).
 
     Args:
-        params:    [B, T, 13] at ``control_rate`` Hz (same as ``pink_trombone``).
+        params:    [B, T, 11] at ``control_rate`` Hz (same as ``pink_trombone``).
         seed:      Same semantics as ``pink_trombone``: scalar, ``[B]`` tensor,
                    or ``None`` for fresh per-sample seeds.
         ir_length: FIR approximation length in samples.  Default 4096 (~93 ms
@@ -1101,11 +1153,9 @@ def pink_trombone_ola(
     p = {name: params_up[..., i] for i, name in enumerate(PARAM_NAMES)}
 
     glottis_out, noise_mod = glottis(
-        noise_param=p["noise"],
         frequency=p["frequency"],
-        tenseness=p["tenseness"],
+        voiceness=p["voiceness"],
         intensity=p["intensity"],
-        loudness=p["loudness"],
         vibrato_wobble=p["vibratoWobble"],
         vibrato_freq=p["vibratoFrequency"],
         vibrato_gain=p["vibratoGain"],

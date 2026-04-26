@@ -17,11 +17,9 @@ model:
   # (lo, hi, init) per trainable parameter. Values not listed here must appear
   # in `frozen_values` below; every Pink Trombone param must be covered.
   param_spec:
-    noise:                [0.0, 0.5, 0.1]
     frequency:            [80.0, 400.0, 140.0]
-    tenseness:            [0.0, 1.0, 0.6]
+    voiceness:            [0.0, 1.0, 0.6]
     intensity:            [0.0, 1.0, 0.5]
-    loudness:             [0.0, 1.0, 0.5]
     tongueIndex:          [10.0, 35.0, 20.0]
     tongueDiameter:       [1.5, 3.5, 2.4]
     constrictionIndex:    [0.0, 44.0, 30.0]

@@ -37,9 +37,11 @@ class TestController:
         """Zero-weight head + logit(init_norm) bias -> params equal the configured init."""
         cfg = _small_config()
         model = PinkTromboneController(cfg)
+        with torch.no_grad():
+            model.head.weight.zero_()
         S = model.samples_per_frame * 4
         wav = torch.randn(1, 1, S)  # encoder output does not matter, weight=0
-        params = model(wav)[0, 0]  # [13]
+        params = model(wav)[0, 0]  # [N_PARAMS]
         for name, (lo, hi, init) in _DEFAULT_PARAM_SPEC.items():
             i = PARAM_NAMES.index(name)
             assert params[i].item() == pytest.approx(init, abs=1e-3)
