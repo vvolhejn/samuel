@@ -70,6 +70,8 @@ class LibriLightChunks(IterableDataset):
         epoch: int = 0,
         seed: int = 0,
         drop_last: bool = True,
+        pitch_cache_path: Path | None = None,
+        control_rate: float = 12.5,
     ):
         super().__init__()
         self.manifest_path = manifest_path
@@ -80,8 +82,22 @@ class LibriLightChunks(IterableDataset):
         self.epoch = epoch
         self.seed = seed
         self.drop_last = drop_last
+        self.control_rate = control_rate
+        self.samples_per_pitch_frame = int(round(sample_rate / control_rate))
+        self.pitch_frames_per_chunk = self.chunk_samples // self.samples_per_pitch_frame
         self._all_files = load_manifest(manifest_path)
+        # Index map: original file index in manifest → file object (used to look
+        # up pitch from the cache since pitch is keyed on manifest index).
+        self._file_to_idx = {id(df): i for i, df in enumerate(self._all_files)}
         self._rank_files = _shard(self._all_files, rank, world_size)
+        self.pitch_cache_path = pitch_cache_path
+        self._pitch: dict[int, tuple[np.ndarray, np.ndarray]] | None = None
+        if pitch_cache_path is not None:
+            z = np.load(pitch_cache_path)
+            self._pitch = {}
+            n = int(z["n_files"])
+            for i in range(n):
+                self._pitch[i] = (z[f"f0_{i}"], z[f"voiced_{i}"])
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
@@ -92,7 +108,7 @@ class LibriLightChunks(IterableDataset):
             return list(self._rank_files)
         return self._rank_files[info.id :: info.num_workers]
 
-    def __iter__(self) -> Iterator[torch.Tensor]:
+    def __iter__(self) -> Iterator[torch.Tensor | dict[str, torch.Tensor]]:
         files = self._worker_files()
         info = get_worker_info()
         wid = 0 if info is None else info.id
@@ -101,11 +117,17 @@ class LibriLightChunks(IterableDataset):
         )
         rng.shuffle(files)
 
+        T_pitch = self.pitch_frames_per_chunk
+
         for df in files:
             try:
                 audio = _load_resampled(df.path, self.sample_rate)
             except Exception:  # noqa: BLE001 - skip unreadable files
                 continue
+            file_idx = self._file_to_idx.get(id(df))
+            pitch_f0 = pitch_voiced = None
+            if self._pitch is not None and file_idx is not None:
+                pitch_f0, pitch_voiced = self._pitch[file_idx]
             n = len(audio)
             for i in range(0, n, self.chunk_samples):
                 chunk = audio[i : i + self.chunk_samples]
@@ -114,7 +136,29 @@ class LibriLightChunks(IterableDataset):
                         continue
                     pad = np.zeros(self.chunk_samples - len(chunk), dtype=np.float32)
                     chunk = np.concatenate([chunk, pad])
-                yield torch.from_numpy(chunk)
+
+                if self._pitch is None:
+                    yield torch.from_numpy(chunk)
+                    continue
+
+                p_start = i // self.samples_per_pitch_frame
+                p_end = p_start + T_pitch
+                if pitch_f0 is None or p_end > len(pitch_f0):
+                    # Cache shorter than expected — pad with unvoiced zeros.
+                    f0 = np.zeros(T_pitch, dtype=np.float32)
+                    voiced = np.zeros(T_pitch, dtype=bool)
+                    have = 0 if pitch_f0 is None else max(0, len(pitch_f0) - p_start)
+                    if have > 0:
+                        f0[:have] = pitch_f0[p_start : p_start + have]
+                        voiced[:have] = pitch_voiced[p_start : p_start + have]
+                else:
+                    f0 = pitch_f0[p_start:p_end].astype(np.float32, copy=False)
+                    voiced = pitch_voiced[p_start:p_end]
+                yield {
+                    "audio": torch.from_numpy(chunk),
+                    "pitch": torch.from_numpy(f0),
+                    "voiced": torch.from_numpy(voiced.astype(np.bool_)),
+                }
 
 
 def build_dataloader(
@@ -129,6 +173,8 @@ def build_dataloader(
     seed: int = 0,
     drop_last: bool = True,
     pin_memory: bool = True,
+    pitch_cache_path: Path | None = None,
+    control_rate: float = 12.5,
 ) -> DataLoader:
     dataset = LibriLightChunks(
         manifest_path=manifest_path,
@@ -139,6 +185,8 @@ def build_dataloader(
         epoch=epoch,
         seed=seed,
         drop_last=drop_last,
+        pitch_cache_path=pitch_cache_path,
+        control_rate=control_rate,
     )
     return DataLoader(
         dataset,

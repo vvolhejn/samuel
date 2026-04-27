@@ -2,17 +2,23 @@ defaults:
   - model
   - _self_
 
-batch_size: 128
+batch_size: 64
 
 data:
   manifest_path: manifests/librilight_10h.jsonl
   sample_rate: 44100
   chunk_seconds: 4.0
   num_workers: 4
+  pitch_cache_path: manifests/pitch_cache/librilight_10h.npz
 
 synth:
   ir_length: 256
   ir_impl: sequential
+
+loss:
+  # pitch_weight must be > 0 for pitch loss to fire; also needs
+  # data.pitch_cache_path pointing at a precomputed npz.
+  pitch_weight: 0.001
 
 optim:
   lr: 3.0e-4
