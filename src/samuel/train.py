@@ -96,38 +96,42 @@ def _tau_for_step(step: int, cfg: TrainConfig) -> float:
 
 @torch.no_grad()
 def _controller_diagnostics(
-    aux: dict[str, torch.Tensor], trainable_names: list[str]
+    aux: dict[str, torch.Tensor], trainable_names: list[str], tau: float
 ) -> dict[str, float | wandb.Histogram]:
     """Per-step diagnostics for the categorical head + encoder.
 
     Logits and z come from ``model.forward(..., return_aux=True)``. Logged
     under ``diag/`` to keep the train/eval namespaces clean.
+
+    Two bucket histograms per trainable param:
+      - ``bucket_usage``: hard argmax counts (what eval and hard-Gumbel pick).
+      - ``bucket_usage_tempered``: average softmax(logits/tau) per bucket
+        (what the soft Gumbel feeds into the synth in expectation).
     """
     logits = aux["logits"].detach().float()  # [B, T, n_t, n_b]
     z = aux["z"].detach().float()  # [B, dim, T]
-    B, T, n_t, n_b = logits.shape
+    _, _, _, n_b = logits.shape
 
     probs = F.softmax(logits, dim=-1)
     softmax_entropy = -(probs * probs.clamp_min(1e-12).log()).sum(-1)  # [B, T, n_t]
     top2 = logits.topk(2, dim=-1).values
     margin = top2[..., 0] - top2[..., 1]  # [B, T, n_t]
     argmax = logits.argmax(-1)  # [B, T, n_t]
+    tempered = F.softmax(logits / max(tau, 1e-6), dim=-1)
+    tempered_per_bucket = tempered.mean(dim=(0, 1))  # [n_t, n_b]
+    edges = np.arange(n_b + 1) - 0.5
 
     out: dict[str, float | wandb.Histogram] = {}
     for j, name in enumerate(trainable_names):
         a_j = argmax[..., j].flatten()
         counts = torch.bincount(a_j, minlength=n_b).float()
-        p = counts / counts.sum().clamp_min(1)
-        # Entropy of the empirical bucket-usage distribution across the
-        # batch+time grid. 0 ⇒ always the same bucket (collapsed),
-        # log(n_buckets) ⇒ uniform across buckets.
-        bucket_usage_entropy = -(p * p.clamp_min(1e-12).log()).sum().item()
         out[f"diag/softmax_entropy/{name}"] = softmax_entropy[..., j].mean().item()
-        out[f"diag/bucket_usage_entropy/{name}"] = bucket_usage_entropy
         out[f"diag/margin/{name}"] = margin[..., j].mean().item()
-        edges = np.arange(n_b + 1) - 0.5
         out[f"diag/bucket_usage/{name}"] = wandb.Histogram(
             np_histogram=(counts.cpu().numpy(), edges)
+        )
+        out[f"diag/bucket_usage_tempered/{name}"] = wandb.Histogram(
+            np_histogram=(tempered_per_bucket[j].cpu().numpy(), edges)
         )
 
     out["diag/softmax_entropy/mean"] = softmax_entropy.mean().item()
@@ -563,7 +567,9 @@ def main(hydra_cfg: DictConfig) -> None:
                 "System/throughput_total": throughput_total,
             }
             if aux is not None:
-                log_payload.update(_controller_diagnostics(aux, model.trainable_names_))
+                log_payload.update(
+                    _controller_diagnostics(aux, model.trainable_names_, tau)
+                )
             wandb.log(log_payload, step=step)
 
         if (
