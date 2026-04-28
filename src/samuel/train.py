@@ -112,8 +112,6 @@ def _controller_diagnostics(
     z = aux["z"].detach().float()  # [B, dim, T]
     _, _, _, n_b = logits.shape
 
-    probs = F.softmax(logits, dim=-1)
-    softmax_entropy = -(probs * probs.clamp_min(1e-12).log()).sum(-1)  # [B, T, n_t]
     top2 = logits.topk(2, dim=-1).values
     margin = top2[..., 0] - top2[..., 1]  # [B, T, n_t]
     argmax = logits.argmax(-1)  # [B, T, n_t]
@@ -125,7 +123,6 @@ def _controller_diagnostics(
     for j, name in enumerate(trainable_names):
         a_j = argmax[..., j].flatten()
         counts = torch.bincount(a_j, minlength=n_b).float()
-        out[f"diag/softmax_entropy/{name}"] = softmax_entropy[..., j].mean().item()
         out[f"diag/margin/{name}"] = margin[..., j].mean().item()
         out[f"diag/bucket_usage/{name}"] = wandb.Histogram(
             np_histogram=(counts.cpu().numpy(), edges)
@@ -134,7 +131,6 @@ def _controller_diagnostics(
             np_histogram=(tempered_per_bucket[j].cpu().numpy(), edges)
         )
 
-    out["diag/softmax_entropy/mean"] = softmax_entropy.mean().item()
     out["diag/margin/mean"] = margin.mean().item()
     out["diag/z_mean_norm"] = z.norm(dim=1).mean().item()
     # Per-feature std across batch+time, averaged. Low ⇒ encoder collapsed.
