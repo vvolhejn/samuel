@@ -138,7 +138,13 @@ class PinkTromboneController(nn.Module):
         """Number of control frames the model will emit for a given waveform length."""
         return math.ceil(n_samples / self.samples_per_frame)
 
-    def forward(self, wav: Tensor, f0: Tensor, tau: float = 1.0) -> Tensor:
+    def forward(
+        self,
+        wav: Tensor,
+        f0: Tensor,
+        tau: float = 1.0,
+        return_aux: bool = False,
+    ) -> Tensor | tuple[Tensor, dict[str, Tensor]]:
         """Predict Pink Trombone parameter trajectories.
 
         Args:
@@ -147,9 +153,13 @@ class PinkTromboneController(nn.Module):
                 Already interpolated through unvoiced regions and clamped to a
                 sane range.
             tau: Gumbel-softmax temperature (training only).
+            return_aux: if True, also return a dict with ``logits``
+                ``[B, T_ctrl, n_trainable, n_buckets]`` and ``z`` (encoder
+                output, ``[B, dim, T_ctrl]``) for diagnostics.
 
         Returns:
-            ``[B, T_ctrl, N_PARAMS]`` Pink Trombone parameter tensor.
+            ``[B, T_ctrl, N_PARAMS]`` parameter tensor (and ``aux`` dict if
+            ``return_aux=True``).
         """
         if wav.ndim != 3:
             raise ValueError(f"expected wav [B, 1, S], got {tuple(wav.shape)}")
@@ -194,4 +204,6 @@ class PinkTromboneController(nn.Module):
             (B, T_ctrl, 1), self._freq_idx, device=out.device, dtype=torch.long
         )
         out = out.scatter(2, freq_idx, f0.unsqueeze(-1).to(out.dtype))
+        if return_aux:
+            return out, {"logits": logits, "z": z}
         return out

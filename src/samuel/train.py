@@ -22,6 +22,7 @@ import numpy as np
 import plotly.graph_objects as go
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from omegaconf import DictConfig
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -91,6 +92,47 @@ def _tau_for_step(step: int, cfg: TrainConfig) -> float:
         return cfg.optim.tau_end
     frac = step / anneal
     return cfg.optim.tau_start + frac * (cfg.optim.tau_end - cfg.optim.tau_start)
+
+
+@torch.no_grad()
+def _controller_diagnostics(
+    aux: dict[str, torch.Tensor], trainable_names: list[str]
+) -> dict[str, float | wandb.Histogram]:
+    """Per-step diagnostics for the categorical head + encoder.
+
+    Logits and z come from ``model.forward(..., return_aux=True)``. Logged
+    under ``diag/`` to keep the train/eval namespaces clean.
+    """
+    logits = aux["logits"].detach().float()  # [B, T, n_t, n_b]
+    z = aux["z"].detach().float()  # [B, dim, T]
+    B, T, n_t, n_b = logits.shape
+
+    probs = F.softmax(logits, dim=-1)
+    softmax_entropy = -(probs * probs.clamp_min(1e-12).log()).sum(-1)  # [B, T, n_t]
+    top2 = logits.topk(2, dim=-1).values
+    margin = top2[..., 0] - top2[..., 1]  # [B, T, n_t]
+    argmax = logits.argmax(-1)  # [B, T, n_t]
+
+    out: dict[str, float | wandb.Histogram] = {}
+    for j, name in enumerate(trainable_names):
+        a_j = argmax[..., j].flatten()
+        counts = torch.bincount(a_j, minlength=n_b).float()
+        p = counts / counts.sum().clamp_min(1)
+        argmax_entropy = -(p * p.clamp_min(1e-12).log()).sum().item()
+        out[f"diag/softmax_entropy/{name}"] = softmax_entropy[..., j].mean().item()
+        out[f"diag/argmax_entropy/{name}"] = argmax_entropy
+        out[f"diag/margin/{name}"] = margin[..., j].mean().item()
+        edges = np.arange(n_b + 1) - 0.5
+        out[f"diag/bucket_usage/{name}"] = wandb.Histogram(
+            np_histogram=(counts.cpu().numpy(), edges)
+        )
+
+    out["diag/softmax_entropy/mean"] = softmax_entropy.mean().item()
+    out["diag/margin/mean"] = margin.mean().item()
+    out["diag/z_mean_norm"] = z.norm(dim=1).mean().item()
+    # Per-feature std across batch+time, averaged. Low ⇒ encoder collapsed.
+    out["diag/z_std_per_feat"] = z.std(dim=(0, 2)).mean().item()
+    return out
 
 
 def _volume_match(pred: torch.Tensor, target: torch.Tensor, hop: int) -> torch.Tensor:
@@ -462,12 +504,17 @@ def main(hydra_cfg: DictConfig) -> None:
         optimizer.zero_grad(set_to_none=True)
 
         # Encoder + head in bf16; synth & loss in fp32
+        log_diag = rank == 0 and step % cfg.log.log_every == 0
         with torch.autocast(
             device_type=device.type,
             dtype=torch.bfloat16,
             enabled=(device.type == "cuda"),
         ):
-            params = ddp_module(wav_in, f0, tau)
+            out = ddp_module(wav_in, f0, tau, return_aux=log_diag)
+            if log_diag:
+                params, aux = out
+            else:
+                params, aux = out, None
         params = params.float()
 
         pred = pink_trombone_ola(
@@ -501,18 +548,18 @@ def main(hydra_cfg: DictConfig) -> None:
             throughput_total = throughput_per_gpu * world_size
             throughput_t0 = time.perf_counter()
             throughput_audio_s = 0.0
-            wandb.log(
-                {
-                    "train/loss": loss.item(),
-                    "train/lr": optimizer.param_groups[0]["lr"],
-                    "train/tau": tau,
-                    "train/grad_norm": float(grad_norm),
-                    "train/epoch": epoch,
-                    "System/throughput_per_gpu": throughput_per_gpu,
-                    "System/throughput_total": throughput_total,
-                },
-                step=step,
-            )
+            log_payload: dict[str, object] = {
+                "train/loss": loss.item(),
+                "train/lr": optimizer.param_groups[0]["lr"],
+                "train/tau": tau,
+                "train/grad_norm": float(grad_norm),
+                "train/epoch": epoch,
+                "System/throughput_per_gpu": throughput_per_gpu,
+                "System/throughput_total": throughput_total,
+            }
+            if aux is not None:
+                log_payload.update(_controller_diagnostics(aux, model.trainable_names_))
+            wandb.log(log_payload, step=step)
 
         if (
             rank == 0
