@@ -118,9 +118,12 @@ def _controller_diagnostics(
         a_j = argmax[..., j].flatten()
         counts = torch.bincount(a_j, minlength=n_b).float()
         p = counts / counts.sum().clamp_min(1)
-        argmax_entropy = -(p * p.clamp_min(1e-12).log()).sum().item()
+        # Entropy of the empirical bucket-usage distribution across the
+        # batch+time grid. 0 ⇒ always the same bucket (collapsed),
+        # log(n_buckets) ⇒ uniform across buckets.
+        bucket_usage_entropy = -(p * p.clamp_min(1e-12).log()).sum().item()
         out[f"diag/softmax_entropy/{name}"] = softmax_entropy[..., j].mean().item()
-        out[f"diag/argmax_entropy/{name}"] = argmax_entropy
+        out[f"diag/bucket_usage_entropy/{name}"] = bucket_usage_entropy
         out[f"diag/margin/{name}"] = margin[..., j].mean().item()
         edges = np.arange(n_b + 1) - 0.5
         out[f"diag/bucket_usage/{name}"] = wandb.Histogram(
