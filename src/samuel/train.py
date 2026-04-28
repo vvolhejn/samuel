@@ -506,8 +506,10 @@ def main(hydra_cfg: DictConfig) -> None:
         tau = _tau_for_step(step, cfg)
         optimizer.zero_grad(set_to_none=True)
 
-        # Encoder + head in bf16; synth & loss in fp32
-        log_diag = rank == 0 and step % cfg.log.log_every == 0
+        # Encoder + head in bf16; synth & loss in fp32. ``step`` is the
+        # pre-increment count; the wandb log below fires on (step+1) so we
+        # match it here to keep diag aligned with the same forward pass.
+        log_diag = rank == 0 and (step + 1) % cfg.log.log_every == 0
         with torch.autocast(
             device_type=device.type,
             dtype=torch.bfloat16,
