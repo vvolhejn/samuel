@@ -157,17 +157,31 @@ def _load_eval_clips(
 
 
 def _param_traj_figure(
-    params: torch.Tensor, trainable_names: list[str], frame_rate: float
+    params: torch.Tensor,
+    trainable_names: list[str],
+    frame_rate: float,
+    bounds: dict[str, tuple[float, float]] | None = None,
 ) -> go.Figure:
-    """plotly line plot of trainable param trajectories for one clip."""
-    params = params.detach().cpu().numpy()  # [T, 13]
+    """plotly line plot of trainable param trajectories for one clip.
+
+    If ``bounds`` is given, each trainable param is rescaled to [0, 1] using
+    its (lo, hi) so all trainable params share the same axis.
+    """
+    params = params.detach().cpu().numpy()  # [T, N_PARAMS]
     T = params.shape[0]
     t = np.arange(T) / frame_rate
     fig = go.Figure()
     for name in trainable_names:
         i = PARAM_NAMES.index(name)
-        fig.add_trace(go.Scatter(x=t, y=params[:, i], mode="lines", name=name))
-    fig.update_layout(xaxis_title="time (s)", yaxis_title="value", height=400)
+        y = params[:, i]
+        if bounds is not None:
+            lo, hi = bounds[name]
+            y = (y - lo) / (hi - lo)
+        fig.add_trace(go.Scatter(x=t, y=y, mode="lines", name=name))
+    yaxis_title = "normalized value" if bounds is not None else "value"
+    fig.update_layout(xaxis_title="time (s)", yaxis_title=yaxis_title, height=400)
+    if bounds is not None:
+        fig.update_yaxes(range=[-0.05, 1.05])
     return fig
 
 
@@ -294,6 +308,7 @@ def _evaluate(
         gap = np.zeros(int(sr * 0.1), dtype=np.float32)
         wandb_logs: dict[str, object] = {}
         trainable_names = model.trainable_names_
+        bounds = {n: model.config.param_spec[n][:2] for n in trainable_names}
         for i, name in enumerate(eval_names):
             tgt_np = target[i].detach().cpu().numpy()
             ola_np = pred_norm[i].detach().cpu().numpy()
@@ -305,7 +320,9 @@ def _evaluate(
             )
             wandb_logs[f"{tag}/audio"] = wandb.Audio(combined, sample_rate=sr)
             wandb_logs[f"{tag}/params"] = wandb.Plotly(
-                _param_traj_figure(params[i], trainable_names, frame_rate)
+                _param_traj_figure(
+                    params[i], trainable_names, frame_rate, bounds=bounds
+                )
             )
             wandb_logs[f"{tag}/mel"] = wandb.Plotly(
                 _mel_fig_stacked([("target", tgt_np), ("ola", ola_np)], sr)

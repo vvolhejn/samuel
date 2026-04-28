@@ -30,10 +30,15 @@ def compute_pitch(
     fmin: float,
     fmax: float,
     frame_length: int,
-    voiced_prob_threshold: float = 0.5,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """pyin pitch at hop=samples_per_frame. Returns (f0_hz, voiced_mask)."""
-    f0, _voiced_flag, voiced_prob = librosa.pyin(
+    """pyin pitch at hop=samples_per_frame. Returns (f0_hz, voiced_mask).
+
+    Voicing comes from librosa's Viterbi-decoded ``voiced_flag`` (equivalently,
+    the frames where ``f0`` is finite). ``voiced_prob`` is a smoothed transition
+    probability that mostly sits below 0.5 even on confidently voiced frames,
+    so thresholding it is much stricter than what pyin actually decides.
+    """
+    f0, voiced_flag, _voiced_prob = librosa.pyin(
         audio,
         fmin=fmin,
         fmax=fmax,
@@ -41,7 +46,7 @@ def compute_pitch(
         frame_length=frame_length,
         hop_length=samples_per_frame,
     )
-    voiced = (voiced_prob >= voiced_prob_threshold) & np.isfinite(f0)
+    voiced = voiced_flag & np.isfinite(f0)
     f0 = np.where(np.isfinite(f0), f0, 0.0).astype(np.float32)
     return f0, voiced.astype(bool)
 
