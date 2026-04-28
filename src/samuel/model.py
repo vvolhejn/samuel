@@ -182,7 +182,13 @@ class PinkTromboneController(nn.Module):
         logits = logits.view(B, T_ctrl, n_trainable, self.n_buckets)
 
         if self.training:
-            weights = F.gumbel_softmax(logits, tau=tau, hard=True, dim=-1)
+            # hard=False: the forward output is the soft Gumbel-softmax
+            # distribution; (weights * centers).sum is then a smooth
+            # expectation between bucket centers. Eval still snaps to the
+            # argmax bucket, so there's a mild train/eval mismatch — but
+            # hard=True (straight-through) tends to lock the argmax in this
+            # setup, with eval loss bit-identical across many steps.
+            weights = F.gumbel_softmax(logits, tau=tau, hard=False, dim=-1)
         else:
             argmax = logits.argmax(dim=-1)
             weights = F.one_hot(argmax, num_classes=self.n_buckets).to(logits.dtype)
