@@ -12,20 +12,23 @@ model:
     pad_mode: constant
     compress: 2
 
-  frame_rate: 12.5
+  # 2048 samples = ~21.53 Hz at 44.1 kHz. Matches the loss hop and the
+  # pitch-cache hop.
+  samples_per_frame: 2048
+  n_buckets: 8
 
-  # (lo, hi, init) per trainable parameter. Values not listed here must appear
-  # in `frozen_values` below; every Pink Trombone param must be covered.
+  # (lo, hi, init) per trainable parameter. ``frequency`` is supplied
+  # externally from the pyin cache; ``intensity`` is frozen at 1.0 and the
+  # synth output is RMS-matched to the target post-hoc.
   param_spec:
-    frequency:            [80.0, 400.0, 140.0]
     voiceness:            [0.0, 1.0, 0.6]
-    intensity:            [0.0, 1.0, 0.5]
     tongueIndex:          [10.0, 35.0, 20.0]
     tongueDiameter:       [1.5, 3.5, 2.4]
     constrictionIndex:    [0.0, 44.0, 30.0]
     constrictionDiameter: [-0.5, 3.0, 1.25]
 
   frozen_values:
+    intensity: 1.0
     vibratoWobble: 0.0
     vibratoFrequency: 6.0
     vibratoGain: 0.0

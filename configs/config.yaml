@@ -6,6 +6,7 @@ batch_size: 128
 
 data:
   manifest_path: manifests/librilight_10h.jsonl
+  pitch_cache_path: manifests/pitch_cache/librilight_10h_spf2048.npz
   sample_rate: 44100
   chunk_seconds: 4.0
   num_workers: 4
@@ -21,6 +22,9 @@ optim:
   grad_clip: 1.0
   max_steps: 40000
   warmup_steps: 800
+  tau_start: 2.0
+  tau_end: 0.5
+  tau_anneal_steps: null  # default = max_steps
 
 log:
   wandb_project: samuel

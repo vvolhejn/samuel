@@ -1,4 +1,12 @@
-"""1D-CNN controller that turns audio into Pink Trombone parameter trajectories."""
+"""1D-CNN controller that turns audio into Pink Trombone parameter trajectories.
+
+The head emits a categorical distribution over ``n_buckets`` evenly spaced
+values per trainable parameter. During training a (hard) Gumbel-softmax
+sample selects one bucket center; at eval time the argmax bucket is used.
+The ``frequency`` parameter is supplied externally (precomputed pyin) and
+``intensity`` is frozen to 1.0 — volume is matched post-synth in the train
+loop.
+"""
 
 from __future__ import annotations
 
@@ -12,20 +20,17 @@ from torch import Tensor, nn
 from samuel.encoder import SEANetEncoder, SEANetEncoderConfig
 from samuel.pink_trombone import N_PARAMS, PARAM_NAMES, SAMPLE_RATE
 
-# (lo, hi, init) per trainable param. init values are placed in the interior
-# of each range (not at lo or hi) so that bias_init = logit(init_norm) is
-# moderate and sigmoid gradient stays well-conditioned during training.
-# A boundary init → |bias_init|≈9.2 → sigmoid'≈1e-4 → dead gradient.
+# (lo, hi, init) per trainable parameter. ``frequency`` and ``intensity`` are
+# intentionally absent — frequency comes from pyin, intensity is frozen.
 _DEFAULT_PARAM_SPEC: dict[str, tuple[float, float, float]] = {
-    "frequency": (80.0, 400.0, 140.0),
     "voiceness": (0.0, 1.0, 0.6),
-    "intensity": (0.0, 1.0, 0.5),
     "tongueIndex": (10.0, 35.0, 20.0),
     "tongueDiameter": (1.5, 3.5, 2.4),
     "constrictionIndex": (0.0, 44.0, 30.0),
     "constrictionDiameter": (-0.5, 3.0, 1.25),
 }
 _DEFAULT_FROZEN_VALUES: dict[str, float] = {
+    "intensity": 1.0,
     "vibratoWobble": 0.0,
     "vibratoFrequency": 6.0,
     "vibratoGain": 0.0,
@@ -43,7 +48,12 @@ class PinkTromboneControllerConfig(BaseModel):
     frozen_values: dict[str, float] = Field(
         default_factory=lambda: dict(_DEFAULT_FROZEN_VALUES)
     )
-    frame_rate: float = 12.5  # parameter control rate, Hz
+    samples_per_frame: int = 2048
+    n_buckets: int = 8
+
+    @property
+    def frame_rate(self) -> float:
+        return SAMPLE_RATE / self.samples_per_frame
 
     def trainable_names(self) -> list[str]:
         """Trainable parameter names in PARAM_NAMES order."""
@@ -55,10 +65,17 @@ class PinkTromboneControllerConfig(BaseModel):
         overlap = trainable & frozen
         if overlap:
             raise ValueError(f"params in both param_spec and frozen_values: {overlap}")
-        missing = set(PARAM_NAMES) - trainable - frozen
+        if "frequency" in trainable or "frequency" in frozen:
+            raise ValueError(
+                "'frequency' must not appear in param_spec or frozen_values; "
+                "it is supplied externally from the pyin cache"
+            )
+        covered = trainable | frozen | {"frequency"}
+        missing = set(PARAM_NAMES) - covered
         if missing:
             raise ValueError(
-                f"params covered by neither param_spec nor frozen_values: {missing}"
+                f"params covered by neither param_spec, frozen_values, nor "
+                f"external frequency: {missing}"
             )
         unknown = (trainable | frozen) - set(PARAM_NAMES)
         if unknown:
@@ -66,14 +83,15 @@ class PinkTromboneControllerConfig(BaseModel):
 
 
 class PinkTromboneController(nn.Module):
-    """SEANet encoder -> linear head -> sigmoid-bounded Pink Trombone params."""
+    """SEANet encoder -> categorical head over ``n_buckets`` per parameter."""
 
     def __init__(self, config: PinkTromboneControllerConfig):
         super().__init__()
         config.validate_coverage()
         self.config = config
 
-        self.samples_per_frame = int(round(SAMPLE_RATE / config.frame_rate))
+        self.samples_per_frame = config.samples_per_frame
+        self.n_buckets = config.n_buckets
         self.encoder = SEANetEncoder(config.encoder)
 
         trainable = config.trainable_names()
@@ -86,26 +104,27 @@ class PinkTromboneController(nn.Module):
         hi = torch.tensor(
             [config.param_spec[n][1] for n in trainable], dtype=torch.float32
         )
-        init = torch.tensor(
-            [config.param_spec[n][2] for n in trainable], dtype=torch.float32
-        )
-        init_norm = ((init - lo) / (hi - lo)).clamp(1e-4, 1 - 1e-4)
-        bias_init = torch.log(init_norm / (1 - init_norm))
-        self.register_buffer("_lo", lo)
-        self.register_buffer("_hi", hi)
+        # Bucket centers are spaced ``(k + 0.5) / n_buckets`` so the extremes
+        # of the range are never reached — endpoints like ``voiceness=0`` or
+        # ``constrictionDiameter=-0.5`` cause synth NaNs.
+        steps = (
+            torch.arange(config.n_buckets, dtype=torch.float32) + 0.5
+        ) / config.n_buckets
+        # [n_trainable, n_buckets]
+        centers = lo.unsqueeze(1) + steps.unsqueeze(0) * (hi - lo).unsqueeze(1)
+        self.register_buffer("bucket_centers", centers)
 
-        # Keep default Kaiming-uniform weight init (fan_in=encoder.dim) — gives
-        # std ≈ 1/sqrt(dim), enough for encoder activations to meaningfully move
-        # the output from the start. bias is overridden so the initial param
-        # output is centered around the configured init values.
-        self.head = nn.Linear(config.encoder.dimension, n_trainable)
+        self.head = nn.Linear(config.encoder.dimension, n_trainable * config.n_buckets)
+        # Bias init at zero -> uniform softmax -> mean bucket value at start.
         with torch.no_grad():
-            self.head.bias.copy_(bias_init)
+            self.head.bias.zero_()
 
         trainable_idx = torch.tensor(
             [PARAM_NAMES.index(n) for n in trainable], dtype=torch.long
         )
         self.register_buffer("_trainable_idx", trainable_idx)
+
+        self._freq_idx: int = PARAM_NAMES.index("frequency")
 
         frozen_items = list(config.frozen_values.items())
         frozen_idx = torch.tensor(
@@ -119,14 +138,26 @@ class PinkTromboneController(nn.Module):
         """Number of control frames the model will emit for a given waveform length."""
         return math.ceil(n_samples / self.samples_per_frame)
 
-    def forward(self, wav: Tensor) -> Tensor:
-        """``wav [B, 1, S]`` (float32, 44.1 kHz) -> ``params [B, T_ctrl, 13]``."""
+    def forward(self, wav: Tensor, f0: Tensor, tau: float = 1.0) -> Tensor:
+        """Predict Pink Trombone parameter trajectories.
+
+        Args:
+            wav: ``[B, 1, S]`` audio at 44.1 kHz.
+            f0: ``[B, T_ctrl]`` fundamental frequency in Hz per control frame.
+                Already interpolated through unvoiced regions and clamped to a
+                sane range.
+            tau: Gumbel-softmax temperature (training only).
+
+        Returns:
+            ``[B, T_ctrl, N_PARAMS]`` Pink Trombone parameter tensor.
+        """
         if wav.ndim != 3:
-            raise ValueError(f"expected [B, 1, S], got {tuple(wav.shape)}")
+            raise ValueError(f"expected wav [B, 1, S], got {tuple(wav.shape)}")
         B, _C, S = wav.shape
         T_ctrl = self.t_ctrl_for(S)
+        if f0.shape != (B, T_ctrl):
+            raise ValueError(f"expected f0 [{B}, {T_ctrl}], got {tuple(f0.shape)}")
 
-        # SEANetEncoder requires S % prod(ratios) == 0; zero-pad on the right.
         hop = self.encoder.hop_length
         pad = (hop - S % hop) % hop
         if pad > 0:
@@ -136,9 +167,17 @@ class PinkTromboneController(nn.Module):
         if z.shape[-1] != T_ctrl:
             z = F.interpolate(z, size=T_ctrl, mode="linear", align_corners=True)
 
-        # Head + sigmoid in fp32 so small bf16-range gradients don't underflow.
-        raw = self.head(z.transpose(1, 2)).float()  # [B, T_ctrl, n_trainable]
-        constrained = torch.sigmoid(raw) * (self._hi - self._lo) + self._lo
+        n_trainable = self.bucket_centers.shape[0]
+        logits = self.head(z.transpose(1, 2)).float()  # [B, T_ctrl, n_t*n_b]
+        logits = logits.view(B, T_ctrl, n_trainable, self.n_buckets)
+
+        if self.training:
+            weights = F.gumbel_softmax(logits, tau=tau, hard=True, dim=-1)
+        else:
+            argmax = logits.argmax(dim=-1)
+            weights = F.one_hot(argmax, num_classes=self.n_buckets).to(logits.dtype)
+
+        constrained = (weights * self.bucket_centers).sum(dim=-1)  # [B, T_ctrl, n_t]
 
         out = torch.zeros(
             B, T_ctrl, N_PARAMS, device=wav.device, dtype=constrained.dtype
@@ -151,4 +190,8 @@ class PinkTromboneController(nn.Module):
             frozen_vals = self._frozen_vals.view(1, 1, -1).expand(B, T_ctrl, -1)
             out = out.scatter(2, frozen_idx, frozen_vals.to(out.dtype))
 
+        freq_idx = torch.full(
+            (B, T_ctrl, 1), self._freq_idx, device=out.device, dtype=torch.long
+        )
+        out = out.scatter(2, freq_idx, f0.unsqueeze(-1).to(out.dtype))
         return out

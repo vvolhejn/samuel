@@ -29,11 +29,17 @@ class DataConfig(BaseModel):
     sample_rate: int = 44100
     chunk_seconds: float = 4.0
     num_workers: int = 4
+    pitch_cache_path: Path | None = None
 
     @field_validator("manifest_path")
     @classmethod
     def _resolve_manifest_path(cls, v: Path) -> Path:
         return _resolve_repo_relative(v)
+
+    @field_validator("pitch_cache_path")
+    @classmethod
+    def _resolve_pitch_cache(cls, v: Path | None) -> Path | None:
+        return _resolve_repo_relative(v) if v is not None else None
 
 
 class OptimConfig(BaseModel):
@@ -45,6 +51,12 @@ class OptimConfig(BaseModel):
     grad_clip: float = 1.0
     max_steps: int = 100_000
     warmup_steps: int = 1_000
+    # Gumbel-softmax temperature: linear anneal from tau_start to tau_end over
+    # the first tau_anneal_steps; afterwards held at tau_end. tau_anneal_steps
+    # defaults to max_steps when omitted in YAML.
+    tau_start: float = 2.0
+    tau_end: float = 0.5
+    tau_anneal_steps: int | None = None
 
 
 class SynthConfig(BaseModel):
