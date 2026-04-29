@@ -394,21 +394,24 @@ def _evaluate(
             tgt_np = target[i].detach().cpu().numpy()
             ola_np = pred_norm[i].detach().cpu().numpy()
             ex_np = pred_exact_norm[i].detach().cpu().numpy()
-            short_name = name[:10]
-            tag = f"eval/{i:02d}_{short_name}"
+            tag = f"eval/{i:02d}"
             # Order is ola → ex → tgt so the listener hears the prediction
             # before the ground truth (no anchoring on the target).
             combined = np.concatenate(
                 [_norm(ola_np), gap, _norm(ex_np), gap, tgt_np.astype(np.float32)]
             )
-            wandb_logs[f"{tag}/audio"] = wandb.Audio(combined, sample_rate=sr)
+            # Clip name lives in the caption — keys stay stable across evals
+            # so wandb panels don't explode when clips are randomized per step.
+            wandb_logs[f"{tag}/audio"] = wandb.Audio(
+                combined, sample_rate=sr, caption=name
+            )
             wandb_logs[f"{tag}/params"] = wandb.Plotly(
                 _param_traj_figure(
                     params[i], trainable_names, frame_rate, bounds=bounds
                 )
             )
             wandb_logs[f"{tag}/mel"] = wandb.Plotly(
-                _mel_fig_stacked([("target", tgt_np), ("ola", ola_np)], sr)
+                _mel_fig_stacked([(f"target ({name})", tgt_np), ("ola", ola_np)], sr)
             )
         wandb.log(wandb_logs, step=step)
 
