@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -150,16 +151,24 @@ def _volume_match(pred: torch.Tensor, target: torch.Tensor, hop: int) -> torch.T
     return (pred_f * gain).reshape(B, T * hop)
 
 
-def _load_eval_clips(
-    cfg: TrainConfig, device: torch.device, samples_per_frame: int
-) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
-    """Load ``n_audio_samples`` fixed clips from the tail of the manifest, with f0."""
+@dataclass
+class EvalSetup:
+    """State needed to sample eval clips on demand."""
+
+    files: list  # list[DatasetFile]
+    pitch: dict  # {file_idx: (f0_arr, voiced_arr)}
+    fmin: float
+    fmax: float
+    chunk_samples: int
+    T_ctrl: int
+
+
+def _eval_setup(cfg: TrainConfig, samples_per_frame: int) -> EvalSetup:
+    """Load manifest + pitch cache once. Eval clips are sampled per-step."""
     files = load_manifest(cfg.data.manifest_path)
-    n = min(cfg.log.n_audio_samples, len(files))
-    picked = files[-n:]
+    chunk_samples = int(round(cfg.data.sample_rate * cfg.data.chunk_seconds))
     # Round chunk_samples down to a multiple of samples_per_frame so eval and
     # training use the same alignment.
-    chunk_samples = int(round(cfg.data.sample_rate * cfg.data.chunk_seconds))
     chunk_samples = (chunk_samples // samples_per_frame) * samples_per_frame
     T_ctrl = chunk_samples // samples_per_frame
 
@@ -170,29 +179,51 @@ def _load_eval_clips(
     pitch, meta = _load_pitch_cache(
         cfg.data.pitch_cache_path, cfg.data.sample_rate, samples_per_frame
     )
-    fmin = meta["fmin"]
-    fmax = meta["fmax"]
-    # Manifest order matches the cache index.
-    n_total = len(files)
-    eval_indices = list(range(n_total - n, n_total))
+    return EvalSetup(
+        files=files,
+        pitch=pitch,
+        fmin=meta["fmin"],
+        fmax=meta["fmax"],
+        chunk_samples=chunk_samples,
+        T_ctrl=T_ctrl,
+    )
+
+
+def _sample_eval_clips(
+    setup: EvalSetup,
+    step: int,
+    n: int,
+    sample_rate: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
+    """Pick ``n`` eval clips deterministically from ``step``.
+
+    Two evals at the same step pick the same clips (cross-run comparison);
+    consecutive evals within a run pick different clips (broader coverage).
+    """
+    n = min(n, len(setup.files))
+    indices = np.random.RandomState(step).choice(
+        len(setup.files), size=n, replace=False
+    )
 
     clips: list[torch.Tensor] = []
     f0s: list[torch.Tensor] = []
     names: list[str] = []
-    for file_idx, df in zip(eval_indices, picked):
-        audio = _load_resampled(df.path, cfg.data.sample_rate)
-        if len(audio) < chunk_samples:
-            audio = np.pad(audio, (0, chunk_samples - len(audio)))
-        audio = audio[:chunk_samples]
+    for file_idx in indices:
+        df = setup.files[int(file_idx)]
+        audio = _load_resampled(df.path, sample_rate)
+        if len(audio) < setup.chunk_samples:
+            audio = np.pad(audio, (0, setup.chunk_samples - len(audio)))
+        audio = audio[: setup.chunk_samples]
 
-        f0_full, voiced_full = pitch[file_idx]
-        f0_chunk = np.zeros(T_ctrl, dtype=np.float32)
-        voiced_chunk = np.zeros(T_ctrl, dtype=bool)
-        have = min(T_ctrl, len(f0_full))
+        f0_full, voiced_full = setup.pitch[int(file_idx)]
+        f0_chunk = np.zeros(setup.T_ctrl, dtype=np.float32)
+        voiced_chunk = np.zeros(setup.T_ctrl, dtype=bool)
+        have = min(setup.T_ctrl, len(f0_full))
         if have > 0:
             f0_chunk[:have] = f0_full[:have]
             voiced_chunk[:have] = voiced_full[:have]
-        f0_filled = fill_unvoiced(f0_chunk, voiced_chunk, fmin, fmax)
+        f0_filled = fill_unvoiced(f0_chunk, voiced_chunk, setup.fmin, setup.fmax)
 
         clips.append(torch.from_numpy(audio))
         f0s.append(torch.from_numpy(f0_filled))
@@ -263,15 +294,20 @@ def _mel_fig_stacked(audios: list[tuple[str, np.ndarray]], sr: int) -> go.Figure
 def _evaluate(
     model: PinkTromboneController,
     ddp_module: nn.Module,
-    eval_clips: torch.Tensor,
-    eval_f0: torch.Tensor,
-    eval_names: list[str],
+    eval_setup: EvalSetup,
     loss_fn: MFCCLoss,
     cfg: TrainConfig,
     step: int,
     run_expensive: bool,
+    device: torch.device,
 ) -> dict[str, float]:
-    """Evaluate on cached eval clips. Returns scalar metrics; logs audio/plots on expensive runs."""
+    """Evaluate on freshly-sampled eval clips (deterministic by ``step``).
+
+    Returns scalar metrics; logs audio/plots on expensive runs.
+    """
+    eval_clips, eval_f0, eval_names = _sample_eval_clips(
+        eval_setup, step, cfg.log.n_audio_samples, cfg.data.sample_rate, device
+    )
     model_was_training = ddp_module.training
     ddp_module.eval()
     target = eval_clips  # [N, S]
@@ -360,8 +396,10 @@ def _evaluate(
             ex_np = pred_exact_norm[i].detach().cpu().numpy()
             short_name = name[:10]
             tag = f"eval/{i:02d}_{short_name}"
+            # Order is ola → ex → tgt so the listener hears the prediction
+            # before the ground truth (no anchoring on the target).
             combined = np.concatenate(
-                [tgt_np.astype(np.float32), gap, _norm(ola_np), gap, _norm(ex_np)]
+                [_norm(ola_np), gap, _norm(ex_np), gap, tgt_np.astype(np.float32)]
             )
             wandb_logs[f"{tag}/audio"] = wandb.Audio(combined, sample_rate=sr)
             wandb_logs[f"{tag}/params"] = wandb.Plotly(
@@ -441,14 +479,10 @@ def main(hydra_cfg: DictConfig) -> None:
         samples_per_frame=samples_per_frame,
     )
 
-    # Eval clips (rank 0 only)
-    eval_clips: torch.Tensor | None = None
-    eval_f0: torch.Tensor | None = None
-    eval_names: list[str] = []
+    # Eval setup (rank 0 only). Clips are sampled per-step inside ``_evaluate``.
+    eval_setup: EvalSetup | None = None
     if rank == 0:
-        eval_clips, eval_f0, eval_names = _load_eval_clips(
-            cfg, device, samples_per_frame
-        )
+        eval_setup = _eval_setup(cfg, samples_per_frame)
 
     # wandb (rank 0 only)
     if rank == 0:
@@ -470,17 +504,16 @@ def main(hydra_cfg: DictConfig) -> None:
     throughput_t0 = time.perf_counter()
     throughput_audio_s = 0.0
 
-    if rank == 0 and eval_clips is not None and eval_f0 is not None:
+    if rank == 0 and eval_setup is not None:
         metrics = _evaluate(
             module,
             ddp_module,
-            eval_clips,
-            eval_f0,
-            eval_names,
+            eval_setup,
             loss_fn,
             cfg,
             step,
             run_expensive=True,
+            device=device,
         )
         wandb.log(metrics, step=step)
         tqdm.write(f"[eval] step={step} loss_ola={metrics['eval/loss_ola']:.4f}")
@@ -568,22 +601,16 @@ def main(hydra_cfg: DictConfig) -> None:
                 )
             wandb.log(log_payload, step=step)
 
-        if (
-            rank == 0
-            and eval_clips is not None
-            and eval_f0 is not None
-            and step % cfg.log.val_every == 0
-        ):
+        if rank == 0 and eval_setup is not None and step % cfg.log.val_every == 0:
             metrics = _evaluate(
                 module,
                 ddp_module,
-                eval_clips,
-                eval_f0,
-                eval_names,
+                eval_setup,
                 loss_fn,
                 cfg,
                 step,
                 run_expensive=(step % cfg.log.eval_every == 0),
+                device=device,
             )
             wandb.log(metrics, step=step)
             tqdm.write(f"[eval] step={step} loss_ola={metrics['eval/loss_ola']:.4f}")

@@ -24,7 +24,7 @@ model:
     voiceness:            [0.0, 1.0, 0.6]
     tongueIndex:          [10.0, 35.0, 20.0]
     tongueDiameter:       [1.5, 3.5, 2.4]
-    constrictionIndex:    [0.0, 44.0, 30.0]
+    constrictionIndex:    [22.0, 44.0, 33.0]
     constrictionDiameter: [-0.5, 3.0, 1.25]
 
   frozen_values:
