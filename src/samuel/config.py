@@ -57,6 +57,12 @@ class OptimConfig(BaseModel):
     tau_start: float = 2.0
     tau_end: float = 0.5
     tau_anneal_steps: int | None = None
+    # Coefficient on the entropy bonus subtracted from the loss:
+    #   loss = mfcc_loss - entropy_weight * mean_entropy(softmax(logits))
+    # Higher values keep the per-position softmax distribution closer to
+    # uniform → stops the head's logits from running off to one-hot, which
+    # otherwise makes the soft Gumbel effectively hard and kills gradients.
+    entropy_weight: float = 0.0
 
 
 class SynthConfig(BaseModel):

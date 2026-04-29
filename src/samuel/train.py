@@ -542,20 +542,15 @@ def main(hydra_cfg: DictConfig) -> None:
         tau = _tau_for_step(step, cfg)
         optimizer.zero_grad(set_to_none=True)
 
-        # Encoder + head in bf16; synth & loss in fp32. ``step`` is the
-        # pre-increment count; the wandb log below fires on (step+1) so we
-        # match it here to keep diag aligned with the same forward pass.
-        log_diag = rank == 0 and (step + 1) % cfg.log.log_every == 0
+        # Encoder + head in bf16; synth & loss in fp32. We always pull aux
+        # so we can use the logits for the entropy bonus and re-use them
+        # for the diag log every log_every steps.
         with torch.autocast(
             device_type=device.type,
             dtype=torch.bfloat16,
             enabled=(device.type == "cuda"),
         ):
-            out = ddp_module(wav_in, f0, tau, return_aux=log_diag)
-            if log_diag:
-                params, aux = out
-            else:
-                params, aux = out, None
+            params, aux = ddp_module(wav_in, f0, tau, return_aux=True)
         params = params.float()
 
         pred = pink_trombone_ola(
@@ -567,7 +562,14 @@ def main(hydra_cfg: DictConfig) -> None:
         S = min(pred.shape[-1], target.shape[-1])
         pred_norm = _volume_match(pred[..., :S], target[..., :S], samples_per_frame)
         S_norm = pred_norm.shape[-1]
-        loss = loss_fn(pred_norm, target[..., :S_norm])
+        mfcc_loss = loss_fn(pred_norm, target[..., :S_norm])
+
+        # Entropy bonus on softmax(logits) — keeps logits from saturating
+        # to one-hot, which otherwise kills the soft-Gumbel gradient.
+        logits = aux["logits"].float()
+        log_probs = F.log_softmax(logits, dim=-1)
+        entropy = -(log_probs.exp() * log_probs).sum(-1).mean()
+        loss = mfcc_loss - cfg.optim.entropy_weight * entropy
 
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -591,6 +593,8 @@ def main(hydra_cfg: DictConfig) -> None:
             throughput_audio_s = 0.0
             log_payload: dict[str, object] = {
                 "train/loss": loss.item(),
+                "train/mfcc_loss": mfcc_loss.item(),
+                "train/entropy": entropy.item(),
                 "train/lr": optimizer.param_groups[0]["lr"],
                 "train/tau": tau,
                 "train/grad_norm": float(grad_norm),
@@ -598,10 +602,9 @@ def main(hydra_cfg: DictConfig) -> None:
                 "System/throughput_per_gpu": throughput_per_gpu,
                 "System/throughput_total": throughput_total,
             }
-            if aux is not None:
-                log_payload.update(
-                    _controller_diagnostics(aux, model.trainable_names_, tau)
-                )
+            log_payload.update(
+                _controller_diagnostics(aux, model.trainable_names_, tau)
+            )
             wandb.log(log_payload, step=step)
 
         if rank == 0 and eval_setup is not None and step % cfg.log.val_every == 0:
