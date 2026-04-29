@@ -27,6 +27,9 @@ optim:
   tau_anneal_steps: null  # default = max_steps
   entropy_weight: 0.01    # encourage softmax(logits) to stay near uniform
 
+loss:
+  type: mfcc
+
 log:
   wandb_project: samuel
   wandb_entity: moboehle-kyutai

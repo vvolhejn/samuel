@@ -39,7 +39,7 @@ from samuel.data import (
     load_manifest,
 )
 from samuel.evals.pitch import pitch_mae_cents
-from samuel.losses import MFCCLoss
+from samuel.losses import MelSpecLoss, MFCCLoss, MultiScaleLogMagSTFTLoss
 from samuel.model import PinkTromboneController
 from samuel.pink_trombone import PARAM_NAMES, pink_trombone, pink_trombone_ola
 
@@ -295,7 +295,7 @@ def _evaluate(
     model: PinkTromboneController,
     ddp_module: nn.Module,
     eval_setup: EvalSetup,
-    loss_fn: MFCCLoss,
+    loss_fn: nn.Module,
     cfg: TrainConfig,
     step: int,
     run_expensive: bool,
@@ -448,7 +448,16 @@ def main(hydra_cfg: DictConfig) -> None:
     model = PinkTromboneController(cfg.model).to(device)
     frame_rate = cfg.model.frame_rate
     samples_per_frame = cfg.model.samples_per_frame
-    loss_fn = MFCCLoss(samples_per_frame=samples_per_frame).to(device)
+    loss_fn: nn.Module
+    if cfg.loss.type == "mfcc":
+        loss_fn = MFCCLoss(samples_per_frame=samples_per_frame)
+    elif cfg.loss.type == "mel":
+        loss_fn = MelSpecLoss(samples_per_frame=samples_per_frame)
+    elif cfg.loss.type == "stft":
+        loss_fn = MultiScaleLogMagSTFTLoss()
+    else:
+        raise ValueError(f"unknown loss type: {cfg.loss.type}")
+    loss_fn = loss_fn.to(device)
 
     ddp_module: nn.Module
     if is_ddp:

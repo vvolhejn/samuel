@@ -103,6 +103,15 @@ class RunConfig(BaseModel):
         return _resolve_repo_relative(v)
 
 
+class LossConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # "mfcc": L1 on first 20 MFCCs (frame-aligned to samples_per_frame).
+    # "mel":  L1 on log-mel spectrogram (frame-aligned to samples_per_frame).
+    # "stft": Multi-scale log-magnitude STFT, n_ffts (512, 1024, 2048).
+    type: Literal["mfcc", "mel", "stft"] = "mfcc"
+
+
 class TrainConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -114,6 +123,7 @@ class TrainConfig(BaseModel):
     synth: SynthConfig = Field(default_factory=SynthConfig)
     optim: OptimConfig = Field(default_factory=OptimConfig)
     log: LogConfig = Field(default_factory=LogConfig)
+    loss: LossConfig = Field(default_factory=LossConfig)
     batch_size: int = 8
 
     @classmethod

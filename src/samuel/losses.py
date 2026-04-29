@@ -73,6 +73,58 @@ class MFCCLoss(nn.Module):
         return (self.features(pred) - self.features(target)).abs().mean()
 
 
+class MelSpecLoss(nn.Module):
+    """L1 distance between log-mel spectrograms (no DCT vs. ``MFCCLoss``).
+
+    Same windowing as ``MFCCLoss`` (``n_fft = hop = samples_per_frame``,
+    no overlap, ``log1p`` of squared magnitudes) but compares the full mel
+    energy spectrum instead of the DCT-truncated cepstrum. Cheaper than
+    MFCC, retains spectral detail above the first 20 cepstral coefficients.
+    """
+
+    def __init__(
+        self,
+        samples_per_frame: int = 2048,
+        n_mels: int = 80,
+        sample_rate: int = SAMPLE_RATE,
+    ):
+        super().__init__()
+        self.samples_per_frame = samples_per_frame
+        self.n_mels = n_mels
+        self.sample_rate = sample_rate
+
+        window = torch.hann_window(samples_per_frame)
+        self.register_buffer("window", window, persistent=False)
+
+        mel_fb = torch.from_numpy(
+            librosa.filters.mel(
+                sr=sample_rate,
+                n_fft=samples_per_frame,
+                n_mels=n_mels,
+                fmin=0.0,
+                fmax=sample_rate / 2,
+            )
+        ).float()  # [n_mels, n_freqs]
+        self.register_buffer("mel_fb", mel_fb, persistent=False)
+
+    def features(self, x: Tensor) -> Tensor:
+        """``x [B, S]`` (S a multiple of samples_per_frame) -> ``[B, n_mels, T]``."""
+        spec = torch.stft(
+            x,
+            n_fft=self.samples_per_frame,
+            hop_length=self.samples_per_frame,
+            window=self.window,
+            center=False,
+            return_complex=True,
+        ).abs()  # [B, n_freqs, T]
+        mel = torch.einsum("mf,bft->bmt", self.mel_fb, spec.pow(2))
+        return torch.log1p(mel)
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        assert pred.shape == target.shape, (pred.shape, target.shape)
+        return (self.features(pred) - self.features(target)).abs().mean()
+
+
 class MultiScaleLogMagSTFTLoss(nn.Module):
     """L1 distance between log-magnitude STFTs at several window sizes.
 
