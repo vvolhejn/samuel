@@ -16,7 +16,7 @@ import librosa
 import numpy as np
 import soundfile as sf
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 
@@ -75,11 +75,24 @@ def fill_unvoiced(
     return np.clip(out, fmin, fmax)
 
 
+class PitchCache(BaseModel):
+    """Per-file pyin f0 cache with the metadata it was computed under."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    # {file_index: (f0_hz [n_frames], voiced_mask [n_frames])}
+    by_file: dict[int, tuple[np.ndarray, np.ndarray]]
+    sample_rate: int
+    samples_per_frame: int
+    fmin: float
+    fmax: float
+
+
 def _load_pitch_cache(
     path: Path,
     sample_rate: int,
     samples_per_frame: int,
-) -> tuple[dict[int, tuple[np.ndarray, np.ndarray]], dict[str, float]]:
+) -> PitchCache:
     """Load a pitch cache, validating it matches (sample_rate, samples_per_frame)."""
     z = np.load(path)
     cache_sr = int(z["sample_rate"])
@@ -95,14 +108,16 @@ def _load_pitch_cache(
             f"--sample-rate {sample_rate} --samples-per-frame {samples_per_frame}"
         )
     n = int(z["n_files"])
-    pitch: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    by_file: dict[int, tuple[np.ndarray, np.ndarray]] = {}
     for i in range(n):
-        pitch[i] = (z[f"f0_{i}"], z[f"voiced_{i}"])
-    meta = {
-        "fmin": float(z["pyin_fmin"]),
-        "fmax": float(z["pyin_fmax"]),
-    }
-    return pitch, meta
+        by_file[i] = (z[f"f0_{i}"], z[f"voiced_{i}"])
+    return PitchCache(
+        by_file=by_file,
+        sample_rate=cache_sr,
+        samples_per_frame=cache_spf,
+        fmin=float(z["pyin_fmin"]),
+        fmax=float(z["pyin_fmax"]),
+    )
 
 
 class LibriLightChunks(IterableDataset):
@@ -112,9 +127,10 @@ class LibriLightChunks(IterableDataset):
     ranks; inside a rank the per-worker split is also round-robin. Each epoch
     the rank's slice is shuffled with ``epoch_seed ^ rank``.
 
-    When ``pitch_cache_path`` is given, yields ``{audio, pitch}`` dicts with
-    the per-chunk pyin f0 (linearly interpolated through unvoiced regions) at
-    ``samples_per_frame`` hop. Otherwise yields raw audio tensors.
+    Always yields ``{"audio": ...}`` dicts. When ``pitch_cache_path`` is
+    given, the dict also has a ``"pitch"`` key with the per-chunk pyin f0
+    (linearly interpolated through unvoiced regions) at ``samples_per_frame``
+    hop.
     """
 
     def __init__(
@@ -153,14 +169,13 @@ class LibriLightChunks(IterableDataset):
 
         self.pitch_cache_path = pitch_cache_path
         self.samples_per_frame = samples_per_frame
-        self._pitch: dict[int, tuple[np.ndarray, np.ndarray]] | None = None
-        self._pitch_meta: dict[str, float] = {}
+        self._pitch: PitchCache | None = None
         if pitch_cache_path is not None:
             if samples_per_frame is None:
                 raise ValueError(
                     "samples_per_frame is required when pitch_cache_path is set"
                 )
-            self._pitch, self._pitch_meta = _load_pitch_cache(
+            self._pitch = _load_pitch_cache(
                 pitch_cache_path, sample_rate, samples_per_frame
             )
             assert self.chunk_samples % samples_per_frame == 0
@@ -179,7 +194,7 @@ class LibriLightChunks(IterableDataset):
             return list(self._rank_files)
         return self._rank_files[info.id :: info.num_workers]
 
-    def __iter__(self) -> Iterator[torch.Tensor | dict[str, torch.Tensor]]:
+    def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
         files = self._worker_files()
         info = get_worker_info()
         wid = 0 if info is None else info.id
@@ -190,8 +205,8 @@ class LibriLightChunks(IterableDataset):
 
         spf = self.samples_per_frame
         T_pitch = self.pitch_frames_per_chunk if self._pitch is not None else 0
-        fmin = self._pitch_meta.get("fmin", 70.0)
-        fmax = self._pitch_meta.get("fmax", 500.0)
+        fmin = self._pitch.fmin if self._pitch is not None else 70.0
+        fmax = self._pitch.fmax if self._pitch is not None else 500.0
 
         for df in files:
             try:
@@ -201,7 +216,7 @@ class LibriLightChunks(IterableDataset):
             file_idx = self._idx_for_file.get(id(df))
             pitch_f0 = pitch_voiced = None
             if self._pitch is not None and file_idx is not None:
-                pitch_f0, pitch_voiced = self._pitch[file_idx]
+                pitch_f0, pitch_voiced = self._pitch.by_file[file_idx]
             n = len(audio)
             for i in range(0, n, self.chunk_samples):
                 chunk = audio[i : i + self.chunk_samples]
@@ -212,7 +227,7 @@ class LibriLightChunks(IterableDataset):
                     chunk = np.concatenate([chunk, pad])
 
                 if self._pitch is None:
-                    yield torch.from_numpy(chunk)
+                    yield {"audio": torch.from_numpy(chunk)}
                     continue
 
                 p_start = i // spf  # type: ignore[operator]

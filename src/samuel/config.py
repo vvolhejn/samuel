@@ -62,7 +62,7 @@ class OptimConfig(BaseModel):
     # Higher values keep the per-position softmax distribution closer to
     # uniform → stops the head's logits from running off to one-hot, which
     # otherwise makes the soft Gumbel effectively hard and kills gradients.
-    entropy_weight: float = 0.0
+    entropy_weight: float = 0.01
 
 
 class SynthConfig(BaseModel):

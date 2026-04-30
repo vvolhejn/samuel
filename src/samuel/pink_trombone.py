@@ -299,8 +299,11 @@ def glottis(
     freq_mod = frequency * (1 + vibrato)
 
     # JS UI couples voicing as loudness = tenseness ** 0.25 (GlottisUI.js).
+    # Clamp before the fractional power: ``x**0.25`` has infinite gradient at
+    # x=0, which produces NaN backward. The clamp is a no-op for any
+    # voiceness ≥ 1e-6 and only kicks in at the bucket extreme exactly 0.
     tenseness = voiceness
-    loudness = voiceness**0.25
+    loudness = voiceness.clamp_min(1e-6) ** 0.25
 
     # ---- tenseness (with simplex jitter) ----
     sn_tens = 0.1 * simplex.simplex1(t * 0.46) + 0.05 * simplex.simplex1(t * 0.36)

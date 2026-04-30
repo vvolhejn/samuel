@@ -104,12 +104,11 @@ class PinkTromboneController(nn.Module):
         hi = torch.tensor(
             [config.param_spec[n][1] for n in trainable], dtype=torch.float32
         )
-        # Bucket centers are spaced ``(k + 0.5) / n_buckets`` so the extremes
-        # of the range are never reached — endpoints like ``voiceness=0`` or
-        # ``constrictionDiameter=-0.5`` cause synth NaNs.
-        steps = (
-            torch.arange(config.n_buckets, dtype=torch.float32) + 0.5
-        ) / config.n_buckets
+        # Bucket centers cover the full [lo, hi] range including endpoints.
+        # ``voiceness=0`` (extreme breathiness) used to produce NaN gradients
+        # via ``voiceness**0.25`` in pink_trombone.py; that's now clamped at
+        # the synth boundary so endpoints are safe.
+        steps = torch.linspace(0.0, 1.0, config.n_buckets, dtype=torch.float32)
         # [n_trainable, n_buckets]
         centers = lo.unsqueeze(1) + steps.unsqueeze(0) * (hi - lo).unsqueeze(1)
         self.register_buffer("bucket_centers", centers)

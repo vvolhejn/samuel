@@ -24,6 +24,9 @@ model:
     voiceness:            [0.0, 1.0, 0.6]
     tongueIndex:          [10.0, 35.0, 20.0]
     tongueDiameter:       [1.5, 3.5, 2.4]
+    # Restricted to the upper half: in practice the constriction is the
+    # tongue tip or the lips, so positions further back in the tract are
+    # not used. Buckets cover the regime that's actually picked.
     constrictionIndex:    [22.0, 44.0, 33.0]
     constrictionDiameter: [-0.5, 3.0, 1.25]
 

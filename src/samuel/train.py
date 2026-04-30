@@ -32,6 +32,7 @@ from tqdm import tqdm
 import wandb
 from samuel.config import TrainConfig
 from samuel.data import (
+    PitchCache,
     _load_pitch_cache,
     _load_resampled,
     build_dataloader,
@@ -156,9 +157,7 @@ class EvalSetup:
     """State needed to sample eval clips on demand."""
 
     files: list  # list[DatasetFile]
-    pitch: dict  # {file_idx: (f0_arr, voiced_arr)}
-    fmin: float
-    fmax: float
+    pitch: PitchCache
     chunk_samples: int
     T_ctrl: int
 
@@ -176,14 +175,12 @@ def _eval_setup(cfg: TrainConfig, samples_per_frame: int) -> EvalSetup:
         raise ValueError(
             "data.pitch_cache_path is required (eval needs precomputed f0)"
         )
-    pitch, meta = _load_pitch_cache(
+    pitch = _load_pitch_cache(
         cfg.data.pitch_cache_path, cfg.data.sample_rate, samples_per_frame
     )
     return EvalSetup(
         files=files,
         pitch=pitch,
-        fmin=meta["fmin"],
-        fmax=meta["fmax"],
         chunk_samples=chunk_samples,
         T_ctrl=T_ctrl,
     )
@@ -216,14 +213,16 @@ def _sample_eval_clips(
             audio = np.pad(audio, (0, setup.chunk_samples - len(audio)))
         audio = audio[: setup.chunk_samples]
 
-        f0_full, voiced_full = setup.pitch[int(file_idx)]
+        f0_full, voiced_full = setup.pitch.by_file[int(file_idx)]
         f0_chunk = np.zeros(setup.T_ctrl, dtype=np.float32)
         voiced_chunk = np.zeros(setup.T_ctrl, dtype=bool)
         have = min(setup.T_ctrl, len(f0_full))
         if have > 0:
             f0_chunk[:have] = f0_full[:have]
             voiced_chunk[:have] = voiced_full[:have]
-        f0_filled = fill_unvoiced(f0_chunk, voiced_chunk, setup.fmin, setup.fmax)
+        f0_filled = fill_unvoiced(
+            f0_chunk, voiced_chunk, setup.pitch.fmin, setup.pitch.fmax
+        )
 
         clips.append(torch.from_numpy(audio))
         f0s.append(torch.from_numpy(f0_filled))
