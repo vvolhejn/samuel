@@ -10,6 +10,7 @@ data:
   sample_rate: 44100
   chunk_seconds: 4.0
   num_workers: 4
+  val_fraction: 0.05
 
 synth:
   ir_length: 256

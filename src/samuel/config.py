@@ -30,6 +30,10 @@ class DataConfig(BaseModel):
     chunk_seconds: float = 4.0
     num_workers: int = 4
     pitch_cache_path: Path | None = None
+    # Fraction of the manifest reserved as the held-out validation split.
+    # Files at the tail of the manifest (after the train cut) are never seen
+    # during training; eval samples from them for the val_* metrics.
+    val_fraction: float = 0.05
 
     @field_validator("manifest_path")
     @classmethod

@@ -42,6 +42,15 @@ def _shard(files: list[DatasetFile], rank: int, world_size: int) -> list[Dataset
     return files[rank::world_size]
 
 
+def split_train_val(
+    files: list[DatasetFile], val_fraction: float
+) -> tuple[list[DatasetFile], list[DatasetFile]]:
+    """Last ``val_fraction`` of the manifest is the held-out validation set."""
+    n = len(files)
+    n_val = max(1, int(round(n * val_fraction))) if val_fraction > 0 else 0
+    return files[: n - n_val], files[n - n_val :] if n_val > 0 else []
+
+
 def _load_resampled(path: Path, target_sr: int) -> np.ndarray:
     """Load a file and resample to ``target_sr`` mono float32."""
     audio, sr = sf.read(str(path), dtype="float32", always_2d=False)
@@ -145,6 +154,7 @@ class LibriLightChunks(IterableDataset):
         drop_last: bool = True,
         pitch_cache_path: Path | None = None,
         samples_per_frame: int | None = None,
+        val_fraction: float = 0.0,
     ):
         super().__init__()
         self.manifest_path = manifest_path
@@ -164,7 +174,14 @@ class LibriLightChunks(IterableDataset):
         self.epoch = epoch
         self.seed = seed
         self.drop_last = drop_last
-        self._all_files = load_manifest(manifest_path)
+        full_manifest = load_manifest(manifest_path)
+        # Pitch-cache lookup uses the full-manifest index, so build the id→idx
+        # map *before* slicing off the val tail.
+        self._idx_for_file: dict[int, int] = {
+            id(df): i for i, df in enumerate(full_manifest)
+        }
+        train_files, _ = split_train_val(full_manifest, val_fraction)
+        self._all_files = train_files
         self._rank_files = _shard(self._all_files, rank, world_size)
 
         self.pitch_cache_path = pitch_cache_path
@@ -180,10 +197,6 @@ class LibriLightChunks(IterableDataset):
             )
             assert self.chunk_samples % samples_per_frame == 0
             self.pitch_frames_per_chunk = self.chunk_samples // samples_per_frame
-        # Map manifest index → file (stable across shards).
-        self._idx_for_file: dict[int, int] = {
-            id(df): i for i, df in enumerate(self._all_files)
-        }
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
@@ -263,6 +276,7 @@ def build_dataloader(
     pin_memory: bool = True,
     pitch_cache_path: Path | None = None,
     samples_per_frame: int | None = None,
+    val_fraction: float = 0.0,
 ) -> DataLoader:
     dataset = LibriLightChunks(
         manifest_path=manifest_path,
@@ -275,6 +289,7 @@ def build_dataloader(
         drop_last=drop_last,
         pitch_cache_path=pitch_cache_path,
         samples_per_frame=samples_per_frame,
+        val_fraction=val_fraction,
     )
     return DataLoader(
         dataset,
