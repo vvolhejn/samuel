@@ -12,6 +12,7 @@ Single-node, DDP-capable. Launch examples:
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -138,40 +139,70 @@ def _controller_diagnostics(
 ) -> dict[str, float | wandb.Histogram]:
     """Per-step diagnostics for the categorical head + encoder.
 
-    Logits and z come from ``model.forward(..., return_aux=True)``. Logged
-    under ``diag/`` to keep the train/eval namespaces clean.
-
-    Two bucket histograms per trainable param:
-      - ``bucket_usage``: hard argmax counts (what eval and hard-Gumbel pick).
-      - ``bucket_usage_tempered``: average softmax(logits/tau) per bucket
-        (what the soft Gumbel feeds into the synth in expectation).
+    Factorized mode (``logits`` shape ``[B, T, n_t, n_b]``): per-param
+    margin + argmax + tempered bucket-usage histograms.
+    Joint mode (``logits`` shape ``[B, T, K]``): joint logit margin and
+    per-param marginal bucket-usage histograms recovered via
+    ``aux["joint_idx"]`` ([K, n_t]).
     """
-    logits = aux["logits"].detach().float()  # [B, T, n_t, n_b]
+    logits = aux["logits"].detach().float()
     z = aux["z"].detach().float()  # [B, dim, T]
-    _, _, _, n_b = logits.shape
-
-    top2 = logits.topk(2, dim=-1).values
-    margin = top2[..., 0] - top2[..., 1]  # [B, T, n_t]
-    argmax = logits.argmax(-1)  # [B, T, n_t]
-    tempered = F.softmax(logits / max(tau, 1e-6), dim=-1)
-    tempered_per_bucket = tempered.mean(dim=(0, 1))  # [n_t, n_b]
-    edges = np.arange(n_b + 1) - 0.5
 
     out: dict[str, float | wandb.Histogram] = {}
-    for j, name in enumerate(trainable_names):
-        a_j = argmax[..., j].flatten()
-        counts = torch.bincount(a_j, minlength=n_b).float()
-        out[f"diag/margin/{name}"] = margin[..., j].mean().item()
-        out[f"diag/bucket_usage/{name}"] = wandb.Histogram(
-            np_histogram=(counts.cpu().numpy(), edges)
+
+    if logits.dim() == 4:
+        _, _, _, n_b = logits.shape
+        top2 = logits.topk(2, dim=-1).values
+        margin = top2[..., 0] - top2[..., 1]  # [B, T, n_t]
+        argmax = logits.argmax(-1)  # [B, T, n_t]
+        tempered = F.softmax(logits / max(tau, 1e-6), dim=-1)
+        tempered_per_bucket = tempered.mean(dim=(0, 1))  # [n_t, n_b]
+        edges = np.arange(n_b + 1) - 0.5
+
+        for j, name in enumerate(trainable_names):
+            a_j = argmax[..., j].flatten()
+            counts = torch.bincount(a_j, minlength=n_b).float()
+            out[f"diag/margin/{name}"] = margin[..., j].mean().item()
+            out[f"diag/bucket_usage/{name}"] = wandb.Histogram(
+                np_histogram=(counts.cpu().numpy(), edges)
+            )
+            out[f"diag/bucket_usage_tempered/{name}"] = wandb.Histogram(
+                np_histogram=(tempered_per_bucket[j].cpu().numpy(), edges)
+            )
+        out["diag/margin/mean"] = margin.mean().item()
+    else:
+        joint_idx = aux["joint_idx"].detach().long()  # [K, n_t]
+        K, n_t = joint_idx.shape
+        n_b = int(joint_idx.max().item()) + 1
+        probs = F.softmax(logits, dim=-1)  # [B, T, K]
+        avg_p = probs.mean(dim=(0, 1))  # [K]
+        argmax = logits.argmax(-1)  # [B, T]
+        top2 = logits.topk(2, dim=-1).values
+        out["diag/margin/joint_mean"] = (top2[..., 0] - top2[..., 1]).mean().item()
+        edges = np.arange(n_b + 1) - 0.5
+        # Per-param marginal probability over buckets, computed from K-class
+        # softmax via scatter-add along the K axis. ``joint_idx.t()`` is
+        # ``[n_t, K]`` giving each class's bucket index for that param.
+        per_param_bucket = avg_p.new_zeros(n_t, n_b)
+        per_param_bucket.scatter_add_(
+            1, joint_idx.t(), avg_p.unsqueeze(0).expand(n_t, -1)
         )
-        out[f"diag/bucket_usage_tempered/{name}"] = wandb.Histogram(
-            np_histogram=(tempered_per_bucket[j].cpu().numpy(), edges)
+        argmax_idx = joint_idx[argmax]  # [B, T, n_t]
+        for j, name in enumerate(trainable_names):
+            counts = torch.bincount(argmax_idx[..., j].flatten(), minlength=n_b).float()
+            out[f"diag/bucket_usage/{name}"] = wandb.Histogram(
+                np_histogram=(counts.cpu().numpy(), edges)
+            )
+            out[f"diag/bucket_usage_marginal/{name}"] = wandb.Histogram(
+                np_histogram=(per_param_bucket[j].cpu().numpy(), edges)
+            )
+        # entropy of the time-averaged joint distribution — flags collapse
+        # to a small subset of the 8^5 classes.
+        out["diag/joint_marginal_entropy"] = (
+            -(avg_p.clamp_min(1e-12) * avg_p.clamp_min(1e-12).log()).sum().item()
         )
 
-    out["diag/margin/mean"] = margin.mean().item()
     out["diag/z_mean_norm"] = z.norm(dim=1).mean().item()
-    # Per-feature std across batch+time, averaged. Low ⇒ encoder collapsed.
     out["diag/z_std_per_feat"] = z.std(dim=(0, 2)).mean().item()
     return out
 
@@ -697,9 +728,14 @@ def main(hydra_cfg: DictConfig) -> None:
 
         # Entropy bonus on softmax(logits) — keeps logits from saturating
         # to one-hot, which otherwise kills the soft-Gumbel gradient.
+        # Normalize by ``log(n_classes_per_position)`` so the bonus is the
+        # fraction of max entropy regardless of head shape (factorized
+        # n_b vs joint n_b**n_t). Without this, the joint bonus is ~n_t×
+        # larger than factorized at the same loss.entropy weight.
         logits = aux["logits"].float()
         log_probs = F.log_softmax(logits, dim=-1)
-        entropy = -(log_probs.exp() * log_probs).sum(-1).mean()
+        n_classes = logits.shape[-1]
+        entropy = -(log_probs.exp() * log_probs).sum(-1).mean() / math.log(n_classes)
         loss = recon_loss - cfg.loss.entropy * entropy
 
         loss.backward()

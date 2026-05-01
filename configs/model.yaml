@@ -16,6 +16,10 @@ model:
   # pitch-cache hop.
   samples_per_frame: 2048
   n_buckets: 8
+  # Joint categorical over n_buckets**n_trainable = 8**5 = 32768 classes
+  # (instead of the factorized per-param head). Each class encodes a full
+  # bucket assignment across all 5 trainable params.
+  joint: true
 
   # (lo, hi, init) per trainable parameter. ``frequency`` is supplied
   # externally from the pyin cache; ``intensity`` is frozen at 1.0 and the

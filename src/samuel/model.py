@@ -1,11 +1,13 @@
 """1D-CNN controller that turns audio into Pink Trombone parameter trajectories.
 
-The head emits a categorical distribution over ``n_buckets`` evenly spaced
-values per trainable parameter. During training a (hard) Gumbel-softmax
-sample selects one bucket center; at eval time the argmax bucket is used.
-The ``frequency`` parameter is supplied externally (precomputed pyin) and
-``intensity`` is frozen to 1.0 — volume is matched post-synth in the train
-loop.
+When ``joint=False`` the head emits ``n_buckets`` logits *per* trainable
+parameter — a factorized categorical with the per-param distributions
+independent. When ``joint=True`` a single categorical over
+``n_buckets ** n_trainable`` joint classes replaces the factorized head;
+each class encodes a full assignment of buckets across all trainable
+params. Training uses a (soft) Gumbel-softmax expectation of bucket
+centers; eval takes the argmax class. ``frequency`` is supplied externally
+(precomputed pyin) and ``intensity`` is frozen to 1.0.
 """
 
 from __future__ import annotations
@@ -50,6 +52,11 @@ class PinkTromboneControllerConfig(BaseModel):
     )
     samples_per_frame: int = 2048
     n_buckets: int = 8
+    # When True, the head predicts a single categorical over
+    # ``n_buckets ** n_trainable`` joint classes instead of a factorized
+    # categorical (``n_buckets`` per param). Useful to test whether
+    # modeling cross-param coupling helps over independent per-param heads.
+    joint: bool = False
 
     @property
     def frame_rate(self) -> float:
@@ -92,6 +99,7 @@ class PinkTromboneController(nn.Module):
 
         self.samples_per_frame = config.samples_per_frame
         self.n_buckets = config.n_buckets
+        self.joint = config.joint
         self.encoder = SEANetEncoder(config.encoder)
 
         trainable = config.trainable_names()
@@ -113,7 +121,33 @@ class PinkTromboneController(nn.Module):
         centers = lo.unsqueeze(1) + steps.unsqueeze(0) * (hi - lo).unsqueeze(1)
         self.register_buffer("bucket_centers", centers)
 
-        self.head = nn.Linear(config.encoder.dimension, n_trainable * config.n_buckets)
+        if self.joint:
+            # Joint head: K = n_buckets ** n_trainable classes. Each class k
+            # encodes a tuple of per-param bucket indices via base-n_buckets
+            # decomposition. ``joint_centers[k, j]`` is the value of param j
+            # for class k — precompute once so the forward is a matmul.
+            n_classes = config.n_buckets**n_trainable
+            self._n_classes = n_classes
+            digits = torch.arange(n_classes)
+            joint_idx = torch.stack(
+                [
+                    (digits // (config.n_buckets**j)) % config.n_buckets
+                    for j in range(n_trainable)
+                ],
+                dim=-1,
+            )  # [K, n_trainable]
+            joint_centers = torch.gather(
+                centers.unsqueeze(0).expand(n_classes, -1, -1),
+                dim=-1,
+                index=joint_idx.unsqueeze(-1),
+            ).squeeze(-1)  # [K, n_trainable]
+            self.register_buffer("joint_centers", joint_centers)
+            self.register_buffer("joint_idx", joint_idx)
+            self.head = nn.Linear(config.encoder.dimension, n_classes)
+        else:
+            self.head = nn.Linear(
+                config.encoder.dimension, n_trainable * config.n_buckets
+            )
         # Bias init at zero -> uniform softmax -> mean bucket value at start.
         with torch.no_grad():
             self.head.bias.zero_()
@@ -177,22 +211,35 @@ class PinkTromboneController(nn.Module):
             z = F.interpolate(z, size=T_ctrl, mode="linear", align_corners=True)
 
         n_trainable = self.bucket_centers.shape[0]
-        logits = self.head(z.transpose(1, 2)).float()  # [B, T_ctrl, n_t*n_b]
-        logits = logits.view(B, T_ctrl, n_trainable, self.n_buckets)
+        head_out = self.head(z.transpose(1, 2)).float()  # [B, T_ctrl, *]
 
-        if self.training:
-            # hard=False: the forward output is the soft Gumbel-softmax
-            # distribution; (weights * centers).sum is then a smooth
-            # expectation between bucket centers. Eval still snaps to the
-            # argmax bucket, so there's a mild train/eval mismatch — but
-            # hard=True (straight-through) tends to lock the argmax in this
-            # setup, with eval loss bit-identical across many steps.
-            weights = F.gumbel_softmax(logits, tau=tau, hard=False, dim=-1)
+        if self.joint:
+            # Joint categorical over K = n_buckets ** n_trainable classes.
+            logits = head_out  # [B, T_ctrl, K]
+            if self.training:
+                weights = F.gumbel_softmax(logits, tau=tau, hard=False, dim=-1)
+            else:
+                argmax = logits.argmax(dim=-1)
+                weights = F.one_hot(argmax, num_classes=self._n_classes).to(
+                    logits.dtype
+                )
+            # weights: [B, T, K], joint_centers: [K, n_trainable]
+            constrained = weights @ self.joint_centers
         else:
-            argmax = logits.argmax(dim=-1)
-            weights = F.one_hot(argmax, num_classes=self.n_buckets).to(logits.dtype)
-
-        constrained = (weights * self.bucket_centers).sum(dim=-1)  # [B, T_ctrl, n_t]
+            logits = head_out.view(B, T_ctrl, n_trainable, self.n_buckets)
+            if self.training:
+                # hard=False: the forward output is the soft Gumbel-softmax
+                # distribution; (weights * centers).sum is then a smooth
+                # expectation between bucket centers. Eval still snaps to the
+                # argmax bucket, so there's a mild train/eval mismatch — but
+                # hard=True (straight-through) tends to lock the argmax in this
+                # setup, with eval loss bit-identical across many steps.
+                weights = F.gumbel_softmax(logits, tau=tau, hard=False, dim=-1)
+            else:
+                argmax = logits.argmax(dim=-1)
+                weights = F.one_hot(argmax, num_classes=self.n_buckets).to(logits.dtype)
+            constrained = (weights * self.bucket_centers).sum(dim=-1)
+        # constrained: [B, T_ctrl, n_trainable]
 
         out = torch.zeros(
             B, T_ctrl, N_PARAMS, device=wav.device, dtype=constrained.dtype
@@ -210,5 +257,8 @@ class PinkTromboneController(nn.Module):
         )
         out = out.scatter(2, freq_idx, f0.unsqueeze(-1).to(out.dtype))
         if return_aux:
-            return out, {"logits": logits, "z": z}
+            aux: dict[str, Tensor] = {"logits": logits, "z": z}
+            if self.joint:
+                aux["joint_idx"] = self.joint_idx
+            return out, aux
         return out
