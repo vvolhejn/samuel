@@ -61,12 +61,6 @@ class OptimConfig(BaseModel):
     tau_start: float = 2.0
     tau_end: float = 0.5
     tau_anneal_steps: int | None = None
-    # Coefficient on the entropy bonus subtracted from the loss:
-    #   loss = mfcc_loss - entropy_weight * mean_entropy(softmax(logits))
-    # Higher values keep the per-position softmax distribution closer to
-    # uniform → stops the head's logits from running off to one-hot, which
-    # otherwise makes the soft Gumbel effectively hard and kills gradients.
-    entropy_weight: float = 0.01
 
 
 class SynthConfig(BaseModel):
@@ -110,10 +104,16 @@ class RunConfig(BaseModel):
 class LossConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    # "mfcc": L1 on first 20 MFCCs (frame-aligned to samples_per_frame).
-    # "mel":  L1 on log-mel spectrogram (frame-aligned to samples_per_frame).
-    # "stft": Multi-scale log-magnitude STFT, n_ffts (512, 1024, 2048).
-    type: Literal["mfcc", "mel", "stft"] = "mfcc"
+    # Reconstruction-loss weights. Components with weight 0 are skipped.
+    # Total training loss is:
+    #   sum(w_i * loss_i(pred, target)) - entropy * H(softmax(logits))
+    # The entropy bonus keeps the per-position softmax distribution near
+    # uniform — without it, logits saturate and the soft Gumbel becomes
+    # effectively hard, killing gradients.
+    mfcc: float = 1.0  # L1 on first 20 MFCCs (frame-aligned to samples_per_frame)
+    mel: float = 0.0  # L1 on log-mel spectrogram (frame-aligned to samples_per_frame)
+    stft: float = 0.0  # Multi-scale log-magnitude STFT, n_ffts (512, 1024, 2048)
+    entropy: float = 0.01
 
 
 class TrainConfig(BaseModel):

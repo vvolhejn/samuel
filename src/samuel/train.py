@@ -47,6 +47,40 @@ from samuel.model import PinkTromboneController
 from samuel.pink_trombone import PARAM_NAMES, pink_trombone, pink_trombone_ola
 
 
+class CombinedReconLoss(nn.Module):
+    """Weighted sum of reconstruction losses.
+
+    All components are always evaluated so their values can be logged for
+    comparison even when they contribute zero to the gradient. The training
+    loss is the weight-weighted sum; zero-weighted components are computed
+    but don't backprop. Passing all weights = 0 raises.
+    """
+
+    def __init__(self, components: list[tuple[str, float, nn.Module]]) -> None:
+        super().__init__()
+        if not any(w != 0.0 for _, w, _ in components):
+            raise ValueError("CombinedReconLoss needs at least one nonzero weight")
+        self.names: list[str] = [n for n, _, _ in components]
+        self.weights: list[float] = [w for _, w, _ in components]
+        self.fns = nn.ModuleList([fn for _, _, fn in components])
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        total, _ = self.with_components(pred, target)
+        return total
+
+    def with_components(
+        self, pred: torch.Tensor, target: torch.Tensor
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        components: dict[str, torch.Tensor] = {}
+        total = pred.new_zeros(())
+        for n, w, fn in zip(self.names, self.weights, self.fns):
+            v = fn(pred, target)
+            components[n] = v
+            if w != 0.0:
+                total = total + w * v
+        return total, components
+
+
 def _ddp_info() -> tuple[int, int, int, bool]:
     """Return (rank, local_rank, world_size, is_ddp)."""
     if "LOCAL_RANK" in os.environ:
@@ -70,7 +104,7 @@ def _broadcast_str(s: str, src: int = 0, is_ddp: bool = False) -> str:
 def _make_run_dir(cfg: TrainConfig, rank: int, is_ddp: bool) -> Path:
     if rank == 0:
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        run_dir = cfg.run.runs_root / f"{ts}_{cfg.run.name}"
+        run_dir = cfg.run.runs_root / f"{cfg.run.name}_{ts}"
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "checkpoints").mkdir(exist_ok=True)
         with open(run_dir / "config.json", "w") as f:
@@ -315,7 +349,7 @@ def _evaluate_split(
     eval_setup: EvalSetup,
     files: list[DatasetFile],
     split: str,
-    loss_fn: nn.Module,
+    loss_fn: CombinedReconLoss,
     cfg: TrainConfig,
     step: int,
     run_expensive: bool,
@@ -351,11 +385,14 @@ def _evaluate_split(
         pred_ola[..., :S].float(), target[..., :S].float(), samples_per_frame
     )
     S_norm = pred_norm.shape[-1]
+    ola_total, ola_components = loss_fn.with_components(
+        pred_norm, target[..., :S_norm].float()
+    )
     out: dict[str, object] = {
-        f"eval/{split}/loss_ola": loss_fn(
-            pred_norm, target[..., :S_norm].float()
-        ).item(),
+        f"eval/{split}/loss_ola": ola_total.item(),
     }
+    for name, value in ola_components.items():
+        out[f"eval/{split}/recon_ola/{name}"] = value.item()
 
     if not run_expensive:
         return out
@@ -368,9 +405,12 @@ def _evaluate_split(
         samples_per_frame,
     )
     S_ex_norm = pred_exact_norm.shape[-1]
-    out[f"eval/{split}/loss_exact"] = loss_fn(
+    exact_total, exact_components = loss_fn.with_components(
         pred_exact_norm, target[..., :S_ex_norm].float()
-    ).item()
+    )
+    out[f"eval/{split}/loss_exact"] = exact_total.item()
+    for name, value in exact_components.items():
+        out[f"eval/{split}/recon_exact/{name}"] = value.item()
 
     # Pitch MAE (librosa.pyin on CPU)
     pitch_ola: list[float] = []
@@ -450,7 +490,7 @@ def _evaluate(
     model: PinkTromboneController,
     ddp_module: nn.Module,
     eval_setup: EvalSetup,
-    loss_fn: nn.Module,
+    loss_fn: CombinedReconLoss,
     cfg: TrainConfig,
     step: int,
     run_expensive: bool,
@@ -526,16 +566,13 @@ def main(hydra_cfg: DictConfig) -> None:
     model = PinkTromboneController(cfg.model).to(device)
     frame_rate = cfg.model.frame_rate
     samples_per_frame = cfg.model.samples_per_frame
-    loss_fn: nn.Module
-    if cfg.loss.type == "mfcc":
-        loss_fn = MFCCLoss(samples_per_frame=samples_per_frame)
-    elif cfg.loss.type == "mel":
-        loss_fn = MelSpecLoss(samples_per_frame=samples_per_frame)
-    elif cfg.loss.type == "stft":
-        loss_fn = MultiScaleLogMagSTFTLoss()
-    else:
-        raise ValueError(f"unknown loss type: {cfg.loss.type}")
-    loss_fn = loss_fn.to(device)
+    loss_fn = CombinedReconLoss(
+        [
+            ("mfcc", cfg.loss.mfcc, MFCCLoss(samples_per_frame=samples_per_frame)),
+            ("mel", cfg.loss.mel, MelSpecLoss(samples_per_frame=samples_per_frame)),
+            ("stft", cfg.loss.stft, MultiScaleLogMagSTFTLoss()),
+        ]
+    ).to(device)
 
     ddp_module: nn.Module
     if is_ddp:
@@ -654,14 +691,16 @@ def main(hydra_cfg: DictConfig) -> None:
         S = min(pred.shape[-1], target.shape[-1])
         pred_norm = _volume_match(pred[..., :S], target[..., :S], samples_per_frame)
         S_norm = pred_norm.shape[-1]
-        mfcc_loss = loss_fn(pred_norm, target[..., :S_norm])
+        recon_loss, recon_components = loss_fn.with_components(
+            pred_norm, target[..., :S_norm]
+        )
 
         # Entropy bonus on softmax(logits) — keeps logits from saturating
         # to one-hot, which otherwise kills the soft-Gumbel gradient.
         logits = aux["logits"].float()
         log_probs = F.log_softmax(logits, dim=-1)
         entropy = -(log_probs.exp() * log_probs).sum(-1).mean()
-        loss = mfcc_loss - cfg.optim.entropy_weight * entropy
+        loss = recon_loss - cfg.loss.entropy * entropy
 
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -685,7 +724,7 @@ def main(hydra_cfg: DictConfig) -> None:
             throughput_audio_s = 0.0
             log_payload: dict[str, object] = {
                 "train/loss": loss.item(),
-                "train/mfcc_loss": mfcc_loss.item(),
+                "train/recon_loss": recon_loss.item(),
                 "train/entropy": entropy.item(),
                 "train/lr": optimizer.param_groups[0]["lr"],
                 "train/tau": tau,
@@ -694,6 +733,8 @@ def main(hydra_cfg: DictConfig) -> None:
                 "System/throughput_per_gpu": throughput_per_gpu,
                 "System/throughput_total": throughput_total,
             }
+            for name, value in recon_components.items():
+                log_payload[f"train/recon/{name}"] = value.item()
             log_payload.update(
                 _controller_diagnostics(aux, model.trainable_names_, tau)
             )

@@ -26,10 +26,12 @@ optim:
   tau_start: 2.0
   tau_end: 0.5
   tau_anneal_steps: null  # default = max_steps
-  entropy_weight: 0.01    # encourage softmax(logits) to stay near uniform
 
 loss:
-  type: mfcc
+  mfcc: 1.0
+  mel: 0.0
+  stft: 0.0
+  entropy: 0.01    # encourage softmax(logits) to stay near uniform
 
 log:
   wandb_project: samuel
