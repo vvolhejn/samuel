@@ -29,11 +29,21 @@ class DataConfig(BaseModel):
     sample_rate: int = 44100
     chunk_seconds: float = 4.0
     num_workers: int = 4
+    pitch_cache_path: Path | None = None
+    # Fraction of the manifest reserved as the held-out validation split.
+    # Files at the tail of the manifest (after the train cut) are never seen
+    # during training; eval samples from them for the val_* metrics.
+    val_fraction: float = 0.05
 
     @field_validator("manifest_path")
     @classmethod
     def _resolve_manifest_path(cls, v: Path) -> Path:
         return _resolve_repo_relative(v)
+
+    @field_validator("pitch_cache_path")
+    @classmethod
+    def _resolve_pitch_cache(cls, v: Path | None) -> Path | None:
+        return _resolve_repo_relative(v) if v is not None else None
 
 
 class OptimConfig(BaseModel):
@@ -45,6 +55,12 @@ class OptimConfig(BaseModel):
     grad_clip: float = 1.0
     max_steps: int = 100_000
     warmup_steps: int = 1_000
+    # Gumbel-softmax temperature: linear anneal from tau_start to tau_end over
+    # the first tau_anneal_steps; afterwards held at tau_end. tau_anneal_steps
+    # defaults to max_steps when omitted in YAML.
+    tau_start: float = 2.0
+    tau_end: float = 0.5
+    tau_anneal_steps: int | None = None
 
 
 class SynthConfig(BaseModel):
@@ -85,6 +101,21 @@ class RunConfig(BaseModel):
         return _resolve_repo_relative(v)
 
 
+class LossConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Reconstruction-loss weights. Components with weight 0 are skipped.
+    # Total training loss is:
+    #   sum(w_i * loss_i(pred, target)) - entropy * H(softmax(logits))
+    # The entropy bonus keeps the per-position softmax distribution near
+    # uniform — without it, logits saturate and the soft Gumbel becomes
+    # effectively hard, killing gradients.
+    mfcc: float = 1.0  # L1 on first 20 MFCCs (frame-aligned to samples_per_frame)
+    mel: float = 0.0  # L1 on log-mel spectrogram (frame-aligned to samples_per_frame)
+    stft: float = 0.0  # Multi-scale log-magnitude STFT, n_ffts (512, 1024, 2048)
+    entropy: float = 0.01
+
+
 class TrainConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -96,6 +127,7 @@ class TrainConfig(BaseModel):
     synth: SynthConfig = Field(default_factory=SynthConfig)
     optim: OptimConfig = Field(default_factory=OptimConfig)
     log: LogConfig = Field(default_factory=LogConfig)
+    loss: LossConfig = Field(default_factory=LossConfig)
     batch_size: int = 8
 
     @classmethod

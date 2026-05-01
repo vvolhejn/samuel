@@ -6,9 +6,11 @@ batch_size: 128
 
 data:
   manifest_path: manifests/librilight_10h.jsonl
+  pitch_cache_path: manifests/pitch_cache/librilight_10h_spf2048.npz
   sample_rate: 44100
   chunk_seconds: 4.0
   num_workers: 4
+  val_fraction: 0.05
 
 synth:
   ir_length: 256
@@ -19,14 +21,23 @@ optim:
   betas: [0.9, 0.95]
   weight_decay: 0.0
   grad_clip: 1.0
-  max_steps: 40000
+  max_steps: 10000
   warmup_steps: 800
+  tau_start: 2.0
+  tau_end: 0.5
+  tau_anneal_steps: null  # default = max_steps
+
+loss:
+  mfcc: 1.0
+  mel: 0.0
+  stft: 0.0
+  entropy: 0.01    # encourage softmax(logits) to stay near uniform
 
 log:
   wandb_project: samuel
   wandb_entity: moboehle-kyutai
   wandb_mode: online
-  log_every: 50
+  log_every: 200
   val_every: 400
   eval_every: 400
   ckpt_every: 2000

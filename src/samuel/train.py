@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -22,6 +23,7 @@ import numpy as np
 import plotly.graph_objects as go
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from omegaconf import DictConfig
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -29,11 +31,54 @@ from tqdm import tqdm
 
 import wandb
 from samuel.config import TrainConfig
-from samuel.data import _load_resampled, build_dataloader, load_manifest
+from samuel.data import (
+    DatasetFile,
+    PitchCache,
+    _load_pitch_cache,
+    _load_resampled,
+    build_dataloader,
+    fill_unvoiced,
+    load_manifest,
+    split_train_val,
+)
 from samuel.evals.pitch import pitch_mae_cents
-from samuel.losses import MultiScaleLogMagSTFTLoss
+from samuel.losses import MelSpecLoss, MFCCLoss, MultiScaleLogMagSTFTLoss
 from samuel.model import PinkTromboneController
 from samuel.pink_trombone import PARAM_NAMES, pink_trombone, pink_trombone_ola
+
+
+class CombinedReconLoss(nn.Module):
+    """Weighted sum of reconstruction losses.
+
+    All components are always evaluated so their values can be logged for
+    comparison even when they contribute zero to the gradient. The training
+    loss is the weight-weighted sum; zero-weighted components are computed
+    but don't backprop. Passing all weights = 0 raises.
+    """
+
+    def __init__(self, components: list[tuple[str, float, nn.Module]]) -> None:
+        super().__init__()
+        if not any(w != 0.0 for _, w, _ in components):
+            raise ValueError("CombinedReconLoss needs at least one nonzero weight")
+        self.names: list[str] = [n for n, _, _ in components]
+        self.weights: list[float] = [w for _, w, _ in components]
+        self.fns = nn.ModuleList([fn for _, _, fn in components])
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        total, _ = self.with_components(pred, target)
+        return total
+
+    def with_components(
+        self, pred: torch.Tensor, target: torch.Tensor
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        components: dict[str, torch.Tensor] = {}
+        total = pred.new_zeros(())
+        for n, w, fn in zip(self.names, self.weights, self.fns):
+            v = fn(pred, target)
+            components[n] = v
+            if w != 0.0:
+                total = total + w * v
+        return total, components
 
 
 def _ddp_info() -> tuple[int, int, int, bool]:
@@ -59,7 +104,7 @@ def _broadcast_str(s: str, src: int = 0, is_ddp: bool = False) -> str:
 def _make_run_dir(cfg: TrainConfig, rank: int, is_ddp: bool) -> Path:
     if rank == 0:
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        run_dir = cfg.run.runs_root / f"{ts}_{cfg.run.name}"
+        run_dir = cfg.run.runs_root / f"{cfg.run.name}_{ts}"
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "checkpoints").mkdir(exist_ok=True)
         with open(run_dir / "config.json", "w") as f:
@@ -79,38 +124,192 @@ def _warmup_lr(step: int, warmup_steps: int) -> float:
     return 1.0
 
 
-def _load_eval_clips(
-    cfg: TrainConfig, device: torch.device
-) -> tuple[torch.Tensor, list[str]]:
-    """Load ``n_audio_samples`` fixed clips from the tail of the manifest."""
+def _tau_for_step(step: int, cfg: TrainConfig) -> float:
+    anneal = cfg.optim.tau_anneal_steps or cfg.optim.max_steps
+    if anneal <= 0 or step >= anneal:
+        return cfg.optim.tau_end
+    frac = step / anneal
+    return cfg.optim.tau_start + frac * (cfg.optim.tau_end - cfg.optim.tau_start)
+
+
+@torch.no_grad()
+def _controller_diagnostics(
+    aux: dict[str, torch.Tensor], trainable_names: list[str], tau: float
+) -> dict[str, float | wandb.Histogram]:
+    """Per-step diagnostics for the categorical head + encoder.
+
+    Logits and z come from ``model.forward(..., return_aux=True)``. Logged
+    under ``diag/`` to keep the train/eval namespaces clean.
+
+    Two bucket histograms per trainable param:
+      - ``bucket_usage``: hard argmax counts (what eval and hard-Gumbel pick).
+      - ``bucket_usage_tempered``: average softmax(logits/tau) per bucket
+        (what the soft Gumbel feeds into the synth in expectation).
+    """
+    logits = aux["logits"].detach().float()  # [B, T, n_t, n_b]
+    z = aux["z"].detach().float()  # [B, dim, T]
+    _, _, _, n_b = logits.shape
+
+    top2 = logits.topk(2, dim=-1).values
+    margin = top2[..., 0] - top2[..., 1]  # [B, T, n_t]
+    argmax = logits.argmax(-1)  # [B, T, n_t]
+    tempered = F.softmax(logits / max(tau, 1e-6), dim=-1)
+    tempered_per_bucket = tempered.mean(dim=(0, 1))  # [n_t, n_b]
+    edges = np.arange(n_b + 1) - 0.5
+
+    out: dict[str, float | wandb.Histogram] = {}
+    for j, name in enumerate(trainable_names):
+        a_j = argmax[..., j].flatten()
+        counts = torch.bincount(a_j, minlength=n_b).float()
+        out[f"diag/margin/{name}"] = margin[..., j].mean().item()
+        out[f"diag/bucket_usage/{name}"] = wandb.Histogram(
+            np_histogram=(counts.cpu().numpy(), edges)
+        )
+        out[f"diag/bucket_usage_tempered/{name}"] = wandb.Histogram(
+            np_histogram=(tempered_per_bucket[j].cpu().numpy(), edges)
+        )
+
+    out["diag/margin/mean"] = margin.mean().item()
+    out["diag/z_mean_norm"] = z.norm(dim=1).mean().item()
+    # Per-feature std across batch+time, averaged. Low ⇒ encoder collapsed.
+    out["diag/z_std_per_feat"] = z.std(dim=(0, 2)).mean().item()
+    return out
+
+
+def _volume_match(pred: torch.Tensor, target: torch.Tensor, hop: int) -> torch.Tensor:
+    """Per-frame RMS-match ``pred`` to ``target``. Both ``[B, S]``, S a multiple of hop."""
+    B = pred.shape[0]
+    T = pred.shape[-1] // hop
+    pred_f = pred[..., : T * hop].view(B, T, hop)
+    tgt_f = target[..., : T * hop].view(B, T, hop)
+    pred_rms = pred_f.pow(2).mean(-1).clamp_min(1e-12).sqrt()
+    tgt_rms = tgt_f.pow(2).mean(-1).clamp_min(1e-12).sqrt()
+    gain = (tgt_rms / pred_rms).unsqueeze(-1)
+    return (pred_f * gain).reshape(B, T * hop)
+
+
+@dataclass
+class EvalSetup:
+    """State needed to sample eval clips on demand.
+
+    Train clips and val clips are sampled separately so we can log overfit
+    (train_loss vs val_loss). The val files are the tail of the manifest
+    (last ``data.val_fraction``), never seen by the dataloader.
+    """
+
+    train_files: list  # list[DatasetFile]
+    val_files: list  # list[DatasetFile]
+    full_files: list  # list[DatasetFile], for full-manifest pitch index
+    pitch: PitchCache
+    chunk_samples: int
+    T_ctrl: int
+
+
+def _eval_setup(cfg: TrainConfig, samples_per_frame: int) -> EvalSetup:
+    """Load manifest + pitch cache once. Eval clips are sampled per-step."""
     files = load_manifest(cfg.data.manifest_path)
-    n = min(cfg.log.n_audio_samples, len(files))
-    picked = files[-n:]
+    train_files, val_files = split_train_val(files, cfg.data.val_fraction)
     chunk_samples = int(round(cfg.data.sample_rate * cfg.data.chunk_seconds))
-    clips = []
-    names = []
-    for df in picked:
-        audio = _load_resampled(df.path, cfg.data.sample_rate)
-        if len(audio) < chunk_samples:
-            audio = np.pad(audio, (0, chunk_samples - len(audio)))
-        audio = audio[:chunk_samples]
+    # Round chunk_samples down to a multiple of samples_per_frame so eval and
+    # training use the same alignment.
+    chunk_samples = (chunk_samples // samples_per_frame) * samples_per_frame
+    T_ctrl = chunk_samples // samples_per_frame
+
+    if cfg.data.pitch_cache_path is None:
+        raise ValueError(
+            "data.pitch_cache_path is required (eval needs precomputed f0)"
+        )
+    pitch = _load_pitch_cache(
+        cfg.data.pitch_cache_path, cfg.data.sample_rate, samples_per_frame
+    )
+    return EvalSetup(
+        train_files=train_files,
+        val_files=val_files,
+        full_files=files,
+        pitch=pitch,
+        chunk_samples=chunk_samples,
+        T_ctrl=T_ctrl,
+    )
+
+
+def _sample_eval_clips(
+    setup: EvalSetup,
+    files: list[DatasetFile],
+    step: int,
+    n: int,
+    sample_rate: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
+    """Pick ``n`` clips from ``files`` deterministically by ``step``.
+
+    Two evals at the same step pick the same clips (cross-run comparison);
+    consecutive evals within a run pick different clips (broader coverage).
+    """
+    n = min(n, len(files))
+    if n == 0:
+        return (
+            torch.empty(0, setup.chunk_samples, device=device),
+            torch.empty(0, setup.T_ctrl, device=device),
+            [],
+        )
+    full_idx_for_id = {id(df): i for i, df in enumerate(setup.full_files)}
+    indices = np.random.RandomState(step).choice(len(files), size=n, replace=False)
+
+    clips: list[torch.Tensor] = []
+    f0s: list[torch.Tensor] = []
+    names: list[str] = []
+    for local_idx in indices:
+        df = files[int(local_idx)]
+        full_idx = full_idx_for_id[id(df)]
+        audio = _load_resampled(df.path, sample_rate)
+        if len(audio) < setup.chunk_samples:
+            audio = np.pad(audio, (0, setup.chunk_samples - len(audio)))
+        audio = audio[: setup.chunk_samples]
+
+        f0_full, voiced_full = setup.pitch.by_file[full_idx]
+        f0_chunk = np.zeros(setup.T_ctrl, dtype=np.float32)
+        voiced_chunk = np.zeros(setup.T_ctrl, dtype=bool)
+        have = min(setup.T_ctrl, len(f0_full))
+        if have > 0:
+            f0_chunk[:have] = f0_full[:have]
+            voiced_chunk[:have] = voiced_full[:have]
+        f0_filled = fill_unvoiced(
+            f0_chunk, voiced_chunk, setup.pitch.fmin, setup.pitch.fmax
+        )
+
         clips.append(torch.from_numpy(audio))
+        f0s.append(torch.from_numpy(f0_filled))
         names.append(df.path.name)
-    return torch.stack(clips).to(device), names
+
+    return torch.stack(clips).to(device), torch.stack(f0s).to(device), names
 
 
 def _param_traj_figure(
-    params: torch.Tensor, trainable_names: list[str], frame_rate: float
+    params: torch.Tensor,
+    trainable_names: list[str],
+    frame_rate: float,
+    bounds: dict[str, tuple[float, float]] | None = None,
 ) -> go.Figure:
-    """plotly line plot of trainable param trajectories for one clip."""
-    params = params.detach().cpu().numpy()  # [T, 13]
+    """plotly line plot of trainable param trajectories for one clip.
+
+    If ``bounds`` is given, each trainable param is rescaled to [0, 1] using
+    its (lo, hi) so all trainable params share the same axis.
+    """
+    params = params.detach().cpu().numpy()  # [T, N_PARAMS]
     T = params.shape[0]
     t = np.arange(T) / frame_rate
     fig = go.Figure()
     for name in trainable_names:
         i = PARAM_NAMES.index(name)
-        fig.add_trace(go.Scatter(x=t, y=params[:, i], mode="lines", name=name))
-    fig.update_layout(xaxis_title="time (s)", yaxis_title="value", height=400)
+        y = params[:, i]
+        if bounds is not None:
+            lo, hi = bounds[name]
+            y = (y - lo) / (hi - lo)
+        fig.add_trace(go.Scatter(x=t, y=y, mode="lines", name=name))
+    yaxis_title = "normalized value" if bounds is not None else "value"
+    fig.update_layout(xaxis_title="time (s)", yaxis_title=yaxis_title, height=400)
+    if bounds is not None:
+        fig.update_yaxes(range=[-0.05, 1.05])
     return fig
 
 
@@ -144,23 +343,34 @@ def _mel_fig_stacked(audios: list[tuple[str, np.ndarray]], sr: int) -> go.Figure
 
 
 @torch.no_grad()
-def _evaluate(
+def _evaluate_split(
     model: PinkTromboneController,
     ddp_module: nn.Module,
-    eval_clips: torch.Tensor,
-    eval_names: list[str],
-    loss_fn: MultiScaleLogMagSTFTLoss,
+    eval_setup: EvalSetup,
+    files: list[DatasetFile],
+    split: str,
+    loss_fn: CombinedReconLoss,
     cfg: TrainConfig,
     step: int,
     run_expensive: bool,
-) -> dict[str, float]:
-    """Evaluate on cached eval clips. Returns scalar metrics; logs audio/plots on expensive runs."""
-    model_was_training = ddp_module.training
-    ddp_module.eval()
+    device: torch.device,
+) -> dict[str, object]:
+    """One eval pass on a subset of files (e.g. train or val).
+
+    Keys are namespaced as ``eval/{split}/...``; cheap path always logs
+    ``loss_ola``, expensive path adds ``loss_exact``, pitch-MAE metrics, and
+    audio/params/mel media (lists, one entry per sampled clip).
+    """
+    eval_clips, eval_f0, eval_names = _sample_eval_clips(
+        eval_setup, files, step, cfg.log.n_audio_samples, cfg.data.sample_rate, device
+    )
+    if eval_clips.numel() == 0:
+        return {}
     target = eval_clips  # [N, S]
     wav = target.unsqueeze(1)  # [N, 1, S]
-    params = model(wav)  # [N, T_ctrl, 13]
+    params = model(wav, eval_f0)  # [N, T_ctrl, N_PARAMS]
     frame_rate = model.config.frame_rate
+    samples_per_frame = model.samples_per_frame
 
     fixed_seed = torch.arange(target.shape[0], dtype=torch.long)
     pred_ola = pink_trombone_ola(
@@ -170,81 +380,159 @@ def _evaluate(
         ir_impl=cfg.synth.ir_impl,
         control_rate=frame_rate,
     )
-    # Crop to shared length (pink_trombone_ola returns T * samples_per_frame samples,
-    # which may differ from S if S was not an exact multiple).
     S = min(pred_ola.shape[-1], target.shape[-1])
-    loss = loss_fn(pred_ola[..., :S].float(), target[..., :S].float()).item()
-    metrics: dict[str, float] = {"eval/loss_ola": loss}
+    pred_norm = _volume_match(
+        pred_ola[..., :S].float(), target[..., :S].float(), samples_per_frame
+    )
+    S_norm = pred_norm.shape[-1]
+    ola_total, ola_components = loss_fn.with_components(
+        pred_norm, target[..., :S_norm].float()
+    )
+    out: dict[str, object] = {
+        f"eval/{split}/loss_ola": ola_total.item(),
+    }
+    for name, value in ola_components.items():
+        out[f"eval/{split}/recon_ola/{name}"] = value.item()
 
-    if run_expensive:
-        pred_exact = pink_trombone(params, seed=fixed_seed, control_rate=frame_rate)
-        S_ex = min(pred_exact.shape[-1], target.shape[-1])
-        metrics["eval/loss_exact"] = loss_fn(
-            pred_exact[..., :S_ex].float(), target[..., :S_ex].float()
-        ).item()
+    if not run_expensive:
+        return out
 
-        # Pitch MAE (librosa.pyin on CPU)
-        pitch_ola = []
-        pitch_exact = []
-        miss_ola = []
-        miss_exact = []
-        for i in range(target.shape[0]):
-            tgt_np = target[i].detach().cpu().numpy()
-            ola_np = pred_ola[i, :S].detach().cpu().numpy()
-            ex_np = pred_exact[i, :S_ex].detach().cpu().numpy()
-            m_ola = pitch_mae_cents(
-                tgt_np,
-                ola_np,
-                cfg.data.sample_rate,
-                fmin=cfg.log.pitch_fmin,
-                fmax=cfg.log.pitch_fmax,
-                voiced_prob_threshold=cfg.log.pitch_voiced_prob_threshold,
-            )
-            m_ex = pitch_mae_cents(
-                tgt_np,
-                ex_np,
-                cfg.data.sample_rate,
-                fmin=cfg.log.pitch_fmin,
-                fmax=cfg.log.pitch_fmax,
-                voiced_prob_threshold=cfg.log.pitch_voiced_prob_threshold,
-            )
-            if not np.isnan(m_ola.mae_cents):
-                pitch_ola.append(m_ola.mae_cents)
-                miss_ola.append(m_ola.unvoiced_miss_frac)
-            if not np.isnan(m_ex.mae_cents):
-                pitch_exact.append(m_ex.mae_cents)
-                miss_exact.append(m_ex.unvoiced_miss_frac)
+    pred_exact = pink_trombone(params, seed=fixed_seed, control_rate=frame_rate)
+    S_ex = min(pred_exact.shape[-1], target.shape[-1])
+    pred_exact_norm = _volume_match(
+        pred_exact[..., :S_ex].float(),
+        target[..., :S_ex].float(),
+        samples_per_frame,
+    )
+    S_ex_norm = pred_exact_norm.shape[-1]
+    exact_total, exact_components = loss_fn.with_components(
+        pred_exact_norm, target[..., :S_ex_norm].float()
+    )
+    out[f"eval/{split}/loss_exact"] = exact_total.item()
+    for name, value in exact_components.items():
+        out[f"eval/{split}/recon_exact/{name}"] = value.item()
 
-        if pitch_ola:
-            metrics["eval/pitch_mae_cents_ola"] = float(np.mean(pitch_ola))
-            metrics["eval/unvoiced_miss_frac_ola"] = float(np.mean(miss_ola))
-        if pitch_exact:
-            metrics["eval/pitch_mae_cents_exact"] = float(np.mean(pitch_exact))
-            metrics["eval/unvoiced_miss_frac_exact"] = float(np.mean(miss_exact))
+    # Pitch MAE (librosa.pyin on CPU)
+    pitch_ola: list[float] = []
+    pitch_exact: list[float] = []
+    miss_ola: list[float] = []
+    miss_exact: list[float] = []
+    for i in range(target.shape[0]):
+        tgt_np = target[i].detach().cpu().numpy()
+        ola_np = pred_norm[i].detach().cpu().numpy()
+        ex_np = pred_exact_norm[i].detach().cpu().numpy()
+        m_ola = pitch_mae_cents(
+            tgt_np,
+            ola_np,
+            cfg.data.sample_rate,
+            fmin=cfg.log.pitch_fmin,
+            fmax=cfg.log.pitch_fmax,
+            voiced_prob_threshold=cfg.log.pitch_voiced_prob_threshold,
+        )
+        m_ex = pitch_mae_cents(
+            tgt_np,
+            ex_np,
+            cfg.data.sample_rate,
+            fmin=cfg.log.pitch_fmin,
+            fmax=cfg.log.pitch_fmax,
+            voiced_prob_threshold=cfg.log.pitch_voiced_prob_threshold,
+        )
+        if not np.isnan(m_ola.mae_cents):
+            pitch_ola.append(m_ola.mae_cents)
+            miss_ola.append(m_ola.unvoiced_miss_frac)
+        if not np.isnan(m_ex.mae_cents):
+            pitch_exact.append(m_ex.mae_cents)
+            miss_exact.append(m_ex.unvoiced_miss_frac)
 
-        # Audio + figures to wandb
-        sr = cfg.data.sample_rate
-        gap = np.zeros(int(sr * 0.1), dtype=np.float32)
-        wandb_logs: dict[str, object] = {}
-        trainable_names = model.trainable_names_
-        for i, name in enumerate(eval_names):
-            tgt_np = target[i].detach().cpu().numpy()
-            ola_np = pred_ola[i, :S].detach().cpu().numpy()
-            ex_np = pred_exact[i, :S_ex].detach().cpu().numpy()
-            short_name = name[:10]
-            tag = f"eval/{i:02d}_{short_name}"
-            combined = np.concatenate(
-                [tgt_np.astype(np.float32), gap, _norm(ola_np), gap, _norm(ex_np)]
-            )
-            wandb_logs[f"{tag}/audio"] = wandb.Audio(combined, sample_rate=sr)
-            wandb_logs[f"{tag}/params"] = wandb.Plotly(
-                _param_traj_figure(params[i], trainable_names, frame_rate)
-            )
-            wandb_logs[f"{tag}/mel"] = wandb.Plotly(
-                _mel_fig_stacked([("target", tgt_np), ("ola", ola_np)], sr)
-            )
-        wandb.log(wandb_logs, step=step)
+    if pitch_ola:
+        out[f"eval/{split}/pitch_mae_cents_ola"] = float(np.mean(pitch_ola))
+        out[f"eval/{split}/unvoiced_miss_frac_ola"] = float(np.mean(miss_ola))
+    if pitch_exact:
+        out[f"eval/{split}/pitch_mae_cents_exact"] = float(np.mean(pitch_exact))
+        out[f"eval/{split}/unvoiced_miss_frac_exact"] = float(np.mean(miss_exact))
 
+    # Audio / params / mel as lists under stable keys.
+    sr = cfg.data.sample_rate
+    gap = np.zeros(int(sr * 0.1), dtype=np.float32)
+    trainable_names = model.trainable_names_
+    bounds = {n: model.config.param_spec[n][:2] for n in trainable_names}
+    audios: list[wandb.Audio] = []
+    param_figs: list[wandb.Plotly] = []
+    mel_pairs: list[tuple[str, np.ndarray]] = []
+    for i, name in enumerate(eval_names):
+        tgt_np = target[i].detach().cpu().numpy()
+        ola_np = pred_norm[i].detach().cpu().numpy()
+        ex_np = pred_exact_norm[i].detach().cpu().numpy()
+        # ola → ex → tgt so the listener hears the prediction before the
+        # ground truth (no anchoring on the target).
+        combined = np.concatenate(
+            [_norm(ola_np), gap, _norm(ex_np), gap, tgt_np.astype(np.float32)]
+        )
+        audios.append(wandb.Audio(combined, sample_rate=sr, caption=name))
+        param_figs.append(
+            wandb.Plotly(
+                _param_traj_figure(
+                    params[i], trainable_names, frame_rate, bounds=bounds
+                )
+            )
+        )
+        mel_pairs.append((f"{name}: target", tgt_np))
+        mel_pairs.append((f"{name}: ola", ola_np))
+
+    out[f"eval/{split}/audio"] = audios
+    out[f"eval/{split}/params"] = param_figs
+    out[f"eval/{split}/mel"] = wandb.Plotly(_mel_fig_stacked(mel_pairs, sr))
+    return out
+
+
+@torch.no_grad()
+def _evaluate(
+    model: PinkTromboneController,
+    ddp_module: nn.Module,
+    eval_setup: EvalSetup,
+    loss_fn: CombinedReconLoss,
+    cfg: TrainConfig,
+    step: int,
+    run_expensive: bool,
+    device: torch.device,
+) -> dict[str, object]:
+    """Evaluate on train + val clips (deterministic by ``step``).
+
+    The val split is the held-out tail of the manifest (see
+    ``data.val_fraction``); the train split samples from the same files the
+    dataloader sees, so ``train`` vs ``val`` numbers expose any overfit.
+    """
+    model_was_training = ddp_module.training
+    ddp_module.eval()
+    metrics: dict[str, object] = {}
+    metrics.update(
+        _evaluate_split(
+            model,
+            ddp_module,
+            eval_setup,
+            eval_setup.train_files,
+            "train",
+            loss_fn,
+            cfg,
+            step,
+            run_expensive,
+            device,
+        )
+    )
+    metrics.update(
+        _evaluate_split(
+            model,
+            ddp_module,
+            eval_setup,
+            eval_setup.val_files,
+            "val",
+            loss_fn,
+            cfg,
+            step,
+            run_expensive,
+            device,
+        )
+    )
     if model_was_training:
         ddp_module.train()
     return metrics
@@ -277,7 +565,14 @@ def main(hydra_cfg: DictConfig) -> None:
     # Model
     model = PinkTromboneController(cfg.model).to(device)
     frame_rate = cfg.model.frame_rate
-    loss_fn = MultiScaleLogMagSTFTLoss().to(device)
+    samples_per_frame = cfg.model.samples_per_frame
+    loss_fn = CombinedReconLoss(
+        [
+            ("mfcc", cfg.loss.mfcc, MFCCLoss(samples_per_frame=samples_per_frame)),
+            ("mel", cfg.loss.mel, MelSpecLoss(samples_per_frame=samples_per_frame)),
+            ("stft", cfg.loss.stft, MultiScaleLogMagSTFTLoss()),
+        ]
+    ).to(device)
 
     ddp_module: nn.Module
     if is_ddp:
@@ -307,13 +602,15 @@ def main(hydra_cfg: DictConfig) -> None:
         world_size=world_size,
         epoch=0,
         seed=cfg.run.seed,
+        pitch_cache_path=cfg.data.pitch_cache_path,
+        samples_per_frame=samples_per_frame,
+        val_fraction=cfg.data.val_fraction,
     )
 
-    # Eval clips (rank 0 only)
-    eval_clips: torch.Tensor | None = None
-    eval_names: list[str] = []
+    # Eval setup (rank 0 only). Clips are sampled per-step inside ``_evaluate``.
+    eval_setup: EvalSetup | None = None
     if rank == 0:
-        eval_clips, eval_names = _load_eval_clips(cfg, device)
+        eval_setup = _eval_setup(cfg, samples_per_frame)
 
     # wandb (rank 0 only)
     if rank == 0:
@@ -335,19 +632,23 @@ def main(hydra_cfg: DictConfig) -> None:
     throughput_t0 = time.perf_counter()
     throughput_audio_s = 0.0
 
-    if rank == 0 and eval_clips is not None:
+    if rank == 0 and eval_setup is not None:
         metrics = _evaluate(
             module,
             ddp_module,
-            eval_clips,
-            eval_names,
+            eval_setup,
             loss_fn,
             cfg,
             step,
             run_expensive=True,
+            device=device,
         )
         wandb.log(metrics, step=step)
-        tqdm.write(f"[eval] step={step} loss_ola={metrics['eval/loss_ola']:.4f}")
+        tqdm.write(
+            f"[eval] step={step} "
+            f"train={metrics.get('eval/train/loss_ola', float('nan')):.4f} "
+            f"val={metrics.get('eval/val/loss_ola', float('nan')):.4f}"
+        )
 
     while step < cfg.optim.max_steps:
         try:
@@ -358,7 +659,8 @@ def main(hydra_cfg: DictConfig) -> None:
             data_iter = iter(loader)
             batch = next(data_iter)
 
-        wav = batch.to(device, non_blocking=True)  # [B, S]
+        wav = batch["audio"].to(device, non_blocking=True)  # [B, S]
+        f0 = batch["pitch"].to(device, non_blocking=True)  # [B, T_ctrl]
         target = wav
         wav_in = wav.unsqueeze(1)  # [B, 1, S]
 
@@ -366,15 +668,18 @@ def main(hydra_cfg: DictConfig) -> None:
         for g in optimizer.param_groups:
             g["lr"] = cfg.optim.lr * _warmup_lr(step, cfg.optim.warmup_steps)
 
+        tau = _tau_for_step(step, cfg)
         optimizer.zero_grad(set_to_none=True)
 
-        # Encoder + head in bf16; synth & loss in fp32
+        # Encoder + head in bf16; synth & loss in fp32. We always pull aux
+        # so we can use the logits for the entropy bonus and re-use them
+        # for the diag log every log_every steps.
         with torch.autocast(
             device_type=device.type,
             dtype=torch.bfloat16,
             enabled=(device.type == "cuda"),
         ):
-            params = ddp_module(wav_in)
+            params, aux = ddp_module(wav_in, f0, tau, return_aux=True)
         params = params.float()
 
         pred = pink_trombone_ola(
@@ -384,7 +689,18 @@ def main(hydra_cfg: DictConfig) -> None:
             control_rate=frame_rate,
         )
         S = min(pred.shape[-1], target.shape[-1])
-        loss = loss_fn(pred[..., :S], target[..., :S])
+        pred_norm = _volume_match(pred[..., :S], target[..., :S], samples_per_frame)
+        S_norm = pred_norm.shape[-1]
+        recon_loss, recon_components = loss_fn.with_components(
+            pred_norm, target[..., :S_norm]
+        )
+
+        # Entropy bonus on softmax(logits) — keeps logits from saturating
+        # to one-hot, which otherwise kills the soft-Gumbel gradient.
+        logits = aux["logits"].float()
+        log_probs = F.log_softmax(logits, dim=-1)
+        entropy = -(log_probs.exp() * log_probs).sum(-1).mean()
+        loss = recon_loss - cfg.loss.entropy * entropy
 
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -406,31 +722,41 @@ def main(hydra_cfg: DictConfig) -> None:
             throughput_total = throughput_per_gpu * world_size
             throughput_t0 = time.perf_counter()
             throughput_audio_s = 0.0
-            wandb.log(
-                {
-                    "train/loss": loss.item(),
-                    "train/lr": optimizer.param_groups[0]["lr"],
-                    "train/grad_norm": float(grad_norm),
-                    "train/epoch": epoch,
-                    "System/throughput_per_gpu": throughput_per_gpu,
-                    "System/throughput_total": throughput_total,
-                },
-                step=step,
+            log_payload: dict[str, object] = {
+                "train/loss": loss.item(),
+                "train/recon_loss": recon_loss.item(),
+                "train/entropy": entropy.item(),
+                "train/lr": optimizer.param_groups[0]["lr"],
+                "train/tau": tau,
+                "train/grad_norm": float(grad_norm),
+                "train/epoch": epoch,
+                "System/throughput_per_gpu": throughput_per_gpu,
+                "System/throughput_total": throughput_total,
+            }
+            for name, value in recon_components.items():
+                log_payload[f"train/recon/{name}"] = value.item()
+            log_payload.update(
+                _controller_diagnostics(aux, model.trainable_names_, tau)
             )
+            wandb.log(log_payload, step=step)
 
-        if rank == 0 and eval_clips is not None and step % cfg.log.val_every == 0:
+        if rank == 0 and eval_setup is not None and step % cfg.log.val_every == 0:
             metrics = _evaluate(
                 module,
                 ddp_module,
-                eval_clips,
-                eval_names,
+                eval_setup,
                 loss_fn,
                 cfg,
                 step,
                 run_expensive=(step % cfg.log.eval_every == 0),
+                device=device,
             )
             wandb.log(metrics, step=step)
-            tqdm.write(f"[eval] step={step} loss_ola={metrics['eval/loss_ola']:.4f}")
+            tqdm.write(
+                f"[eval] step={step} "
+                f"train={metrics.get('eval/train/loss_ola', float('nan')):.4f} "
+                f"val={metrics.get('eval/val/loss_ola', float('nan')):.4f}"
+            )
 
         if rank == 0 and step % cfg.log.ckpt_every == 0:
             ckpt_path = run_dir / "checkpoints" / f"{step:07d}.pt"
