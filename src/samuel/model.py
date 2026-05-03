@@ -59,18 +59,23 @@ class PinkTromboneControllerConfig(BaseModel):
         """Trainable parameter names in PARAM_NAMES order."""
         return [n for n in PARAM_NAMES if n in self.param_spec]
 
+    @property
+    def freq_is_trainable(self) -> bool:
+        return "frequency" in self.param_spec
+
     def validate_coverage(self) -> None:
         trainable = set(self.param_spec)
         frozen = set(self.frozen_values)
         overlap = trainable & frozen
         if overlap:
             raise ValueError(f"params in both param_spec and frozen_values: {overlap}")
-        if "frequency" in trainable or "frequency" in frozen:
-            raise ValueError(
-                "'frequency' must not appear in param_spec or frozen_values; "
-                "it is supplied externally from the pyin cache"
-            )
-        covered = trainable | frozen | {"frequency"}
+        # ``frequency`` may be either trainable (predicted by the head) or
+        # supplied externally from the pyin cache. It must not be frozen.
+        if "frequency" in frozen:
+            raise ValueError("'frequency' must not be frozen")
+        covered = trainable | frozen
+        if "frequency" not in covered:
+            covered = covered | {"frequency"}  # external pyin path
         missing = set(PARAM_NAMES) - covered
         if missing:
             raise ValueError(
@@ -92,6 +97,7 @@ class PinkTromboneController(nn.Module):
 
         self.samples_per_frame = config.samples_per_frame
         self.n_buckets = config.n_buckets
+        self.freq_is_trainable = config.freq_is_trainable
         self.encoder = SEANetEncoder(config.encoder)
 
         trainable = config.trainable_names()
@@ -140,7 +146,7 @@ class PinkTromboneController(nn.Module):
     def forward(
         self,
         wav: Tensor,
-        f0: Tensor,
+        f0: Tensor | None,
         tau: float = 1.0,
         return_aux: bool = False,
     ) -> Tensor | tuple[Tensor, dict[str, Tensor]]:
@@ -148,9 +154,10 @@ class PinkTromboneController(nn.Module):
 
         Args:
             wav: ``[B, 1, S]`` audio at 44.1 kHz.
-            f0: ``[B, T_ctrl]`` fundamental frequency in Hz per control frame.
-                Already interpolated through unvoiced regions and clamped to a
-                sane range.
+            f0: ``[B, T_ctrl]`` fundamental frequency in Hz per control frame
+                (already filled through unvoiced regions). Required when
+                ``frequency`` is *not* in ``param_spec`` (external-pyin path);
+                ignored when ``frequency`` is trainable.
             tau: Gumbel-softmax temperature (training only).
             return_aux: if True, also return a dict with ``logits``
                 ``[B, T_ctrl, n_trainable, n_buckets]`` and ``z`` (encoder
@@ -164,8 +171,11 @@ class PinkTromboneController(nn.Module):
             raise ValueError(f"expected wav [B, 1, S], got {tuple(wav.shape)}")
         B, _C, S = wav.shape
         T_ctrl = self.t_ctrl_for(S)
-        if f0.shape != (B, T_ctrl):
-            raise ValueError(f"expected f0 [{B}, {T_ctrl}], got {tuple(f0.shape)}")
+        if not self.freq_is_trainable:
+            if f0 is None:
+                raise ValueError("f0 is required when frequency is not trainable")
+            if f0.shape != (B, T_ctrl):
+                raise ValueError(f"expected f0 [{B}, {T_ctrl}], got {tuple(f0.shape)}")
 
         hop = self.encoder.hop_length
         pad = (hop - S % hop) % hop
@@ -205,10 +215,11 @@ class PinkTromboneController(nn.Module):
             frozen_vals = self._frozen_vals.view(1, 1, -1).expand(B, T_ctrl, -1)
             out = out.scatter(2, frozen_idx, frozen_vals.to(out.dtype))
 
-        freq_idx = torch.full(
-            (B, T_ctrl, 1), self._freq_idx, device=out.device, dtype=torch.long
-        )
-        out = out.scatter(2, freq_idx, f0.unsqueeze(-1).to(out.dtype))
+        if not self.freq_is_trainable:
+            freq_idx = torch.full(
+                (B, T_ctrl, 1), self._freq_idx, device=out.device, dtype=torch.long
+            )
+            out = out.scatter(2, freq_idx, f0.unsqueeze(-1).to(out.dtype))
         if return_aux:
             return out, {"logits": logits, "z": z}
         return out

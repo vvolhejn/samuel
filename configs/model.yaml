@@ -19,10 +19,12 @@ model:
   # tests whether finer per-param resolution improves reconstruction.
   n_buckets: 32
 
-  # (lo, hi, init) per trainable parameter. ``frequency`` is supplied
-  # externally from the pyin cache; ``intensity`` is frozen at 1.0 and the
-  # synth output is RMS-matched to the target post-hoc.
+  # (lo, hi, init) per trainable parameter. ``frequency`` is in param_spec
+  # here so the head learns it instead of taking it from the pyin cache.
+  # ``intensity`` is frozen at 1.0 and the synth output is RMS-matched to
+  # the target post-hoc.
   param_spec:
+    frequency:            [80.0, 400.0, 140.0]
     voiceness:            [0.0, 1.0, 0.6]
     tongueIndex:          [10.0, 35.0, 20.0]
     tongueDiameter:       [1.5, 3.5, 2.4]

@@ -109,12 +109,23 @@ class TestController:
         with pytest.raises(ValueError, match="covered by neither"):
             PinkTromboneController(cfg)
 
-    def test_frequency_in_spec_rejected(self):
-        bad_spec = dict(_DEFAULT_PARAM_SPEC)
-        bad_spec["frequency"] = (80.0, 400.0, 200.0)
+    def test_frequency_trainable_path(self):
+        spec = dict(_DEFAULT_PARAM_SPEC)
+        spec["frequency"] = (80.0, 400.0, 200.0)
         cfg = PinkTromboneControllerConfig(
             encoder=SEANetEncoderConfig(n_filters=8, dimension=16),
-            param_spec=bad_spec,
+            param_spec=spec,
+            samples_per_frame=2048,
+            n_buckets=8,
         )
-        with pytest.raises(ValueError, match="frequency.*externally"):
-            PinkTromboneController(cfg)
+        model = PinkTromboneController(cfg).eval()
+        assert model.freq_is_trainable is True
+        S = cfg.samples_per_frame * 4
+        wav = torch.zeros(2, 1, S)
+        # f0 may be omitted entirely when frequency is trainable.
+        params = model(wav, None)
+        assert params.shape == (2, S // cfg.samples_per_frame, N_PARAMS)
+        freq_idx = PARAM_NAMES.index("frequency")
+        # predicted frequencies must lie on bucket centers and within range.
+        f_vals = params[..., freq_idx].flatten()
+        assert ((f_vals >= 80.0 - 1e-4) & (f_vals <= 400.0 + 1e-4)).all()
