@@ -15,9 +15,8 @@ model:
   # 2048 samples = ~21.53 Hz at 44.1 kHz. Matches the loss hop and the
   # pitch-cache hop.
   samples_per_frame: 2048
-  # Factorized head with 32 buckets per param (vs. 8 in the baseline) —
-  # tests whether finer per-param resolution improves reconstruction.
-  n_buckets: 32
+  # Factorized head, 64 buckets per param.
+  n_buckets: 64
 
   # (lo, hi, init) per trainable parameter. ``frequency`` is supplied
   # externally from the pyin cache; ``intensity`` is frozen at 1.0 and the
