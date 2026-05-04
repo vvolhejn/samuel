@@ -12,9 +12,9 @@ model:
     pad_mode: constant
     compress: 2
 
-  # 1024 samples = ~43.07 Hz at 44.1 kHz. Doubles the control rate vs.
-  # the 2048-spf baseline, paired with the matching pitch cache.
-  samples_per_frame: 1024
+  # 512 samples = ~86.13 Hz at 44.1 kHz. 4× the 2048-spf baseline rate,
+  # paired with the matching pitch cache.
+  samples_per_frame: 512
   # Factorized head with 32 buckets per param (vs. 8 in the baseline) —
   # tests whether finer per-param resolution improves reconstruction.
   n_buckets: 32
