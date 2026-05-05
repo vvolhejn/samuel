@@ -2,11 +2,11 @@ defaults:
   - model
   - _self_
 
-batch_size: 128
+batch_size: 96
 
 data:
   manifest_path: manifests/librilight_10h.jsonl
-  pitch_cache_path: manifests/pitch_cache/librilight_10h_spf2048.npz
+  pitch_cache_path: manifests/pitch_cache/librilight_10h_spf512.npz
   sample_rate: 44100
   chunk_seconds: 4.0
   num_workers: 4

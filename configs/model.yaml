@@ -12,9 +12,9 @@ model:
     pad_mode: constant
     compress: 2
 
-  # 2048 samples = ~21.53 Hz at 44.1 kHz. Matches the loss hop and the
+  # 512 samples = ~86.13 Hz at 44.1 kHz. Matches the loss hop and the
   # pitch-cache hop.
-  samples_per_frame: 2048
+  samples_per_frame: 512
   n_buckets: 8
 
   # (lo, hi, init) per trainable parameter. ``frequency`` is supplied
