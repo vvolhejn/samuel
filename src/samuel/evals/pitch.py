@@ -28,6 +28,12 @@ def pitch_track(
     voiced_prob_threshold: float = 0.5,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return (f0_hz, voiced_mask) aligned per-frame. Both shape [n_frames]."""
+    # The synth (esp. the "exact" path) can occasionally produce inf/NaN
+    # samples for pathological parameter combinations. librosa.pyin then
+    # raises ParameterError. Replace non-finite samples with 0 so the eval
+    # never crashes the run; downstream metrics fall back to NaN naturally.
+    if not np.isfinite(audio).all():
+        audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
     f0, voiced_flag, voiced_prob = librosa.pyin(
         audio, fmin=fmin, fmax=fmax, sr=sample_rate
     )

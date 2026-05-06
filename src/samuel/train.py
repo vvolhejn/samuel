@@ -539,6 +539,10 @@ def _evaluate(
 
 
 def _norm(x: np.ndarray) -> np.ndarray:
+    # Synth occasionally emits non-finite samples for pathological controls;
+    # sanitize before normalising so wandb.Audio (int16) isn't fed garbage.
+    if not np.isfinite(x).all():
+        x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
     p = float(np.abs(x).max())
     return x / p * 0.9 if p > 1e-6 else x
 
