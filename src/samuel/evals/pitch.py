@@ -27,7 +27,15 @@ def pitch_track(
     fmax: float = 500.0,
     voiced_prob_threshold: float = 0.5,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return (f0_hz, voiced_mask) aligned per-frame. Both shape [n_frames]."""
+    """Return (f0_hz, voiced_mask) aligned per-frame. Both shape [n_frames].
+
+    If ``audio`` contains non-finite samples, returns an empty result rather
+    than letting librosa raise — callers (e.g. the eval loop) treat NaN
+    metrics as a missing measurement, which is preferable to a hard crash
+    on a transient synth divergence.
+    """
+    if not np.all(np.isfinite(audio)):
+        return np.full(0, np.nan, dtype=np.float32), np.zeros(0, dtype=bool)
     f0, voiced_flag, voiced_prob = librosa.pyin(
         audio, fmin=fmin, fmax=fmax, sr=sample_rate
     )

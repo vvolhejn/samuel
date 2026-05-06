@@ -42,7 +42,13 @@ from samuel.data import (
     split_train_val,
 )
 from samuel.evals.pitch import pitch_mae_cents
-from samuel.losses import MelSpecLoss, MFCCLoss, MultiScaleLogMagSTFTLoss
+from samuel.losses import (
+    MelSpecLoss,
+    MFCCLoss,
+    MultiScaleLogMagSTFTLoss,
+    MultiScaleMelSpecLoss,
+    MultiScaleMFCCLoss,
+)
 from samuel.model import PinkTromboneController
 from samuel.pink_trombone import PARAM_NAMES, pink_trombone, pink_trombone_ola
 
@@ -571,6 +577,8 @@ def main(hydra_cfg: DictConfig) -> None:
             ("mfcc", cfg.loss.mfcc, MFCCLoss(samples_per_frame=samples_per_frame)),
             ("mel", cfg.loss.mel, MelSpecLoss(samples_per_frame=samples_per_frame)),
             ("stft", cfg.loss.stft, MultiScaleLogMagSTFTLoss()),
+            ("ms_mfcc", cfg.loss.ms_mfcc, MultiScaleMFCCLoss()),
+            ("ms_mel", cfg.loss.ms_mel, MultiScaleMelSpecLoss()),
         ]
     ).to(device)
 

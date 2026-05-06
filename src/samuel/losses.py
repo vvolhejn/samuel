@@ -125,6 +125,133 @@ class MelSpecLoss(nn.Module):
         return (self.features(pred) - self.features(target)).abs().mean()
 
 
+class MultiScaleMFCCLoss(nn.Module):
+    """L1 distance between MFCCs computed at several window sizes.
+
+    Same idea as ``MultiScaleLogMagSTFTLoss`` but on cepstral coefficients:
+    for each ``n_fft``, compute a hop=``n_fft/hop_div`` STFT, mel-filter
+    (``n_mels`` bins), ``log1p`` of squared magnitudes, and DCT-II truncated
+    to ``n_mfcc`` coefficients. Returns the L1 distance averaged over scales.
+    """
+
+    def __init__(
+        self,
+        n_ffts: Sequence[int] = (512, 1024, 2048),
+        hop_div: int = 4,
+        n_mels: int = 80,
+        n_mfcc: int = 20,
+        sample_rate: int = SAMPLE_RATE,
+    ):
+        super().__init__()
+        self.n_ffts = tuple(n_ffts)
+        self.hop_div = hop_div
+        self.n_mels = n_mels
+        self.n_mfcc = n_mfcc
+        self.sample_rate = sample_rate
+
+        k = torch.arange(n_mfcc, dtype=torch.float32).unsqueeze(1)
+        n = torch.arange(n_mels, dtype=torch.float32)
+        dct = torch.cos(math.pi * k * (n + 0.5) / n_mels) * math.sqrt(2.0 / n_mels)
+        dct[0] *= 1.0 / math.sqrt(2.0)
+        self.register_buffer("dct", dct, persistent=False)  # [n_mfcc, n_mels]
+
+        for n_fft in self.n_ffts:
+            self.register_buffer(
+                f"window_{n_fft}", torch.hann_window(n_fft), persistent=False
+            )
+            mel_fb = torch.from_numpy(
+                librosa.filters.mel(
+                    sr=sample_rate,
+                    n_fft=n_fft,
+                    n_mels=n_mels,
+                    fmin=0.0,
+                    fmax=sample_rate / 2,
+                )
+            ).float()  # [n_mels, n_freqs]
+            self.register_buffer(f"mel_fb_{n_fft}", mel_fb, persistent=False)
+
+    def _features(self, x: Tensor, n_fft: int) -> Tensor:
+        window: Tensor = getattr(self, f"window_{n_fft}")
+        mel_fb: Tensor = getattr(self, f"mel_fb_{n_fft}")
+        hop = n_fft // self.hop_div
+        spec = torch.stft(
+            x, n_fft=n_fft, hop_length=hop, window=window, return_complex=True
+        ).abs()  # [B, n_freqs, T]
+        mel = torch.einsum("mf,bft->bmt", mel_fb, spec.pow(2))
+        log_mel = torch.log1p(mel)
+        return torch.einsum("km,bmt->bkt", self.dct, log_mel)  # [B, n_mfcc, T]
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        assert pred.shape == target.shape, (pred.shape, target.shape)
+        loss = pred.new_zeros(())
+        for n_fft in self.n_ffts:
+            loss = (
+                loss
+                + (self._features(pred, n_fft) - self._features(target, n_fft))
+                .abs()
+                .mean()
+            )
+        return loss / len(self.n_ffts)
+
+
+class MultiScaleMelSpecLoss(nn.Module):
+    """L1 distance between log-mel spectrograms at several window sizes.
+
+    Same as ``MultiScaleMFCCLoss`` but skips the DCT — compares the full
+    mel energy spectrum at each scale.
+    """
+
+    def __init__(
+        self,
+        n_ffts: Sequence[int] = (512, 1024, 2048),
+        hop_div: int = 4,
+        n_mels: int = 80,
+        sample_rate: int = SAMPLE_RATE,
+    ):
+        super().__init__()
+        self.n_ffts = tuple(n_ffts)
+        self.hop_div = hop_div
+        self.n_mels = n_mels
+        self.sample_rate = sample_rate
+
+        for n_fft in self.n_ffts:
+            self.register_buffer(
+                f"window_{n_fft}", torch.hann_window(n_fft), persistent=False
+            )
+            mel_fb = torch.from_numpy(
+                librosa.filters.mel(
+                    sr=sample_rate,
+                    n_fft=n_fft,
+                    n_mels=n_mels,
+                    fmin=0.0,
+                    fmax=sample_rate / 2,
+                )
+            ).float()
+            self.register_buffer(f"mel_fb_{n_fft}", mel_fb, persistent=False)
+
+    def _features(self, x: Tensor, n_fft: int) -> Tensor:
+        window: Tensor = getattr(self, f"window_{n_fft}")
+        mel_fb: Tensor = getattr(self, f"mel_fb_{n_fft}")
+        hop = n_fft // self.hop_div
+        spec = torch.stft(
+            x, n_fft=n_fft, hop_length=hop, window=window, return_complex=True
+        ).abs()
+        mel = torch.einsum("mf,bft->bmt", mel_fb, spec.pow(2))
+        return torch.log1p(mel)
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        assert pred.shape == target.shape, (pred.shape, target.shape)
+        loss = pred.new_zeros(())
+        for n_fft in self.n_ffts:
+            loss = (
+                loss
+                + (self._features(pred, n_fft) - self._features(target, n_fft))
+                .abs()
+                .mean()
+            )
+        return loss / len(self.n_ffts)
+
+
 class MultiScaleLogMagSTFTLoss(nn.Module):
     """L1 distance between log-magnitude STFTs at several window sizes.
 
