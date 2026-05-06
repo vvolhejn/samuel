@@ -15,7 +15,7 @@ model:
   # 512 samples = ~86.13 Hz at 44.1 kHz. Matches the loss hop and the
   # pitch-cache hop.
   samples_per_frame: 512
-  n_buckets: 8
+  n_buckets: 32
 
   # (lo, hi, init) per trainable parameter. ``frequency`` is supplied
   # externally from the pyin cache; ``intensity`` is frozen at 1.0 and the
