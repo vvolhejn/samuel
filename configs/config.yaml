@@ -32,6 +32,9 @@ loss:
   mel: 0.0
   stft: 0.0
   entropy: 0.01    # encourage softmax(logits) to stay near uniform
+  # 4x window overlap (n_fft=2048, hop=samples_per_frame=512). Null falls
+  # back to n_fft=samples_per_frame (no overlap).
+  mfcc_n_fft: 2048
 
 log:
   wandb_project: samuel
