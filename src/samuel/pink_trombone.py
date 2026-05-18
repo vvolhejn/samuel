@@ -908,6 +908,124 @@ def _compute_batch_irs_eig(
     return torch.cat([ir_0.unsqueeze(-1), ir_tail], dim=-1)  # [BT, L]
 
 
+# ---------------------------------------------------------------------------
+# Transients (differentiable plosive-release bursts)
+# ---------------------------------------------------------------------------
+#
+# In the original JS Pink Trombone, a discrete state machine watches each tract
+# segment for closure (diameter <= 0) and, on the frame where the closure is
+# released (last had obstruction, this one doesn't), injects a brief impulse
+# into ``left[position]`` for ~0.2 s. This produces the percussive burst of a
+# plosive release (/p/, /t/, /k/).
+#
+# The discrete edge detector and integer position pick aren't differentiable.
+# We replace them with smooth surrogates:
+#
+#   1. Per frame, take ``min(diameter)`` over the tract -> a continuous proxy
+#      for "how closed is the tract right now".
+#   2. Closure indicator ``c_t = sigmoid(-k * min_diameter)`` is near 1 when
+#      closed, near 0 when open. ``k`` controls sharpness.
+#   3. Release strength ``r_t = ReLU(c_{t-1} - c_t)`` fires only on falling
+#      edges (closing -> opening), zero elsewhere. ReLU on the difference
+#      avoids smeared bursts during slow modulation of an open tract.
+#   4. Position: skipped explicitly. The OLA path already injects turbulence
+#      at the constriction position via ``h_turb``; closures happen at the
+#      constriction, so we add the transient excitation onto ``turb_source``
+#      and reuse the same per-frame IR. No extra OLA pass.
+#   5. Impulse shape: a fixed exponentially decaying kernel applied at audio
+#      rate. The JS used ``0.3 * (-2)^(t * 200)`` which is NaN/exploding for
+#      non-integer t — almost certainly a typo. We use a plain decay
+#      ``strength * exp(-t * decay_rate)``.
+
+_TRANSIENT_KERNEL_LEN_SECONDS = 0.05  # 50ms covers the audible burst
+_TRANSIENT_DECAY_RATE = 200.0  # ~5ms time constant (matches JS exponent magnitude)
+_TRANSIENT_STRENGTH = 0.3  # matches JS Transient.strength
+# Closure indicator: sigmoid(closure_k * (closure_threshold - min_diameter)).
+# Centered so that min_diameter == closure_threshold gives closure=0.5, with
+# `closure -> 1` for tighter constrictions and `-> 0` for diameter beyond the
+# threshold. closure_threshold ~ 0.1 catches the JS "diameter <= 0" event after
+# the clamp(min=0) inside _compute_diameter_profile.
+_TRANSIENT_CLOSURE_K = 60.0
+_TRANSIENT_CLOSURE_THRESHOLD = 0.1
+
+
+def _make_transient_kernel(
+    sample_rate: int = SAMPLE_RATE,
+    decay_rate: float = _TRANSIENT_DECAY_RATE,
+    strength: float = _TRANSIENT_STRENGTH,
+    duration_s: float = _TRANSIENT_KERNEL_LEN_SECONDS,
+    device: torch.device | None = None,
+    dtype: torch.dtype = torch.float32,
+) -> Tensor:
+    """Causal exponential transient kernel of shape [L]."""
+    L = int(round(duration_s * sample_rate))
+    t = torch.arange(L, device=device, dtype=dtype) / sample_rate
+    return strength * torch.exp(-t * decay_rate)
+
+
+def compute_release_signal(
+    diameter_f: Tensor,  # [B, T, N] per-frame diameter profile
+    closure_k: float = _TRANSIENT_CLOSURE_K,
+    closure_threshold: float = _TRANSIENT_CLOSURE_THRESHOLD,
+) -> Tensor:  # [B, T]
+    """Soft per-frame release strength.
+
+    Closure indicator: ``c_t = sigmoid(k * (threshold - min_t diameter))``.
+    Release: ``ReLU(c_{t-1} - c_t)``, positive only on closed -> open
+    transitions. The same quantity drives transient injection and can be
+    used by auxiliary losses (e.g. onset alignment).
+    """
+    min_diam = diameter_f.min(dim=-1).values  # [B, T]
+    closure = torch.sigmoid(closure_k * (closure_threshold - min_diam))  # [B, T]
+    closure_prev = F.pad(closure[:, :-1], (1, 0))  # [B, T], pad with 0 at t=0
+    return F.relu(closure_prev - closure)  # [B, T]
+
+
+def _compute_transient_excitation(
+    diameter_f: Tensor,  # [B, T, N] per-frame diameter profile
+    samples_per_frame: int,
+    closure_k: float = _TRANSIENT_CLOSURE_K,
+    closure_threshold: float = _TRANSIENT_CLOSURE_THRESHOLD,
+    decay_rate: float = _TRANSIENT_DECAY_RATE,
+    strength: float = _TRANSIENT_STRENGTH,
+    duration_s: float = _TRANSIENT_KERNEL_LEN_SECONDS,
+) -> Tensor:  # [B, S] audio-rate excitation, S = T * samples_per_frame
+    """Build a differentiable transient excitation signal.
+
+    Returns a per-sample signal that is zero almost everywhere and contains a
+    decaying exponential burst at the start of every frame where the tract
+    transitions from closed to open. Burst amplitude is proportional to the
+    softened release strength ``r_t`` of that frame.
+    """
+    B, T, _ = diameter_f.shape
+    device = diameter_f.device
+    dtype = diameter_f.dtype
+    S = T * samples_per_frame
+
+    release = compute_release_signal(diameter_f, closure_k, closure_threshold)  # [B, T]
+
+    # Place each frame's release strength as a single sample at the frame
+    # boundary in an audio-rate signal, then convolve with the kernel.
+    trigger = torch.zeros(B, S, device=device, dtype=dtype)
+    frame_starts = torch.arange(T, device=device) * samples_per_frame  # [T]
+    trigger[:, frame_starts] = release  # [B, T] -> [B, T] at indexed positions
+
+    kernel = _make_transient_kernel(
+        sample_rate=SAMPLE_RATE,
+        decay_rate=decay_rate,
+        strength=strength,
+        duration_s=duration_s,
+        device=device,
+        dtype=dtype,
+    )  # [L]
+    L = kernel.shape[0]
+
+    # Causal convolution: pad on the left only.
+    trigger_padded = F.pad(trigger.unsqueeze(1), (L - 1, 0))  # [B, 1, S+L-1]
+    excitation = F.conv1d(trigger_padded, kernel.flip(0).view(1, 1, L)).squeeze(1)
+    return excitation  # [B, S]
+
+
 def _ola_convolve(source: Tensor, h: Tensor, hop: int) -> Tensor:
     """Overlap-add convolution with per-frame FIR filters.
 
@@ -960,6 +1078,11 @@ def _tract_ola(
     ir_length: int = 4096,
     samples_per_frame: int = SAMPLES_PER_FRAME,
     ir_impl: Literal["eig", "sequential"] = "sequential",
+    enable_transients: bool = False,
+    transient_closure_k: float = _TRANSIENT_CLOSURE_K,
+    transient_closure_threshold: float = _TRANSIENT_CLOSURE_THRESHOLD,
+    transient_decay_rate: float = _TRANSIENT_DECAY_RATE,
+    transient_strength: float = _TRANSIENT_STRENGTH,
 ) -> Tensor:  # [B, S]
     B, S = glottis_out.shape
     N = _TRACT_N
@@ -1011,6 +1134,17 @@ def _tract_ola(
     turb_source = (
         noise_mod * glottis_out * 0.66 * (thinness * openness) / 2 * valid_mask
     )
+
+    if enable_transients:
+        transient_excitation = _compute_transient_excitation(
+            diameter_f,
+            samples_per_frame=hop,
+            closure_k=transient_closure_k,
+            closure_threshold=transient_closure_threshold,
+            decay_rate=transient_decay_rate,
+            strength=transient_strength,
+        )  # [B, S]
+        turb_source = turb_source + transient_excitation
 
     # --- Impulse responses (parallel over B×T) ---
     BT = B * T
@@ -1118,6 +1252,7 @@ def pink_trombone_ola(
     ir_length: int = 4096,
     control_rate: float = CONTROL_RATE,
     ir_impl: Literal["eig", "sequential"] = "sequential",
+    enable_transients: bool = False,
 ) -> Tensor:
     """OLA FIR approximation of the Pink Trombone vocal synthesizer.
 
@@ -1175,4 +1310,5 @@ def pink_trombone_ola(
         ir_length=ir_length,
         samples_per_frame=spf,
         ir_impl=ir_impl,
+        enable_transients=enable_transients,
     )

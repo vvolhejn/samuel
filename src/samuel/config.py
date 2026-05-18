@@ -71,6 +71,12 @@ class SynthConfig(BaseModel):
     # frame_rate is the parameter control rate; lives on the model config
     # (it drives T_ctrl) but the synth path reads it from the same field.
 
+    # Differentiable plosive-release transients. When enabled, the synth
+    # detects soft "closure -> opening" edges per frame and injects a brief
+    # exponentially-decaying burst into the turbulence source at the
+    # constriction position.
+    enable_transients: bool = False
+
 
 class LogConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -110,7 +116,7 @@ class LossConfig(BaseModel):
     # The entropy bonus keeps the per-position softmax distribution near
     # uniform — without it, logits saturate and the soft Gumbel becomes
     # effectively hard, killing gradients.
-    mfcc: float = 1.0  # L1 on first 20 MFCCs (frame-aligned to samples_per_frame)
+    mfcc: float = 1.0  # L1 on first 20 MFCCs (hop = samples_per_frame)
     mel: float = 0.0  # L1 on log-mel spectrogram (frame-aligned to samples_per_frame)
     stft: float = 0.0  # Multi-scale log-magnitude STFT, n_ffts (512, 1024, 2048)
     entropy: float = 0.01
@@ -119,6 +125,11 @@ class LossConfig(BaseModel):
     # n_fft=samples_per_frame), which improves voicedness and recon. Set to
     # None to revert to n_fft = samples_per_frame.
     mfcc_n_fft: int | None = 2048
+    # Asymmetric onset-alignment loss: for each spectral-flux onset in target,
+    # require a soft "release" event (closure -> open transition) within
+    # ``onset_align_radius`` frames. Only active when transients are enabled.
+    onset_align: float = 0.0
+    onset_align_radius: int = 2
 
 
 class TrainConfig(BaseModel):
