@@ -114,6 +114,11 @@ class LossConfig(BaseModel):
     mel: float = 0.0  # L1 on log-mel spectrogram (frame-aligned to samples_per_frame)
     stft: float = 0.0  # Multi-scale log-magnitude STFT, n_ffts (512, 1024, 2048)
     entropy: float = 0.01
+    # MFCC-loss STFT window size. Default 2048 with samples_per_frame=512 gives
+    # 4x window overlap and better-resolved spectra (vs. no overlap at
+    # n_fft=samples_per_frame), which improves voicedness and recon. Set to
+    # None to revert to n_fft = samples_per_frame.
+    mfcc_n_fft: int | None = 2048
 
 
 class TrainConfig(BaseModel):

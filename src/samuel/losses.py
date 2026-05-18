@@ -12,13 +12,15 @@ from samuel.pink_trombone import SAMPLE_RATE
 
 
 class MFCCLoss(nn.Module):
-    """L1 distance between MFCCs, computed once per ``samples_per_frame`` frame.
+    """L1 distance between MFCCs, computed at hop ``samples_per_frame``.
 
     Mirrors the ``mfcc`` branch of ``LossKit`` in
-    ``scripts/per_frame_fit_search.py``: ``n_fft = hop = samples_per_frame``,
-    no overlap, single STFT slice per frame; an 80-bin mel filterbank with
-    ``log1p`` of squared magnitudes; orthonormal DCT-II truncated to
-    ``n_mfcc`` coefficients.
+    ``scripts/per_frame_fit_search.py`` when ``n_fft is None`` (defaults to
+    ``samples_per_frame``, no overlap). Setting ``n_fft > samples_per_frame``
+    introduces window overlap (e.g. 4× at ``n_fft = 2048`` with hop=512)
+    so each frame's spectrum sees more temporal context. 80-bin mel
+    filterbank, ``log1p`` of squared magnitudes, orthonormal DCT-II
+    truncated to ``n_mfcc`` coefficients.
     """
 
     def __init__(
@@ -27,20 +29,28 @@ class MFCCLoss(nn.Module):
         n_mels: int = 80,
         n_mfcc: int = 20,
         sample_rate: int = SAMPLE_RATE,
+        n_fft: int | None = None,
     ):
         super().__init__()
+        if n_fft is None:
+            n_fft = samples_per_frame
+        if n_fft < samples_per_frame:
+            raise ValueError(
+                f"n_fft ({n_fft}) must be >= samples_per_frame ({samples_per_frame})"
+            )
         self.samples_per_frame = samples_per_frame
+        self.n_fft = n_fft
         self.n_mels = n_mels
         self.n_mfcc = n_mfcc
         self.sample_rate = sample_rate
 
-        window = torch.hann_window(samples_per_frame)
+        window = torch.hann_window(n_fft)
         self.register_buffer("window", window, persistent=False)
 
         mel_fb = torch.from_numpy(
             librosa.filters.mel(
                 sr=sample_rate,
-                n_fft=samples_per_frame,
+                n_fft=n_fft,
                 n_mels=n_mels,
                 fmin=0.0,
                 fmax=sample_rate / 2,
@@ -55,10 +65,10 @@ class MFCCLoss(nn.Module):
         self.register_buffer("dct", dct, persistent=False)  # [n_mfcc, n_mels]
 
     def features(self, x: Tensor) -> Tensor:
-        """``x [B, S]`` (S a multiple of samples_per_frame) -> ``[B, n_mfcc, T]``."""
+        """``x [B, S]`` -> ``[B, n_mfcc, T]`` with ``T`` set by hop and n_fft."""
         spec = torch.stft(
             x,
-            n_fft=self.samples_per_frame,
+            n_fft=self.n_fft,
             hop_length=self.samples_per_frame,
             window=self.window,
             center=False,

@@ -572,7 +572,14 @@ def main(hydra_cfg: DictConfig) -> None:
     samples_per_frame = cfg.model.samples_per_frame
     loss_fn = CombinedReconLoss(
         [
-            ("mfcc", cfg.loss.mfcc, MFCCLoss(samples_per_frame=samples_per_frame)),
+            (
+                "mfcc",
+                cfg.loss.mfcc,
+                MFCCLoss(
+                    samples_per_frame=samples_per_frame,
+                    n_fft=cfg.loss.mfcc_n_fft,
+                ),
+            ),
             ("mel", cfg.loss.mel, MelSpecLoss(samples_per_frame=samples_per_frame)),
             ("stft", cfg.loss.stft, MultiScaleLogMagSTFTLoss()),
         ]
