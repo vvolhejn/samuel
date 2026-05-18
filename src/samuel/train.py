@@ -42,7 +42,12 @@ from samuel.data import (
     split_train_val,
 )
 from samuel.evals.pitch import pitch_mae_cents
-from samuel.losses import MelSpecLoss, MFCCLoss, MultiScaleLogMagSTFTLoss
+from samuel.losses import (
+    MelSpecLoss,
+    MFCCLoss,
+    MultiScaleLogMagSTFTLoss,
+    OnsetAlignLoss,
+)
 from samuel.model import PinkTromboneController
 from samuel.pink_trombone import PARAM_NAMES, pink_trombone, pink_trombone_ola
 
@@ -379,6 +384,7 @@ def _evaluate_split(
         ir_length=cfg.synth.ir_length,
         ir_impl=cfg.synth.ir_impl,
         control_rate=frame_rate,
+        enable_transients=cfg.synth.enable_transients,
     )
     S = min(pred_ola.shape[-1], target.shape[-1])
     pred_norm = _volume_match(
@@ -584,6 +590,12 @@ def main(hydra_cfg: DictConfig) -> None:
             ("stft", cfg.loss.stft, MultiScaleLogMagSTFTLoss()),
         ]
     ).to(device)
+    onset_loss_fn: OnsetAlignLoss | None = None
+    if cfg.loss.onset_align > 0 and cfg.synth.enable_transients:
+        onset_loss_fn = OnsetAlignLoss(
+            samples_per_frame=samples_per_frame,
+            align_radius=cfg.loss.onset_align_radius,
+        ).to(device)
 
     ddp_module: nn.Module
     if is_ddp:
@@ -698,6 +710,7 @@ def main(hydra_cfg: DictConfig) -> None:
             ir_length=cfg.synth.ir_length,
             ir_impl=cfg.synth.ir_impl,
             control_rate=frame_rate,
+            enable_transients=cfg.synth.enable_transients,
         )
         S = min(pred.shape[-1], target.shape[-1])
         pred_norm = _volume_match(pred[..., :S], target[..., :S], samples_per_frame)
@@ -706,12 +719,23 @@ def main(hydra_cfg: DictConfig) -> None:
             pred_norm, target[..., :S_norm]
         )
 
+        # Onset-alignment auxiliary loss (only when transients are enabled).
+        # Penalize each target onset that has no closure-release event within
+        # cfg.loss.onset_align_radius frames.
+        onset_loss: torch.Tensor | None = None
+        cd_ctrl: torch.Tensor | None = None
+        if onset_loss_fn is not None:
+            cd_ctrl = params[..., PARAM_NAMES.index("constrictionDiameter")]
+            onset_loss = onset_loss_fn(cd_ctrl, target[..., :S_norm])
+
         # Entropy bonus on softmax(logits) — keeps logits from saturating
         # to one-hot, which otherwise kills the soft-Gumbel gradient.
         logits = aux["logits"].float()
         log_probs = F.log_softmax(logits, dim=-1)
         entropy = -(log_probs.exp() * log_probs).sum(-1).mean()
         loss = recon_loss - cfg.loss.entropy * entropy
+        if onset_loss is not None:
+            loss = loss + cfg.loss.onset_align * onset_loss
 
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -746,6 +770,13 @@ def main(hydra_cfg: DictConfig) -> None:
             }
             for name, value in recon_components.items():
                 log_payload[f"train/recon/{name}"] = value.item()
+            if onset_loss is not None and cd_ctrl is not None:
+                log_payload["train/onset_align"] = onset_loss.item()
+                # Diagnostic: fraction of frames the controller emits a
+                # narrow constriction (cd < 0.3 → synth closure threshold).
+                log_payload["train/closure_rate"] = (
+                    (cd_ctrl < 0.3).float().mean().item()
+                )
             log_payload.update(
                 _controller_diagnostics(aux, model.trainable_names_, tau)
             )
