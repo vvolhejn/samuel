@@ -133,6 +133,26 @@ def _tau_for_step(step: int, cfg: TrainConfig) -> float:
 
 
 @torch.no_grad()
+def _param_variation(params: torch.Tensor, module: PinkTromboneController) -> float:
+    """Mean per-frame absolute change of trainable params, normalised to [0, 1].
+
+    Each trainable parameter is rescaled to ``[0, 1]`` using its bucket-center
+    range before differencing, so no single wide-range parameter dominates.
+    Returned scalar is the mean over batch, time, and trainable params. Useful
+    as an "are the predicted trajectories changing at a humanly-plausible
+    rate?" check: a value of 0.1 means the average param moves 10 % of its
+    range per control frame.
+    """
+    trainable_idx = module._trainable_idx
+    train_params = params.index_select(-1, trainable_idx).float()
+    lo = module.bucket_centers[:, 0].view(1, 1, -1)
+    hi = module.bucket_centers[:, -1].view(1, 1, -1)
+    p_norm = (train_params - lo) / (hi - lo).clamp_min(1e-8)
+    diff = (p_norm[:, 1:] - p_norm[:, :-1]).abs()
+    return float(diff.mean().item())
+
+
+@torch.no_grad()
 def _controller_diagnostics(
     aux: dict[str, torch.Tensor], trainable_names: list[str], tau: float
 ) -> dict[str, float | wandb.Histogram]:
@@ -390,6 +410,7 @@ def _evaluate_split(
     )
     out: dict[str, object] = {
         f"eval/{split}/loss_ola": ola_total.item(),
+        f"eval/{split}/param_variation": _param_variation(params, model),
     }
     for name, value in ola_components.items():
         out[f"eval/{split}/recon_ola/{name}"] = value.item()
@@ -746,6 +767,7 @@ def main(hydra_cfg: DictConfig) -> None:
             }
             for name, value in recon_components.items():
                 log_payload[f"train/recon/{name}"] = value.item()
+            log_payload["train/param_variation"] = _param_variation(params, module)
             log_payload.update(
                 _controller_diagnostics(aux, model.trainable_names_, tau)
             )
