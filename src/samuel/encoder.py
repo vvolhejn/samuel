@@ -164,3 +164,73 @@ class SEANetEncoder(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return self.model(x)
+
+
+class SEANetDecoder(nn.Module):
+    """Symmetric decoder to ``SEANetEncoder``.
+
+    Takes a latent ``[B, dimension, T_enc]`` and upsamples back to a waveform
+    ``[B, channels, T_enc * prod(ratios)]`` using transposed convolutions.
+    Used for the no-bottleneck sanity check (neural autoencoder instead of
+    Pink Trombone as decoder); not streaming/causal.
+    """
+
+    def __init__(self, config: SEANetEncoderConfig):
+        super().__init__()
+        self.config = config
+        ratios = list(reversed(config.ratios))  # encoder applies in this order
+        # Decoder mirrors the encoder, so iterate in encoder order's reverse
+        # (which equals config.ratios as written: outermost ratio first).
+        dec_ratios = list(reversed(ratios))
+        self.hop_length = int(np.prod(ratios))
+
+        n_filters = config.n_filters
+        pad_mode = config.pad_mode
+
+        mult = 2 ** len(ratios)
+        layers: list[nn.Module] = [
+            CausalConv1d(
+                config.dimension,
+                mult * n_filters,
+                config.last_kernel_size,
+                pad_mode=pad_mode,
+            ),
+        ]
+        for ratio in dec_ratios:
+            layers += [
+                nn.ELU(alpha=1.0),
+                weight_norm(
+                    nn.ConvTranspose1d(
+                        mult * n_filters,
+                        mult * n_filters // 2,
+                        kernel_size=ratio * 2,
+                        stride=ratio,
+                        padding=ratio // 2 + ratio % 2,
+                        output_padding=ratio % 2,
+                    )
+                ),
+            ]
+            mult //= 2
+            for j in range(config.n_residual_layers):
+                layers.append(
+                    SEANetResnetBlock(
+                        mult * n_filters,
+                        kernel_sizes=[config.residual_kernel_size, 1],
+                        dilations=[config.dilation_base**j, 1],
+                        pad_mode=pad_mode,
+                        compress=config.compress,
+                    )
+                )
+        layers += [
+            nn.ELU(alpha=1.0),
+            CausalConv1d(
+                mult * n_filters,
+                config.channels,
+                config.kernel_size,
+                pad_mode=pad_mode,
+            ),
+        ]
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, z: Tensor) -> Tensor:
+        return self.model(z)
