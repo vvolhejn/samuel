@@ -41,13 +41,14 @@ log:
   wandb_entity: moboehle-kyutai
   wandb_mode: online
   log_every: 200
-  val_every: 400
-  eval_every: 400
+  eval_every: 1000
   ckpt_every: 2000
-  n_audio_samples: 4
+  n_eval_clips: 100
+  n_audio_samples: 10
   pitch_fmin: 70.0
   pitch_fmax: 500.0
   pitch_voiced_prob_threshold: 0.5
+  asr_whisper_size: base
 
 run:
   runs_root: runs
