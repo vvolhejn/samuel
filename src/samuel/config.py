@@ -79,13 +79,9 @@ class LogConfig(BaseModel):
     wandb_entity: str | None = None
     wandb_mode: Literal["online", "offline", "disabled"] = "online"
     log_every: int = 50
-    # Single eval cadence: every ``eval_every`` steps we compute every metric
-    # (losses, pitch, ASR/WER, ...) on the held-out val clips.
     eval_every: int = 1_000
     ckpt_every: int = 5_000
-    # Number of held-out val clips evaluated for metrics. Fixed across the
-    # whole run so the WER/loss curves track actual training progress, not
-    # clip-set noise.
+    # The same clips are used for each eval for stable metrics
     n_eval_clips: int = 100
     # Subset of those clips for which we attach audio/params/mel media to
     # wandb. The subset is re-sampled every eval step (deterministic by
@@ -94,7 +90,7 @@ class LogConfig(BaseModel):
     pitch_fmin: float = 70.0
     pitch_fmax: float = 500.0
     pitch_voiced_prob_threshold: float = 0.5
-    # Whisper model size for the WER/CER eval. ``""`` disables ASR eval.
+    # Whisper model size for the WER/CER eval. Empty string disables ASR eval.
     asr_whisper_size: str = "base"
 
 

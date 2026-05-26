@@ -137,6 +137,48 @@ def _score_text(ref: str, hyp: str) -> AsrScores:
     return AsrScores(wer=wer, cer=cer, ref=ref, hyp=hyp)
 
 
+def _preload_cudnn() -> None:
+    """Preload cuDNN 9 from the torch-bundled nvidia-cudnn-cu12 wheel.
+
+    ctranslate2 dlopens libcudnn_ops.so.9 / libcudnn_cnn.so.9 by short name,
+    which only resolves if the directory is on the loader path. Torch finds
+    them via its own preload; ctranslate2 doesn't. We replicate the preload
+    here so callers don't need to set LD_LIBRARY_PATH.
+    """
+    import ctypes
+    import os
+
+    try:
+        import nvidia.cudnn  # type: ignore[import-not-found]
+    except ImportError:
+        return
+    # nvidia.cudnn is a namespace package — no __file__; use __path__.
+    pkg_paths = list(getattr(nvidia.cudnn, "__path__", []))
+    lib_dir = next(
+        (
+            os.path.join(p, "lib")
+            for p in pkg_paths
+            if os.path.isdir(os.path.join(p, "lib"))
+        ),
+        None,
+    )
+    if lib_dir is None:
+        return
+    # Order matters: graph + ops depend on cnn; preload the leaves first.
+    for name in (
+        "libcudnn.so.9",
+        "libcudnn_graph.so.9",
+        "libcudnn_ops.so.9",
+        "libcudnn_cnn.so.9",
+    ):
+        path = os.path.join(lib_dir, name)
+        if os.path.exists(path):
+            try:
+                ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                pass
+
+
 def _load_whisper(model_size: str, device: str):
     """Load faster-whisper, falling back to CPU if CUDA init fails.
 
@@ -147,6 +189,7 @@ def _load_whisper(model_size: str, device: str):
     from faster_whisper import WhisperModel
 
     if device == "cuda":
+        _preload_cudnn()
         try:
             return WhisperModel(model_size, device="cuda", compute_type="float16")
         except Exception as e:  # noqa: BLE001  (we want every CUDA failure mode)
