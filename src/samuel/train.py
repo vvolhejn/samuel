@@ -44,7 +44,7 @@ from samuel.data import (
 from samuel.evals.pitch import pitch_mae_cents
 from samuel.losses import MelSpecLoss, MFCCLoss, MultiScaleLogMagSTFTLoss
 from samuel.model import PinkTromboneController
-from samuel.pink_trombone import PARAM_NAMES, pink_trombone, pink_trombone_ola
+from samuel.pink_trombone import PARAM_NAMES, pink_trombone_ola
 
 
 class CombinedReconLoss(nn.Module):
@@ -378,8 +378,8 @@ def _evaluate_split(
     """One eval pass on a subset of files (e.g. train or val).
 
     Keys are namespaced as ``eval/{split}/...``; cheap path always logs
-    ``loss_ola``, expensive path adds ``loss_exact``, pitch-MAE metrics, and
-    audio/params/mel media (lists, one entry per sampled clip).
+    ``loss``, expensive path adds pitch-MAE metrics and audio/params/mel media
+    (lists, one entry per sampled clip).
     """
     eval_clips, eval_f0, eval_names = _sample_eval_clips(
         eval_setup, files, step, cfg.log.n_audio_samples, cfg.data.sample_rate, device
@@ -405,72 +405,38 @@ def _evaluate_split(
         pred_ola[..., :S].float(), target[..., :S].float(), samples_per_frame
     )
     S_norm = pred_norm.shape[-1]
-    ola_total, ola_components = loss_fn.with_components(
-        pred_norm, target[..., :S_norm].float()
-    )
+    total, components = loss_fn.with_components(pred_norm, target[..., :S_norm].float())
     out: dict[str, object] = {
-        f"eval/{split}/loss_ola": ola_total.item(),
+        f"eval/{split}/loss": total.item(),
         f"eval/{split}/param_variation": _param_variation(params, model),
     }
-    for name, value in ola_components.items():
-        out[f"eval/{split}/recon_ola/{name}"] = value.item()
+    for name, value in components.items():
+        out[f"eval/{split}/recon/{name}"] = value.item()
 
     if not run_expensive:
         return out
 
-    pred_exact = pink_trombone(params, seed=fixed_seed, control_rate=frame_rate)
-    S_ex = min(pred_exact.shape[-1], target.shape[-1])
-    pred_exact_norm = _volume_match(
-        pred_exact[..., :S_ex].float(),
-        target[..., :S_ex].float(),
-        samples_per_frame,
-    )
-    S_ex_norm = pred_exact_norm.shape[-1]
-    exact_total, exact_components = loss_fn.with_components(
-        pred_exact_norm, target[..., :S_ex_norm].float()
-    )
-    out[f"eval/{split}/loss_exact"] = exact_total.item()
-    for name, value in exact_components.items():
-        out[f"eval/{split}/recon_exact/{name}"] = value.item()
-
     # Pitch MAE (librosa.pyin on CPU)
-    pitch_ola: list[float] = []
-    pitch_exact: list[float] = []
-    miss_ola: list[float] = []
-    miss_exact: list[float] = []
+    pitch_mae: list[float] = []
+    miss: list[float] = []
     for i in range(target.shape[0]):
         tgt_np = target[i].detach().cpu().numpy()
-        ola_np = pred_norm[i].detach().cpu().numpy()
-        ex_np = pred_exact_norm[i].detach().cpu().numpy()
-        m_ola = pitch_mae_cents(
+        pred_np = pred_norm[i].detach().cpu().numpy()
+        m = pitch_mae_cents(
             tgt_np,
-            ola_np,
+            pred_np,
             cfg.data.sample_rate,
             fmin=cfg.log.pitch_fmin,
             fmax=cfg.log.pitch_fmax,
             voiced_prob_threshold=cfg.log.pitch_voiced_prob_threshold,
         )
-        m_ex = pitch_mae_cents(
-            tgt_np,
-            ex_np,
-            cfg.data.sample_rate,
-            fmin=cfg.log.pitch_fmin,
-            fmax=cfg.log.pitch_fmax,
-            voiced_prob_threshold=cfg.log.pitch_voiced_prob_threshold,
-        )
-        if not np.isnan(m_ola.mae_cents):
-            pitch_ola.append(m_ola.mae_cents)
-            miss_ola.append(m_ola.unvoiced_miss_frac)
-        if not np.isnan(m_ex.mae_cents):
-            pitch_exact.append(m_ex.mae_cents)
-            miss_exact.append(m_ex.unvoiced_miss_frac)
+        if not np.isnan(m.mae_cents):
+            pitch_mae.append(m.mae_cents)
+            miss.append(m.unvoiced_miss_frac)
 
-    if pitch_ola:
-        out[f"eval/{split}/pitch_mae_cents_ola"] = float(np.mean(pitch_ola))
-        out[f"eval/{split}/unvoiced_miss_frac_ola"] = float(np.mean(miss_ola))
-    if pitch_exact:
-        out[f"eval/{split}/pitch_mae_cents_exact"] = float(np.mean(pitch_exact))
-        out[f"eval/{split}/unvoiced_miss_frac_exact"] = float(np.mean(miss_exact))
+    if pitch_mae:
+        out[f"eval/{split}/pitch_mae_cents"] = float(np.mean(pitch_mae))
+        out[f"eval/{split}/unvoiced_miss_frac"] = float(np.mean(miss))
 
     # Audio / params / mel as lists under stable keys.
     sr = cfg.data.sample_rate
@@ -482,13 +448,10 @@ def _evaluate_split(
     mel_pairs: list[tuple[str, np.ndarray]] = []
     for i, name in enumerate(eval_names):
         tgt_np = target[i].detach().cpu().numpy()
-        ola_np = pred_norm[i].detach().cpu().numpy()
-        ex_np = pred_exact_norm[i].detach().cpu().numpy()
-        # ola → ex → tgt so the listener hears the prediction before the
-        # ground truth (no anchoring on the target).
-        combined = np.concatenate(
-            [_norm(ola_np), gap, _norm(ex_np), gap, tgt_np.astype(np.float32)]
-        )
+        pred_np = pred_norm[i].detach().cpu().numpy()
+        # pred → tgt so the listener hears the prediction before the ground
+        # truth (no anchoring on the target).
+        combined = np.concatenate([_norm(pred_np), gap, tgt_np.astype(np.float32)])
         audios.append(wandb.Audio(combined, sample_rate=sr, caption=name))
         param_figs.append(
             wandb.Plotly(
@@ -498,7 +461,7 @@ def _evaluate_split(
             )
         )
         mel_pairs.append((f"{name}: target", tgt_np))
-        mel_pairs.append((f"{name}: ola", ola_np))
+        mel_pairs.append((f"{name}: pred", pred_np))
 
     out[f"eval/{split}/audio"] = audios
     out[f"eval/{split}/params"] = param_figs
@@ -678,8 +641,8 @@ def main(hydra_cfg: DictConfig) -> None:
         wandb.log(metrics, step=step)
         tqdm.write(
             f"[eval] step={step} "
-            f"train={metrics.get('eval/train/loss_ola', float('nan')):.4f} "
-            f"val={metrics.get('eval/val/loss_ola', float('nan')):.4f}"
+            f"train={metrics.get('eval/train/loss', float('nan')):.4f} "
+            f"val={metrics.get('eval/val/loss', float('nan')):.4f}"
         )
 
     while step < cfg.optim.max_steps:
@@ -787,8 +750,8 @@ def main(hydra_cfg: DictConfig) -> None:
             wandb.log(metrics, step=step)
             tqdm.write(
                 f"[eval] step={step} "
-                f"train={metrics.get('eval/train/loss_ola', float('nan')):.4f} "
-                f"val={metrics.get('eval/val/loss_ola', float('nan')):.4f}"
+                f"train={metrics.get('eval/train/loss', float('nan')):.4f} "
+                f"val={metrics.get('eval/val/loss', float('nan')):.4f}"
             )
 
         if rank == 0 and step % cfg.log.ckpt_every == 0:
