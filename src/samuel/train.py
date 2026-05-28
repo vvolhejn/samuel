@@ -32,8 +32,6 @@ from tqdm import tqdm
 import wandb
 from samuel.config import TrainConfig
 from samuel.data import (
-    DatasetFile,
-    PitchCache,
     _load_pitch_cache,
     _load_resampled,
     build_dataloader,
@@ -41,6 +39,7 @@ from samuel.data import (
     load_manifest,
     split_train_val,
 )
+from samuel.evals.asr import WhisperEvaluator
 from samuel.evals.pitch import pitch_mae_cents
 from samuel.losses import MelSpecLoss, MFCCLoss, MultiScaleLogMagSTFTLoss
 from samuel.model import PinkTromboneController
@@ -210,25 +209,34 @@ def _volume_match(pred: torch.Tensor, target: torch.Tensor, hop: int) -> torch.T
 
 @dataclass
 class EvalSetup:
-    """State needed to sample eval clips on demand.
+    """State needed for evaluation.
 
-    Train clips and val clips are sampled separately so we can log overfit
-    (train_loss vs val_loss). The val files are the tail of the manifest
-    (last ``data.val_fraction``), never seen by the dataloader.
+    Holds a fixed set of held-out val clips preloaded into CPU tensors so
+    every eval step sees the same data — only the audio-media subset varies
+    by step.
     """
 
-    train_files: list  # list[DatasetFile]
-    val_files: list  # list[DatasetFile]
-    full_files: list  # list[DatasetFile], for full-manifest pitch index
-    pitch: PitchCache
+    val_wavs: torch.Tensor  # [N_eval, S] float32, CPU
+    val_f0: torch.Tensor  # [N_eval, T_ctrl] float32, CPU
+    val_names: list[str]  # caption per clip
+    val_full_idx: list[int]  # stable per-clip key (for Whisper target cache)
     chunk_samples: int
     T_ctrl: int
+    whisper: "WhisperEvaluator | None"
 
 
-def _eval_setup(cfg: TrainConfig, samples_per_frame: int) -> EvalSetup:
-    """Load manifest + pitch cache once. Eval clips are sampled per-step."""
+def _eval_setup(
+    cfg: TrainConfig,
+    samples_per_frame: int,
+    device: torch.device,
+) -> EvalSetup:
+    """Load manifest + pitch cache + ASR model + the fixed eval-clip tensors.
+
+    Called once at rank-0 startup. Loading 100 4-second clips at 44.1 kHz is
+    about 17 MB — easily kept in memory for the run.
+    """
     files = load_manifest(cfg.data.manifest_path)
-    train_files, val_files = split_train_val(files, cfg.data.val_fraction)
+    _, val_files = split_train_val(files, cfg.data.val_fraction)
     chunk_samples = int(round(cfg.data.sample_rate * cfg.data.chunk_seconds))
     # Round chunk_samples down to a multiple of samples_per_frame so eval and
     # training use the same alignment.
@@ -242,66 +250,66 @@ def _eval_setup(cfg: TrainConfig, samples_per_frame: int) -> EvalSetup:
     pitch = _load_pitch_cache(
         cfg.data.pitch_cache_path, cfg.data.sample_rate, samples_per_frame
     )
-    return EvalSetup(
-        train_files=train_files,
-        val_files=val_files,
-        full_files=files,
-        pitch=pitch,
-        chunk_samples=chunk_samples,
-        T_ctrl=T_ctrl,
-    )
 
+    n_eval = min(cfg.log.n_eval_clips, len(val_files))
+    selected = val_files[:n_eval]
+    full_idx_for_id = {id(df): i for i, df in enumerate(files)}
 
-def _sample_eval_clips(
-    setup: EvalSetup,
-    files: list[DatasetFile],
-    step: int,
-    n: int,
-    sample_rate: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
-    """Pick ``n`` clips from ``files`` deterministically by ``step``.
-
-    Two evals at the same step pick the same clips (cross-run comparison);
-    consecutive evals within a run pick different clips (broader coverage).
-    """
-    n = min(n, len(files))
-    if n == 0:
-        return (
-            torch.empty(0, setup.chunk_samples, device=device),
-            torch.empty(0, setup.T_ctrl, device=device),
-            [],
-        )
-    full_idx_for_id = {id(df): i for i, df in enumerate(setup.full_files)}
-    indices = np.random.RandomState(step).choice(len(files), size=n, replace=False)
-
-    clips: list[torch.Tensor] = []
+    wavs: list[torch.Tensor] = []
     f0s: list[torch.Tensor] = []
     names: list[str] = []
-    for local_idx in indices:
-        df = files[int(local_idx)]
+    full_indices: list[int] = []
+    for df in selected:
         full_idx = full_idx_for_id[id(df)]
-        audio = _load_resampled(df.path, sample_rate)
-        if len(audio) < setup.chunk_samples:
-            audio = np.pad(audio, (0, setup.chunk_samples - len(audio)))
-        audio = audio[: setup.chunk_samples]
+        audio = _load_resampled(df.path, cfg.data.sample_rate)
+        if len(audio) < chunk_samples:
+            audio = np.pad(audio, (0, chunk_samples - len(audio)))
+        audio = audio[:chunk_samples]
 
-        f0_full, voiced_full = setup.pitch.by_file[full_idx]
-        f0_chunk = np.zeros(setup.T_ctrl, dtype=np.float32)
-        voiced_chunk = np.zeros(setup.T_ctrl, dtype=bool)
-        have = min(setup.T_ctrl, len(f0_full))
+        f0_full, voiced_full = pitch.by_file[full_idx]
+        f0_chunk = np.zeros(T_ctrl, dtype=np.float32)
+        voiced_chunk = np.zeros(T_ctrl, dtype=bool)
+        have = min(T_ctrl, len(f0_full))
         if have > 0:
             f0_chunk[:have] = f0_full[:have]
             voiced_chunk[:have] = voiced_full[:have]
-        f0_filled = fill_unvoiced(
-            f0_chunk, voiced_chunk, setup.pitch.fmin, setup.pitch.fmax
-        )
+        f0_filled = fill_unvoiced(f0_chunk, voiced_chunk, pitch.fmin, pitch.fmax)
 
-        clips.append(torch.from_numpy(audio))
+        wavs.append(torch.from_numpy(audio))
         f0s.append(torch.from_numpy(f0_filled))
         names.append(df.path.name)
+        full_indices.append(full_idx)
 
-    return torch.stack(clips).to(device), torch.stack(f0s).to(device), names
+    whisper: WhisperEvaluator | None = None
+    if cfg.log.asr_whisper_size:
+        whisper = WhisperEvaluator(
+            model_size=cfg.log.asr_whisper_size,
+            device="cuda" if device.type == "cuda" else "cpu",
+        )
+
+    return EvalSetup(
+        val_wavs=torch.stack(wavs),
+        val_f0=torch.stack(f0s),
+        val_names=names,
+        val_full_idx=full_indices,
+        chunk_samples=chunk_samples,
+        T_ctrl=T_ctrl,
+        whisper=whisper,
+    )
+
+
+def _audio_sample_indices(step: int, total: int, k: int) -> list[int]:
+    """Pick ``k`` distinct indices in ``[0, total)`` deterministically by step.
+
+    Same step ⇒ same indices (cross-run reproducibility); consecutive evals
+    within a run get different subsets so wandb gets fresh listening samples.
+    """
+    k = min(k, total)
+    if k == 0:
+        return []
+    return [
+        int(i) for i in np.random.RandomState(step).choice(total, size=k, replace=False)
+    ]
 
 
 def _param_traj_figure(
@@ -362,111 +370,36 @@ def _mel_fig_stacked(audios: list[tuple[str, np.ndarray]], sr: int) -> go.Figure
     return fig
 
 
-@torch.no_grad()
-def _evaluate_split(
+_EVAL_BATCH = 16  # cap for forward/synth chunks to keep memory bounded
+
+
+def _run_eval_batched(
     model: PinkTromboneController,
-    ddp_module: nn.Module,
-    eval_setup: EvalSetup,
-    files: list[DatasetFile],
-    split: str,
-    loss_fn: CombinedReconLoss,
+    wavs: torch.Tensor,  # [N, S] on device
+    f0s: torch.Tensor,  # [N, T_ctrl] on device
     cfg: TrainConfig,
-    step: int,
-    run_expensive: bool,
-    device: torch.device,
-) -> dict[str, object]:
-    """One eval pass on a subset of files (e.g. train or val).
-
-    Keys are namespaced as ``eval/{split}/...``; cheap path always logs
-    ``loss``, expensive path adds pitch-MAE metrics and audio/params/mel media
-    (lists, one entry per sampled clip).
-    """
-    eval_clips, eval_f0, eval_names = _sample_eval_clips(
-        eval_setup, files, step, cfg.log.n_audio_samples, cfg.data.sample_rate, device
-    )
-    if eval_clips.numel() == 0:
-        return {}
-    target = eval_clips  # [N, S]
-    wav = target.unsqueeze(1)  # [N, 1, S]
-    params = model(wav, eval_f0)  # [N, T_ctrl, N_PARAMS]
-    frame_rate = model.config.frame_rate
-    samples_per_frame = model.samples_per_frame
-
-    fixed_seed = torch.arange(target.shape[0], dtype=torch.long)
-    pred_ola = pink_trombone_ola(
-        params,
-        seed=fixed_seed,
-        ir_length=cfg.synth.ir_length,
-        ir_impl=cfg.synth.ir_impl,
-        control_rate=frame_rate,
-    )
-    S = min(pred_ola.shape[-1], target.shape[-1])
-    pred_norm = _volume_match(
-        pred_ola[..., :S].float(), target[..., :S].float(), samples_per_frame
-    )
-    S_norm = pred_norm.shape[-1]
-    total, components = loss_fn.with_components(pred_norm, target[..., :S_norm].float())
-    out: dict[str, object] = {
-        f"eval/{split}/loss": total.item(),
-        f"eval/{split}/param_variation": _param_variation(params, model),
-    }
-    for name, value in components.items():
-        out[f"eval/{split}/recon/{name}"] = value.item()
-
-    if not run_expensive:
-        return out
-
-    # Pitch MAE (librosa.pyin on CPU)
-    pitch_mae: list[float] = []
-    miss: list[float] = []
-    for i in range(target.shape[0]):
-        tgt_np = target[i].detach().cpu().numpy()
-        pred_np = pred_norm[i].detach().cpu().numpy()
-        m = pitch_mae_cents(
-            tgt_np,
-            pred_np,
-            cfg.data.sample_rate,
-            fmin=cfg.log.pitch_fmin,
-            fmax=cfg.log.pitch_fmax,
-            voiced_prob_threshold=cfg.log.pitch_voiced_prob_threshold,
+    frame_rate: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Forward + OLA synth in chunks. Returns (params, ola)."""
+    N = wavs.shape[0]
+    params_all: list[torch.Tensor] = []
+    ola_all: list[torch.Tensor] = []
+    for start in range(0, N, _EVAL_BATCH):
+        end = min(start + _EVAL_BATCH, N)
+        wav = wavs[start:end].unsqueeze(1)  # [B, 1, S]
+        f0 = f0s[start:end]
+        params = model(wav, f0)
+        fixed_seed = torch.arange(start, end, dtype=torch.long)
+        ola = pink_trombone_ola(
+            params,
+            seed=fixed_seed,
+            ir_length=cfg.synth.ir_length,
+            ir_impl=cfg.synth.ir_impl,
+            control_rate=frame_rate,
         )
-        if not np.isnan(m.mae_cents):
-            pitch_mae.append(m.mae_cents)
-            miss.append(m.unvoiced_miss_frac)
-
-    if pitch_mae:
-        out[f"eval/{split}/pitch_mae_cents"] = float(np.mean(pitch_mae))
-        out[f"eval/{split}/unvoiced_miss_frac"] = float(np.mean(miss))
-
-    # Audio / params / mel as lists under stable keys.
-    sr = cfg.data.sample_rate
-    gap = np.zeros(int(sr * 0.1), dtype=np.float32)
-    trainable_names = model.trainable_names_
-    bounds = {n: model.config.param_spec[n][:2] for n in trainable_names}
-    audios: list[wandb.Audio] = []
-    param_figs: list[wandb.Plotly] = []
-    mel_pairs: list[tuple[str, np.ndarray]] = []
-    for i, name in enumerate(eval_names):
-        tgt_np = target[i].detach().cpu().numpy()
-        pred_np = pred_norm[i].detach().cpu().numpy()
-        # pred → tgt so the listener hears the prediction before the ground
-        # truth (no anchoring on the target).
-        combined = np.concatenate([_norm(pred_np), gap, tgt_np.astype(np.float32)])
-        audios.append(wandb.Audio(combined, sample_rate=sr, caption=name))
-        param_figs.append(
-            wandb.Plotly(
-                _param_traj_figure(
-                    params[i], trainable_names, frame_rate, bounds=bounds
-                )
-            )
-        )
-        mel_pairs.append((f"{name}: target", tgt_np))
-        mel_pairs.append((f"{name}: pred", pred_np))
-
-    out[f"eval/{split}/audio"] = audios
-    out[f"eval/{split}/params"] = param_figs
-    out[f"eval/{split}/mel"] = wandb.Plotly(_mel_fig_stacked(mel_pairs, sr))
-    return out
+        params_all.append(params)
+        ola_all.append(ola)
+    return torch.cat(params_all, dim=0), torch.cat(ola_all, dim=0)
 
 
 @torch.no_grad()
@@ -477,49 +410,121 @@ def _evaluate(
     loss_fn: CombinedReconLoss,
     cfg: TrainConfig,
     step: int,
-    run_expensive: bool,
     device: torch.device,
 ) -> dict[str, object]:
-    """Evaluate on train + val clips (deterministic by ``step``).
+    """Full eval on the fixed held-out val clips.
 
-    The val split is the held-out tail of the manifest (see
-    ``data.val_fraction``); the train split samples from the same files the
-    dataloader sees, so ``train`` vs ``val`` numbers expose any overfit.
+    Computes losses, pitch MAE, ASR WER/CER, and ``param_variation`` on every
+    val clip. Logs audio / params / mel media for ``n_audio_samples`` of them
+    (random subset, deterministic by ``step``). Wall-time of the eval call is
+    logged under ``eval/duration_s`` so we can keep an eye on it growing.
     """
+    if eval_setup.val_wavs.numel() == 0:
+        return {}
+
+    t0 = time.perf_counter()
     model_was_training = ddp_module.training
     ddp_module.eval()
-    metrics: dict[str, object] = {}
-    metrics.update(
-        _evaluate_split(
-            model,
-            ddp_module,
-            eval_setup,
-            eval_setup.train_files,
-            "train",
-            loss_fn,
-            cfg,
-            step,
-            run_expensive,
-            device,
-        )
+
+    target = eval_setup.val_wavs.to(device)  # [N, S] float32
+    f0 = eval_setup.val_f0.to(device)  # [N, T_ctrl]
+    samples_per_frame = model.samples_per_frame
+    frame_rate = model.config.frame_rate
+
+    params, pred_ola = _run_eval_batched(model, target, f0, cfg, frame_rate)
+
+    S = min(pred_ola.shape[-1], target.shape[-1])
+    pred_norm = _volume_match(
+        pred_ola[..., :S].float(), target[..., :S].float(), samples_per_frame
     )
-    metrics.update(
-        _evaluate_split(
-            model,
-            ddp_module,
-            eval_setup,
-            eval_setup.val_files,
-            "val",
-            loss_fn,
-            cfg,
-            step,
-            run_expensive,
-            device,
+
+    S_norm = pred_norm.shape[-1]
+    total, components = loss_fn.with_components(pred_norm, target[..., :S_norm].float())
+
+    out: dict[str, object] = {
+        "eval/loss": total.item(),
+        "eval/param_variation": _param_variation(params, model),
+    }
+    for name, value in components.items():
+        out[f"eval/recon/{name}"] = value.item()
+
+    # Pitch MAE + ASR (per clip, CPU).
+    pitch_vals: list[float] = []
+    miss_vals: list[float] = []
+    wer_vals: list[float] = []
+    cer_vals: list[float] = []
+    sr = cfg.data.sample_rate
+    whisper = eval_setup.whisper
+    N = target.shape[0]
+    for i in range(N):
+        tgt_np = target[i].detach().cpu().numpy()
+        pred_np = pred_norm[i].detach().cpu().numpy()
+
+        m = pitch_mae_cents(
+            tgt_np,
+            pred_np,
+            sr,
+            fmin=cfg.log.pitch_fmin,
+            fmax=cfg.log.pitch_fmax,
+            voiced_prob_threshold=cfg.log.pitch_voiced_prob_threshold,
         )
-    )
+        if not np.isnan(m.mae_cents):
+            pitch_vals.append(m.mae_cents)
+            miss_vals.append(m.unvoiced_miss_frac)
+
+        if whisper is not None:
+            scores = whisper.score(
+                tgt_np,
+                pred_np,
+                sr,
+                target_key=eval_setup.val_full_idx[i],
+            )
+            if not np.isnan(scores.wer):
+                wer_vals.append(scores.wer)
+            if not np.isnan(scores.cer):
+                cer_vals.append(scores.cer)
+
+    if pitch_vals:
+        out["eval/pitch_mae_cents"] = float(np.mean(pitch_vals))
+        out["eval/unvoiced_miss_frac"] = float(np.mean(miss_vals))
+    if wer_vals:
+        out["eval/wer"] = float(np.mean(wer_vals))
+    if cer_vals:
+        out["eval/cer"] = float(np.mean(cer_vals))
+
+    # Audio / params / mel for a random subset (seeded by ``step``).
+    media_idx = _audio_sample_indices(step, N, cfg.log.n_audio_samples)
+    if media_idx:
+        gap = np.zeros(int(sr * 0.1), dtype=np.float32)
+        trainable_names = model.trainable_names_
+        bounds = {n: model.config.param_spec[n][:2] for n in trainable_names}
+        audios: list[wandb.Audio] = []
+        param_figs: list[wandb.Plotly] = []
+        mel_pairs: list[tuple[str, np.ndarray]] = []
+        for i in media_idx:
+            name = eval_setup.val_names[i]
+            tgt_np = target[i].detach().cpu().numpy()
+            pred_np = pred_norm[i].detach().cpu().numpy()
+            # pred → tgt so listeners hear the prediction first.
+            combined = np.concatenate([_norm(pred_np), gap, tgt_np.astype(np.float32)])
+            audios.append(wandb.Audio(combined, sample_rate=sr, caption=name))
+            param_figs.append(
+                wandb.Plotly(
+                    _param_traj_figure(
+                        params[i], trainable_names, frame_rate, bounds=bounds
+                    )
+                )
+            )
+            mel_pairs.append((f"{name}: target", tgt_np))
+            mel_pairs.append((f"{name}: pred", pred_np))
+        out["eval/audio"] = audios
+        out["eval/params"] = param_figs
+        out["eval/mel"] = wandb.Plotly(_mel_fig_stacked(mel_pairs, sr))
+
     if model_was_training:
         ddp_module.train()
-    return metrics
+    out["eval/duration_s"] = time.perf_counter() - t0
+    return out
 
 
 def _norm(x: np.ndarray) -> np.ndarray:
@@ -602,10 +607,10 @@ def main(hydra_cfg: DictConfig) -> None:
         val_fraction=cfg.data.val_fraction,
     )
 
-    # Eval setup (rank 0 only). Clips are sampled per-step inside ``_evaluate``.
+    # Eval setup (rank 0 only): preloads the fixed val-clip tensors + ASR model.
     eval_setup: EvalSetup | None = None
     if rank == 0:
-        eval_setup = _eval_setup(cfg, samples_per_frame)
+        eval_setup = _eval_setup(cfg, samples_per_frame, device)
 
     # wandb (rank 0 only)
     if rank == 0:
@@ -635,14 +640,14 @@ def main(hydra_cfg: DictConfig) -> None:
             loss_fn,
             cfg,
             step,
-            run_expensive=True,
             device=device,
         )
         wandb.log(metrics, step=step)
         tqdm.write(
             f"[eval] step={step} "
-            f"train={metrics.get('eval/train/loss', float('nan')):.4f} "
-            f"val={metrics.get('eval/val/loss', float('nan')):.4f}"
+            f"loss={metrics.get('eval/loss', float('nan')):.4f} "
+            f"wer={metrics.get('eval/wer', float('nan')):.3f} "
+            f"in {metrics.get('eval/duration_s', float('nan')):.1f}s"
         )
 
     while step < cfg.optim.max_steps:
@@ -736,7 +741,7 @@ def main(hydra_cfg: DictConfig) -> None:
             )
             wandb.log(log_payload, step=step)
 
-        if rank == 0 and eval_setup is not None and step % cfg.log.val_every == 0:
+        if rank == 0 and eval_setup is not None and step % cfg.log.eval_every == 0:
             metrics = _evaluate(
                 module,
                 ddp_module,
@@ -744,14 +749,14 @@ def main(hydra_cfg: DictConfig) -> None:
                 loss_fn,
                 cfg,
                 step,
-                run_expensive=(step % cfg.log.eval_every == 0),
                 device=device,
             )
             wandb.log(metrics, step=step)
             tqdm.write(
                 f"[eval] step={step} "
-                f"train={metrics.get('eval/train/loss', float('nan')):.4f} "
-                f"val={metrics.get('eval/val/loss', float('nan')):.4f}"
+                f"loss={metrics.get('eval/loss', float('nan')):.4f} "
+                f"wer={metrics.get('eval/wer', float('nan')):.3f} "
+                f"in {metrics.get('eval/duration_s', float('nan')):.1f}s"
             )
 
         if rank == 0 and step % cfg.log.ckpt_every == 0:

@@ -79,13 +79,19 @@ class LogConfig(BaseModel):
     wandb_entity: str | None = None
     wandb_mode: Literal["online", "offline", "disabled"] = "online"
     log_every: int = 50
-    val_every: int = 1_000
-    eval_every: int = 10_000
+    eval_every: int = 1_000
     ckpt_every: int = 5_000
-    n_audio_samples: int = 4
+    # The same clips are used for each eval for stable metrics
+    n_eval_clips: int = 100
+    # Subset of those clips for which we attach audio/params/mel media to
+    # wandb. The subset is re-sampled every eval step (deterministic by
+    # step) so listeners hear new examples without bloating storage.
+    n_audio_samples: int = 10
     pitch_fmin: float = 70.0
     pitch_fmax: float = 500.0
     pitch_voiced_prob_threshold: float = 0.5
+    # Whisper model size for the WER/CER eval. Empty string disables ASR eval.
+    asr_whisper_size: str = "base"
 
 
 class RunConfig(BaseModel):
