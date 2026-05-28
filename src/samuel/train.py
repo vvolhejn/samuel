@@ -43,7 +43,7 @@ from samuel.evals.asr import WhisperEvaluator
 from samuel.evals.pitch import pitch_mae_cents
 from samuel.losses import MelSpecLoss, MFCCLoss, MultiScaleLogMagSTFTLoss
 from samuel.model import PinkTromboneController
-from samuel.pink_trombone import PARAM_NAMES, pink_trombone, pink_trombone_ola
+from samuel.pink_trombone import PARAM_NAMES, pink_trombone_ola
 
 
 class CombinedReconLoss(nn.Module):
@@ -379,12 +379,11 @@ def _run_eval_batched(
     f0s: torch.Tensor,  # [N, T_ctrl] on device
     cfg: TrainConfig,
     frame_rate: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Forward + OLA synth + exact synth in chunks. Returns (params, ola, exact)."""
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Forward + OLA synth in chunks. Returns (params, ola)."""
     N = wavs.shape[0]
     params_all: list[torch.Tensor] = []
     ola_all: list[torch.Tensor] = []
-    exact_all: list[torch.Tensor] = []
     for start in range(0, N, _EVAL_BATCH):
         end = min(start + _EVAL_BATCH, N)
         wav = wavs[start:end].unsqueeze(1)  # [B, 1, S]
@@ -398,15 +397,9 @@ def _run_eval_batched(
             ir_impl=cfg.synth.ir_impl,
             control_rate=frame_rate,
         )
-        exact = pink_trombone(params, seed=fixed_seed, control_rate=frame_rate)
         params_all.append(params)
         ola_all.append(ola)
-        exact_all.append(exact)
-    return (
-        torch.cat(params_all, dim=0),
-        torch.cat(ola_all, dim=0),
-        torch.cat(exact_all, dim=0),
-    )
+    return torch.cat(params_all, dim=0), torch.cat(ola_all, dim=0)
 
 
 @torch.no_grad()
@@ -438,43 +431,26 @@ def _evaluate(
     samples_per_frame = model.samples_per_frame
     frame_rate = model.config.frame_rate
 
-    params, pred_ola, pred_exact = _run_eval_batched(model, target, f0, cfg, frame_rate)
+    params, pred_ola = _run_eval_batched(model, target, f0, cfg, frame_rate)
 
     S = min(pred_ola.shape[-1], target.shape[-1])
-    pred_ola_norm = _volume_match(
+    pred_norm = _volume_match(
         pred_ola[..., :S].float(), target[..., :S].float(), samples_per_frame
     )
-    S_ex = min(pred_exact.shape[-1], target.shape[-1])
-    pred_exact_norm = _volume_match(
-        pred_exact[..., :S_ex].float(),
-        target[..., :S_ex].float(),
-        samples_per_frame,
-    )
 
-    S_ola = pred_ola_norm.shape[-1]
-    ola_total, ola_components = loss_fn.with_components(
-        pred_ola_norm, target[..., :S_ola].float()
-    )
-    S_exact = pred_exact_norm.shape[-1]
-    exact_total, exact_components = loss_fn.with_components(
-        pred_exact_norm, target[..., :S_exact].float()
-    )
+    S_norm = pred_norm.shape[-1]
+    total, components = loss_fn.with_components(pred_norm, target[..., :S_norm].float())
 
     out: dict[str, object] = {
-        "eval/loss_ola": ola_total.item(),
-        "eval/loss_exact": exact_total.item(),
+        "eval/loss": total.item(),
         "eval/param_variation": _param_variation(params, model),
     }
-    for name, value in ola_components.items():
-        out[f"eval/recon_ola/{name}"] = value.item()
-    for name, value in exact_components.items():
-        out[f"eval/recon_exact/{name}"] = value.item()
+    for name, value in components.items():
+        out[f"eval/recon/{name}"] = value.item()
 
     # Pitch MAE + ASR (per clip, CPU).
-    pitch_ola_vals: list[float] = []
-    pitch_exact_vals: list[float] = []
-    miss_ola: list[float] = []
-    miss_exact: list[float] = []
+    pitch_vals: list[float] = []
+    miss_vals: list[float] = []
     wer_vals: list[float] = []
     cer_vals: list[float] = []
     sr = cfg.data.sample_rate
@@ -482,36 +458,24 @@ def _evaluate(
     N = target.shape[0]
     for i in range(N):
         tgt_np = target[i].detach().cpu().numpy()
-        ola_np = pred_ola_norm[i].detach().cpu().numpy()
-        ex_np = pred_exact_norm[i].detach().cpu().numpy()
+        pred_np = pred_norm[i].detach().cpu().numpy()
 
-        m_ola = pitch_mae_cents(
+        m = pitch_mae_cents(
             tgt_np,
-            ola_np,
+            pred_np,
             sr,
             fmin=cfg.log.pitch_fmin,
             fmax=cfg.log.pitch_fmax,
             voiced_prob_threshold=cfg.log.pitch_voiced_prob_threshold,
         )
-        m_ex = pitch_mae_cents(
-            tgt_np,
-            ex_np,
-            sr,
-            fmin=cfg.log.pitch_fmin,
-            fmax=cfg.log.pitch_fmax,
-            voiced_prob_threshold=cfg.log.pitch_voiced_prob_threshold,
-        )
-        if not np.isnan(m_ola.mae_cents):
-            pitch_ola_vals.append(m_ola.mae_cents)
-            miss_ola.append(m_ola.unvoiced_miss_frac)
-        if not np.isnan(m_ex.mae_cents):
-            pitch_exact_vals.append(m_ex.mae_cents)
-            miss_exact.append(m_ex.unvoiced_miss_frac)
+        if not np.isnan(m.mae_cents):
+            pitch_vals.append(m.mae_cents)
+            miss_vals.append(m.unvoiced_miss_frac)
 
         if whisper is not None:
             scores = whisper.score(
                 tgt_np,
-                ola_np,
+                pred_np,
                 sr,
                 target_key=eval_setup.val_full_idx[i],
             )
@@ -520,12 +484,9 @@ def _evaluate(
             if not np.isnan(scores.cer):
                 cer_vals.append(scores.cer)
 
-    if pitch_ola_vals:
-        out["eval/pitch_mae_cents_ola"] = float(np.mean(pitch_ola_vals))
-        out["eval/unvoiced_miss_frac_ola"] = float(np.mean(miss_ola))
-    if pitch_exact_vals:
-        out["eval/pitch_mae_cents_exact"] = float(np.mean(pitch_exact_vals))
-        out["eval/unvoiced_miss_frac_exact"] = float(np.mean(miss_exact))
+    if pitch_vals:
+        out["eval/pitch_mae_cents"] = float(np.mean(pitch_vals))
+        out["eval/unvoiced_miss_frac"] = float(np.mean(miss_vals))
     if wer_vals:
         out["eval/wer"] = float(np.mean(wer_vals))
     if cer_vals:
@@ -543,12 +504,9 @@ def _evaluate(
         for i in media_idx:
             name = eval_setup.val_names[i]
             tgt_np = target[i].detach().cpu().numpy()
-            ola_np = pred_ola_norm[i].detach().cpu().numpy()
-            ex_np = pred_exact_norm[i].detach().cpu().numpy()
-            # ola → ex → tgt so listeners hear the prediction first.
-            combined = np.concatenate(
-                [_norm(ola_np), gap, _norm(ex_np), gap, tgt_np.astype(np.float32)]
-            )
+            pred_np = pred_norm[i].detach().cpu().numpy()
+            # pred → tgt so listeners hear the prediction first.
+            combined = np.concatenate([_norm(pred_np), gap, tgt_np.astype(np.float32)])
             audios.append(wandb.Audio(combined, sample_rate=sr, caption=name))
             param_figs.append(
                 wandb.Plotly(
@@ -558,7 +516,7 @@ def _evaluate(
                 )
             )
             mel_pairs.append((f"{name}: target", tgt_np))
-            mel_pairs.append((f"{name}: ola", ola_np))
+            mel_pairs.append((f"{name}: pred", pred_np))
         out["eval/audio"] = audios
         out["eval/params"] = param_figs
         out["eval/mel"] = wandb.Plotly(_mel_fig_stacked(mel_pairs, sr))
@@ -687,7 +645,7 @@ def main(hydra_cfg: DictConfig) -> None:
         wandb.log(metrics, step=step)
         tqdm.write(
             f"[eval] step={step} "
-            f"loss_ola={metrics.get('eval/loss_ola', float('nan')):.4f} "
+            f"loss={metrics.get('eval/loss', float('nan')):.4f} "
             f"wer={metrics.get('eval/wer', float('nan')):.3f} "
             f"in {metrics.get('eval/duration_s', float('nan')):.1f}s"
         )
@@ -796,7 +754,7 @@ def main(hydra_cfg: DictConfig) -> None:
             wandb.log(metrics, step=step)
             tqdm.write(
                 f"[eval] step={step} "
-                f"loss_ola={metrics.get('eval/loss_ola', float('nan')):.4f} "
+                f"loss={metrics.get('eval/loss', float('nan')):.4f} "
                 f"wer={metrics.get('eval/wer', float('nan')):.3f} "
                 f"in {metrics.get('eval/duration_s', float('nan')):.1f}s"
             )
