@@ -460,17 +460,19 @@ def _evaluate(
         tgt_np = target[i].detach().cpu().numpy()
         pred_np = pred_norm[i].detach().cpu().numpy()
 
-        m = pitch_mae_cents(
-            tgt_np,
-            pred_np,
-            sr,
-            fmin=cfg.log.pitch_fmin,
-            fmax=cfg.log.pitch_fmax,
-            voiced_prob_threshold=cfg.log.pitch_voiced_prob_threshold,
-        )
-        if not np.isnan(m.mae_cents):
-            pitch_vals.append(m.mae_cents)
-            miss_vals.append(m.unvoiced_miss_frac)
+        # This eval is slow and doesn't make sense to run if we're not learning the f0
+        if "frequency" in model.trainable_names_:
+            m = pitch_mae_cents(
+                tgt_np,
+                pred_np,
+                sr,
+                fmin=cfg.log.pitch_fmin,
+                fmax=cfg.log.pitch_fmax,
+                voiced_prob_threshold=cfg.log.pitch_voiced_prob_threshold,
+            )
+            if not np.isnan(m.mae_cents):
+                pitch_vals.append(m.mae_cents)
+                miss_vals.append(m.unvoiced_miss_frac)
 
         if whisper is not None:
             scores = whisper.score(
