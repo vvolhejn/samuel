@@ -15,6 +15,7 @@ data:
 synth:
   ir_length: 256
   ir_impl: sequential
+  enable_transients: false
 
 optim:
   lr: 3.0e-4
@@ -35,6 +36,8 @@ loss:
   # 4x window overlap (n_fft=2048, hop=samples_per_frame=512). Null falls
   # back to n_fft=samples_per_frame (no overlap).
   mfcc_n_fft: 2048
+  onset_align: 0.1  # weight on the asymmetric onset-alignment loss
+  onset_align_radius: 2
 
 log:
   wandb_project: samuel

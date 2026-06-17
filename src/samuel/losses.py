@@ -196,6 +196,114 @@ class LoudnessEnvelopeLoss(nn.Module):
         return (torch.log(p_rms + eps) - torch.log(t_rms + eps)).abs().mean()
 
 
+class OnsetAlignLoss(nn.Module):
+    """Encourage the synth's closure-release events to coincide with onsets
+    in the target audio.
+
+    Detects onsets in target via spectral flux on a mel spectrogram (no grad,
+    target is fixed) at the same hop as the controller's frame rate. The loss
+    asks: for each onset frame, is there a release somewhere in a small
+    neighborhood? Spurious releases (release with no onset) are not penalized
+    here.
+
+    Important: this loss keys directly off the controller's
+    ``constrictionDiameter`` parameter rather than the full diameter
+    profile's min. Two reasons:
+
+      1. ``min(diameter)`` blocks gradient to all tract positions that
+         aren't currently the minimum, so when the constriction isn't
+         already tighter than the tongue, the loss can't tell the
+         controller to push ``cd`` down.
+
+      2. The controller directly emits ``constrictionDiameter``; this is
+         the lever the loss should push on. Keying off ``cd`` is a clean,
+         monotonic signal with gradient everywhere.
+
+    The synth's transient trigger still uses the full ``min(diameter)``
+    (steep sigmoid), so transients fire only on true closures.
+
+    Formally:
+        env[t]   = max-normalized spectral flux at frame t (target)
+        c[t]     = sigmoid(k * (threshold - cd[t-1])) (pred, "was closed before t?")
+        c_d[t]   = max-pool of c over a ±radius window
+        loss     = mean ReLU(env - c_d)
+
+    Asymmetric: each strong target onset wants a "was closed before"
+    nearby, but a closure at a non-onset frame is fine here (the
+    reconstruction loss handles "don't close when you shouldn't").
+    """
+
+    def __init__(
+        self,
+        samples_per_frame: int = 512,
+        n_fft: int = 2048,
+        n_mels: int = 80,
+        sample_rate: int = SAMPLE_RATE,
+        align_radius: int = 2,
+        closure_k: float = 4.0,
+        closure_threshold: float = 0.3,
+    ):
+        super().__init__()
+        self.samples_per_frame = samples_per_frame
+        self.n_fft = n_fft
+        self.align_radius = align_radius
+        self.closure_k = closure_k
+        self.closure_threshold = closure_threshold
+        window = torch.hann_window(n_fft)
+        self.register_buffer("window", window, persistent=False)
+        mel_fb = torch.from_numpy(
+            librosa.filters.mel(
+                sr=sample_rate,
+                n_fft=n_fft,
+                n_mels=n_mels,
+                fmin=0.0,
+                fmax=sample_rate / 2,
+            )
+        ).float()
+        self.register_buffer("mel_fb", mel_fb, persistent=False)
+
+    @torch.no_grad()
+    def _onset_envelope(self, target: Tensor) -> Tensor:
+        """Spectral-flux onset envelope at frame rate, normalized per clip."""
+        spec = torch.stft(
+            target,
+            n_fft=self.n_fft,
+            hop_length=self.samples_per_frame,
+            window=self.window,
+            center=True,
+            return_complex=True,
+        ).abs()  # [B, F, T+1]
+        mel = torch.einsum("mf,bft->bmt", self.mel_fb, spec.pow(2))
+        log_mel = torch.log1p(mel)
+        # Spectral flux: positive change frame-to-frame, summed over mel bins.
+        flux = F.relu(log_mel[:, :, 1:] - log_mel[:, :, :-1]).sum(dim=1)  # [B, T]
+        # Normalize per clip so the loss scale doesn't depend on volume.
+        flux = flux / (flux.amax(dim=-1, keepdim=True) + 1e-8)
+        return flux
+
+    def _soft_closure_prev(self, cd: Tensor) -> Tensor:
+        """Soft closure indicator at the *previous* frame, gentler than the
+        synth's transient trigger so gradient flows over the whole range of
+        ``cd`` and not just where the constriction is already tighter than
+        the tongue."""
+        closure = torch.sigmoid(self.closure_k * (self.closure_threshold - cd))
+        return F.pad(closure[:, :-1], (1, 0))
+
+    def forward(self, cd: Tensor, target: Tensor) -> Tensor:
+        """``cd`` is [B, T_ctrl] (constrictionDiameter); ``target`` is [B, S]."""
+        c_prev = self._soft_closure_prev(cd)  # [B, T_ctrl]
+        env = self._onset_envelope(target)  # [B, T_env]
+        k = 2 * self.align_radius + 1
+        c_d = F.max_pool1d(
+            c_prev.unsqueeze(1),
+            kernel_size=k,
+            stride=1,
+            padding=self.align_radius,
+        ).squeeze(1)
+        T = min(env.shape[-1], c_d.shape[-1])
+        return F.relu(env[..., :T] - c_d[..., :T]).mean()
+
+
 class MultiScaleLogMagSTFTLossWithEnvelope(nn.Module):
     """Multi-scale STFT loss + loudness-envelope loss."""
 
