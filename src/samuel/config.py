@@ -81,6 +81,9 @@ class LogConfig(BaseModel):
     log_every: int = 50
     eval_every: int = 1_000
     ckpt_every: int = 5_000
+    # On clean completion, upload the final checkpoint (last.pt) as a wandb
+    # artifact so runs are backed up off the training filesystem.
+    ckpt_wandb_artifact: bool = True
     # The same clips are used for each eval for stable metrics
     n_eval_clips: int = 100
     # Subset of those clips for which we attach audio/params/mel media to
