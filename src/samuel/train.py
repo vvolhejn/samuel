@@ -779,6 +779,14 @@ def main(hydra_cfg: DictConfig) -> None:
 
     pbar.close()
     if rank == 0:
+        if cfg.log.ckpt_wandb_artifact and cfg.log.wandb_mode != "disabled":
+            last_path = run_dir / "checkpoints" / "last.pt"
+            if last_path.exists():
+                artifact = wandb.Artifact(f"{run_dir.name}-checkpoint", type="model")
+                # Resolve the symlink and store under a stable name so the
+                # artifact always exposes the final step as last.pt.
+                artifact.add_file(str(last_path.resolve()), name="last.pt")
+                wandb.log_artifact(artifact)
         wandb.finish()
     if is_ddp:
         dist.destroy_process_group()
