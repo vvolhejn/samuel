@@ -85,10 +85,7 @@ class LogConfig(BaseModel):
     ckpt_wandb_artifact: bool = True
     # The same clips are used for each eval for stable metrics
     n_eval_clips: int = 100
-    # Eval-clip length in seconds. None -> use data.chunk_seconds (match
-    # training). Set longer (e.g. 10.0) for finer, less-quantised WER/CER and a
-    # measure of *sustained* intelligibility, without changing the training
-    # chunk length. Absolute WER rises with length, so don't compare across it.
+    # Eval-clip length in seconds. None -> use data.chunk_seconds (match training)
     eval_chunk_seconds: float | None = None
     # Subset of those clips for which we attach audio/params/mel media to
     # wandb. The subset is re-sampled every eval step (deterministic by
@@ -133,11 +130,8 @@ class LossConfig(BaseModel):
     # None to revert to n_fft = samples_per_frame.
     mfcc_n_fft: int | None = 2048
 
-    # SSL feature-matching (perceptual) loss on a frozen speech encoder. L1
-    # distance between the encoder's hidden states for pred vs. target audio.
-    # This is the loss shown in the single-clip overfit to break intelligibility
-    # where spectral losses alone plateau at babble. Weight 0 disables it AND
-    # skips building the encoder entirely (so a pure-MFCC run pays nothing).
+    # SSL feature-matching (perceptual) loss on a frozen speech encoder.
+    # L1 distance between the encoder's hidden states for pred vs. target audio.
     ssl: float = 0.0
     # HF model id. Others tried: facebook/hubert-base-ls960,
     # facebook/wav2vec2-base-960h (wavlm won; wav2vec2 needs entropy>=0.1).
