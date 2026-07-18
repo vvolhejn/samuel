@@ -11,7 +11,7 @@ from samuel.pink_trombone import (
     _NOSE_START,
     _TRACT_N,
     _compute_batch_irs,
-    _compute_batch_irs_eig,
+    _ola_convolve,
     _compute_diameter_profile,
     _upsample_params,
     glottis,
@@ -448,103 +448,44 @@ class TestPinkTromboneOla:
         )
 
 
-class TestComputeBatchIrsEig:
-    """Eigendecomposition-based IR must match the sequential reference."""
+def _realistic_coefs(BT=4, seed=0):
+    """Reflection coefficients derived from a realistic diameter profile.
 
-    def _realistic_coefs(self, BT=4, seed=0):
-        """Reflection coefficients derived from a realistic diameter profile.
+    Mirrors the setup in `_tract_ola`: takes (tongueIndex, tongueDiameter,
+    constrictionIndex, constrictionDiameter) → diameter → area → reflection
+    coefficients. Varies tongue position across the batch for diversity.
+    """
+    N = _TRACT_N
+    ns = _NOSE_START
+    g = torch.Generator().manual_seed(seed)
 
-        Mirrors the setup in `_tract_ola`: takes (tongueIndex, tongueDiameter,
-        constrictionIndex, constrictionDiameter) → diameter → area → reflection
-        coefficients. Varies tongue position across the batch for diversity.
-        """
-        N = _TRACT_N
-        ns = _NOSE_START
-        g = torch.Generator().manual_seed(seed)
+    tongue_idx = 10 + 20 * torch.rand(BT, 1, generator=g)  # ~vowel range
+    tongue_dia = 1.8 + 1.0 * torch.rand(BT, 1, generator=g)
+    constr_idx = 20 + 20 * torch.rand(BT, 1, generator=g)
+    constr_dia = 1.5 + 1.5 * torch.rand(BT, 1, generator=g)  # open — no turb
 
-        tongue_idx = 10 + 20 * torch.rand(BT, 1, generator=g)  # ~vowel range
-        tongue_dia = 1.8 + 1.0 * torch.rand(BT, 1, generator=g)
-        constr_idx = 20 + 20 * torch.rand(BT, 1, generator=g)
-        constr_dia = 1.5 + 1.5 * torch.rand(BT, 1, generator=g)  # open — no turb
+    diameter = _compute_diameter_profile(
+        tongue_idx, tongue_dia, constr_idx, constr_dia, N
+    ).squeeze(1)  # [BT, N]
+    amplitude = diameter**2
+    r_inner = (amplitude[:, :-1] - amplitude[:, 1:]) / (
+        amplitude[:, :-1] + amplitude[:, 1:] + 1e-10
+    )
+    r = torch.cat([torch.zeros(BT, 1), r_inner], dim=1)  # [BT, N]
 
-        diameter = _compute_diameter_profile(
-            tongue_idx, tongue_dia, constr_idx, constr_dia, N
-        ).squeeze(1)  # [BT, N]
-        amplitude = diameter**2
-        r_inner = (amplitude[:, :-1] - amplitude[:, 1:]) / (
-            amplitude[:, :-1] + amplitude[:, 1:] + 1e-10
-        )
-        r = torch.cat([torch.zeros(BT, 1), r_inner], dim=1)  # [BT, N]
-
-        velum = torch.full((BT,), 0.01)  # closed-velum default
-        A_L = amplitude[:, ns]
-        A_R = amplitude[:, ns + 1]
-        A_N = velum**2
-        sum_A = A_L + A_R + A_N + 1e-10
-        r_L = (2 * A_L - sum_A) / sum_A
-        r_R = (2 * A_R - sum_A) / sum_A
-        r_N = (2 * A_N - sum_A) / sum_A
-        return r, r_L, r_R, r_N
-
-    def test_matches_sequential_glottis(self):
-        """Glottis impulse IR: eig must match sequential to ~1e-4."""
-        r, r_L, r_R, r_N = self._realistic_coefs(BT=4, seed=0)
-        L = 512
-        inject_pos = torch.zeros(4, dtype=torch.long)  # unused in glottis mode
-        ref = _compute_batch_irs(r, r_L, r_R, r_N, _NOSE_R_CPU, True, inject_pos, L)
-        eig = _compute_batch_irs_eig(r, r_L, r_R, r_N, _NOSE_R_CPU, True, inject_pos, L)
-        assert ref.shape == eig.shape == (4, L)
-        torch.testing.assert_close(ref, eig, atol=1e-4, rtol=1e-4)
-
-    def test_matches_sequential_turbulence(self):
-        """Turbulence IR with varying inject_pos — the edge case.
-
-        In turb mode `b` is a one-hot at a tube position (not at the glottis)
-        and pass 2 does NOT re-inject turbulence, so `b_full = A_step · b_turb`
-        without the `+ b_turb` term. Position-independent bugs would pass a
-        uniform-inject_pos test, so we vary it across the batch.
-        """
-        r, r_L, r_R, r_N = self._realistic_coefs(BT=4, seed=1)
-        L = 512
-        inject_pos = torch.tensor([5, 12, 24, 35], dtype=torch.long)
-        ref = _compute_batch_irs(r, r_L, r_R, r_N, _NOSE_R_CPU, False, inject_pos, L)
-        eig = _compute_batch_irs_eig(
-            r, r_L, r_R, r_N, _NOSE_R_CPU, False, inject_pos, L
-        )
-        assert ref.shape == eig.shape == (4, L)
-        torch.testing.assert_close(ref, eig, atol=1e-4, rtol=1e-4)
-
-    def test_gradient_matches_glottis(self):
-        """Backward pass: ∂loss/∂r must agree between the two implementations.
-
-        Exercised at BT=17 and L=4096 — realistic full-clip dimensions and the
-        regime where the eig formulation must be run in complex128 to keep
-        gradients clean (complex64 underflows on the ~1e-8 eigenvalue gaps the
-        near-symmetric waveguide geometry produces, giving NaN grads on some
-        frames). Tolerance is looser than forward since eig backward still has
-        more noise than the sequential path.
-        """
-        r0, r_L, r_R, r_N = self._realistic_coefs(BT=17, seed=0)
-        L = 4096
-        inject_pos = torch.zeros(17, dtype=torch.long)
-
-        def grad_of(impl):
-            r = r0.clone().requires_grad_(True)
-            ir = impl(r, r_L, r_R, r_N, _NOSE_R_CPU, True, inject_pos, L)
-            ir.pow(2).sum().backward()
-            return r.grad.clone()
-
-        g_ref = grad_of(_compute_batch_irs)
-        g_eig = grad_of(_compute_batch_irs_eig)
-
-        cos_sim = (g_ref * g_eig).sum() / (g_ref.norm() * g_eig.norm() + 1e-30)
-        rel_err = (g_ref - g_eig).norm() / (g_ref.norm() + 1e-30)
-        assert cos_sim > 0.999, f"cosine similarity {cos_sim:.4f} < 0.999"
-        assert rel_err < 0.05, f"relative L2 error {rel_err:.4f} > 0.05"
+    velum = torch.full((BT,), 0.01)  # closed-velum default
+    A_L = amplitude[:, ns]
+    A_R = amplitude[:, ns + 1]
+    A_N = velum**2
+    sum_A = A_L + A_R + A_N + 1e-10
+    r_L = (2 * A_L - sum_A) / sum_A
+    r_R = (2 * A_R - sum_A) / sum_A
+    r_N = (2 * A_N - sum_A) / sum_A
+    return r, r_L, r_R, r_N
 
 
 # ---------------------------------------------------------------------------
-# New API: control_rate, ir_impl, per-sample seeds
+# New API: control_rate, per-sample seeds
 # ---------------------------------------------------------------------------
 
 
@@ -570,30 +511,6 @@ class TestNewApi:
         assert out_125.shape == (1, T * spf_125)
         assert out_25.shape == (1, T * spf_25)
         assert spf_125 == 2 * spf_25
-
-    def test_ir_impl_toggle_matches(self):
-        """Sequential and eig IR impls agree within loose tolerance on a short clip."""
-        T = 2
-        B = 1
-        params = torch.zeros(B, T, N_PARAMS)
-        params[..., PARAM_NAMES.index("frequency")] = 140.0
-        params[..., PARAM_NAMES.index("voiceness")] = 0.6
-        params[..., PARAM_NAMES.index("intensity")] = 1.0
-        params[..., PARAM_NAMES.index("tongueIndex")] = 20.0
-        params[..., PARAM_NAMES.index("tongueDiameter")] = 2.4
-        params[..., PARAM_NAMES.index("tractLength")] = 44.0
-        params[..., PARAM_NAMES.index("constrictionIndex")] = 30.0
-        params[..., PARAM_NAMES.index("constrictionDiameter")] = 3.0
-        params[..., PARAM_NAMES.index("vibratoFrequency")] = 6.0
-
-        out_seq = pink_trombone_ola(params, seed=0, ir_length=256, ir_impl="sequential")
-        out_eig = pink_trombone_ola(params, seed=0, ir_length=256, ir_impl="eig")
-        # Skip the first OLA frame where edge effects dominate.
-        hop = SAMPLES_PER_FRAME
-        rel = (out_seq[:, hop:] - out_eig[:, hop:]).abs().mean() / (
-            out_seq[:, hop:].abs().mean() + 1e-10
-        )
-        assert rel.item() < 0.05
 
     def test_per_sample_seeds_differ(self):
         """Different per-batch seeds produce different simplex-noise-driven outputs."""
@@ -624,3 +541,53 @@ class TestNewApi:
         same_seeds = torch.tensor([3, 3], dtype=torch.long)
         out_same = pink_trombone_ola(params, seed=same_seeds, ir_length=64)
         assert torch.allclose(out_same[0], out_same[1], atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Batched-mask IR computation and vectorized OLA
+# ---------------------------------------------------------------------------
+
+
+class TestBatchedIrAndOla:
+    def test_mask_batched_irs_match_separate_calls(self):
+        """A [2*BT] bool-mask call must equal two scalar-mode calls."""
+        r, r_L, r_R, r_N = _realistic_coefs(BT=4, seed=2)
+        L = 256
+        inject_pos = torch.tensor([5, 12, 24, 35], dtype=torch.long)
+
+        h_g = _compute_batch_irs(r, r_L, r_R, r_N, _NOSE_R_CPU, True, inject_pos, L)
+        h_t = _compute_batch_irs(r, r_L, r_R, r_N, _NOSE_R_CPU, False, inject_pos, L)
+
+        mask = torch.tensor([True] * 4 + [False] * 4)
+        h_both = _compute_batch_irs(
+            torch.cat([r, r]),
+            torch.cat([r_L, r_L]),
+            torch.cat([r_R, r_R]),
+            torch.cat([r_N, r_N]),
+            _NOSE_R_CPU,
+            mask,
+            torch.cat([inject_pos, inject_pos]),
+            L,
+        )
+        torch.testing.assert_close(h_both[:4], h_g)
+        torch.testing.assert_close(h_both[4:], h_t)
+
+    def test_ola_convolve_matches_loop_reference(self):
+        """Vectorized OLA must match the per-frame loop it replaced."""
+        torch.manual_seed(0)
+        B, T, L, hop = 3, 7, 96, 64
+        source = torch.randn(B, T * hop)
+        h = torch.randn(B, T, L)
+
+        ref = torch.zeros(B, T * hop + L - 1)
+        h_flip = h.flip(-1)
+        for i in range(T):
+            seg = source[:, i * hop : (i + 1) * hop]
+            conv_out = torch.nn.functional.conv1d(
+                seg.unsqueeze(0), h_flip[:, i, :].unsqueeze(1), groups=B, padding=L - 1
+            ).squeeze(0)
+            ref[:, i * hop : i * hop + hop + L - 1] += conv_out
+        ref = ref[:, : T * hop]
+
+        out = _ola_convolve(source, h, hop)
+        torch.testing.assert_close(out, ref)

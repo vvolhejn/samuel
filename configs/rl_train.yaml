@@ -20,7 +20,6 @@ data:
 
 synth:
   ir_length: 256
-  ir_impl: sequential
 
 log:
   wandb_project: samuel-rl
