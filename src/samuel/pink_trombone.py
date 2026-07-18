@@ -463,7 +463,10 @@ def _compute_diameter_profile(
     new_diam = (c_diam - 0.3).clamp(min=0)  # [B, S, 1]
     diff = diameter - new_diam  # [B, S, N]
     new_diameter = new_diam + diff * scalar  # [B, S, N]
-    diameter = torch.where(diff > 0, new_diameter, diameter)
+    # Below -0.85 - noseOffset the constriction only opens the velum and does
+    # not touch the oral tract (Tract.js skips it) -> nasal vowels.
+    apply_c = c_diam >= -(0.85 + _NOSE_OFFSET)  # [B, S, 1]
+    diameter = torch.where((diff > 0) & apply_c, new_diameter, diameter)
 
     return diameter  # [B, S, N]
 

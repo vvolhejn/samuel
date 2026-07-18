@@ -28,7 +28,16 @@ _DEFAULT_PARAM_SPEC: dict[str, tuple[float, float, float]] = {
     "tongueIndex": (10.0, 35.0, 20.0),
     "tongueDiameter": (1.5, 3.5, 2.4),
     "constrictionIndex": (22.0, 44.0, 33.0),
-    "constrictionDiameter": (-0.5, 3.0, 1.25),
+    # constrictionDiameter controls the oral constriction and, past the nose
+    # start, the velum. Effect by interval (thresholds from pink_trombone.py):
+    #   < -1.65        : velum open, oral tract untouched      -> nasal vowels
+    #   [-1.65, -0.8)  : velum open, oral tract clamped shut   -> nasal consonants (m/n/ng)
+    #   [-0.8, 0.3]    : velum closed, full oral closure        -> oral stops (b/d/g, p/t/k)
+    #   (0.3, 0.7)     : narrow opening + turbulence injected   -> fricatives (s/f, ...)
+    #   >= 0.7         : wide opening, no turbulence; once the constriction
+    #                    exceeds the local rest diameter it has no effect
+    #                                                            -> approximants / open vowels
+    "constrictionDiameter": (-2.0, 3.0, 1.25),
 }
 _DEFAULT_FROZEN_VALUES: dict[str, float] = {
     "intensity": 1.0,
@@ -50,7 +59,7 @@ class PinkTromboneControllerConfig(BaseModel):
         default_factory=lambda: dict(_DEFAULT_FROZEN_VALUES)
     )
     samples_per_frame: int = 2048
-    n_buckets: int = 8
+    n_buckets: int = 32
 
     @property
     def frame_rate(self) -> float:
