@@ -933,12 +933,14 @@ def _compute_batch_irs_eig(
 #      constriction, so we add the transient excitation onto ``turb_source``
 #      and reuse the same per-frame IR. No extra OLA pass.
 #   5. Impulse shape: a fixed exponentially decaying kernel applied at audio
-#      rate. The JS used ``0.3 * (-2)^(t * 200)`` which is NaN/exploding for
-#      non-integer t — almost certainly a typo. We use a plain decay
-#      ``strength * exp(-t * decay_rate)``.
+#      rate. The original JS is ``0.3 * 2^(-200 * t)`` (5ms half-life). The
+#      modularized JS clone in Pink-Trombone/ has a sign typo,
+#      ``0.3 * (-2)^(t * 200)``, which is NaN for non-integer t; we mirror the
+#      original's intent as ``strength * 2^(-decay_rate * t)``.
 
 _TRANSIENT_KERNEL_LEN_SECONDS = 0.05  # 50ms covers the audible burst
-_TRANSIENT_DECAY_RATE = 200.0  # ~5ms time constant (matches JS exponent magnitude)
+# Base-2 decay so this matches the JS exactly: half-life = 1/decay_rate = 5ms.
+_TRANSIENT_DECAY_RATE = 200.0
 _TRANSIENT_STRENGTH = 0.3  # matches JS Transient.strength
 # Closure indicator: sigmoid(closure_k * (closure_threshold - min_diameter)).
 # Centered so that min_diameter == closure_threshold gives closure=0.5, with
@@ -957,10 +959,15 @@ def _make_transient_kernel(
     device: torch.device | None = None,
     dtype: torch.dtype = torch.float32,
 ) -> Tensor:
-    """Causal exponential transient kernel of shape [L]."""
+    """Causal exponential transient kernel of shape [L].
+
+    ``strength * 2^(-decay_rate * t)`` — base-2 to match the JS Transient
+    amplitude exactly (half-life ``1 / decay_rate``). Using ``exp`` here would
+    decay a factor ``ln 2`` faster (~1.4x) than the reference synth.
+    """
     L = int(round(duration_s * sample_rate))
     t = torch.arange(L, device=device, dtype=dtype) / sample_rate
-    return strength * torch.exp(-t * decay_rate)
+    return strength * torch.pow(2.0, -decay_rate * t)
 
 
 def compute_release_signal(
