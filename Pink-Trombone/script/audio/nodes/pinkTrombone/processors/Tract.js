@@ -204,7 +204,9 @@ class Tract {
     for (let index = this.transients.length - 1; index >= 0; index--) {
       const transient = this.transients[index];
 
-      this.left[transient.position] += transient.amplitude;
+      // Split the burst between both traveling waves, as in the original.
+      this.left[transient.position] += transient.amplitude / 2;
+      this.right[transient.position] += transient.amplitude / 2;
       transient.update(seconds);
 
       if (!transient.isAlive) this.transients.splice(index, 1);
@@ -461,6 +463,10 @@ class Tract {
   }
 
   _updateTract() {
+    // Recompute the obstruction from scratch each pass; without the reset a
+    // past closure sticks around forever and the release in
+    // _updateTransients can never fire.
+    this.transients.obstruction.new = -1;
     for (let index = 0; index < this.length; index++) {
       if (this.diameter[index] <= 0) {
         this.transients.obstruction.new = index;
@@ -469,12 +475,17 @@ class Tract {
   }
 
   _updateTransients(seconds) {
-    if (this.nose.amplitude[0] < 0.05) {
-      if (this.transients.obstruction.last > -1 && this.transients.obstruction.new == -1)
-        this.transients.push(new Transient(this.transients.obstruction.new, seconds));
+    // Closed last pass, open now => plosive release. The transient is placed
+    // at the position that *was* obstructed (obstruction.last); the nose gate
+    // suppresses the click when air can escape nasally.
+    if (
+      this.transients.obstruction.last > -1 &&
+      this.transients.obstruction.new == -1 &&
+      this.nose.amplitude[0] < 0.05
+    )
+      this.transients.push(new Transient(this.transients.obstruction.last, seconds));
 
-      this.transients.obstruction.last = this.transients.obstruction.new;
-    }
+    this.transients.obstruction.last = this.transients.obstruction.new;
   }
 
   _updateReflection() {

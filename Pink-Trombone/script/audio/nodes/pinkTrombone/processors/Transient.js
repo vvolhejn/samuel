@@ -11,7 +11,11 @@ class Transient {
     }
 
     get amplitude() {
-        return this.strength * Math.pow(-2, this.timeAlive * this.exponent);
+        // Exponential decay with a 1/exponent half-life (5ms). The original
+        // Pink Trombone computes strength * 2^(-exponent * timeAlive); writing
+        // pow(-2, timeAlive * exponent) instead returns NaN for non-integer
+        // exponents (negative base).
+        return this.strength * Math.pow(2, -this.exponent * this.timeAlive);
     }
 
     get isAlive() {
