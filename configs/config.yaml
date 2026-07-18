@@ -34,6 +34,13 @@ loss:
   # 4x window overlap (n_fft=2048, hop=samples_per_frame=512). Null falls
   # back to n_fft=samples_per_frame (no overlap).
   mfcc_n_fft: 2048
+  # SSL feature-matching (perceptual) loss. ssl=0 disables it and skips
+  # building the encoder. E.g. mfcc+ssl run: loss.ssl=1.0; ssl-only: loss.mfcc=0
+  # loss.ssl=1.0. Recommended entropy=0.1 for SSL runs (Gumbel-head stability).
+  ssl: 0.0
+  ssl_model: microsoft/wavlm-base-plus
+  ssl_layer: 6
+  ssl_distance: l1
 
 log:
   wandb_project: samuel
@@ -43,6 +50,9 @@ log:
   eval_every: 1000
   ckpt_every: 2000
   n_eval_clips: 100
+  # Eval-clip length (s). null -> match training (data.chunk_seconds). Set e.g.
+  # 10.0 for finer WER/CER and sustained-intelligibility measurement.
+  eval_chunk_seconds: null
   n_audio_samples: 10
   pitch_fmin: 70.0
   pitch_fmax: 500.0

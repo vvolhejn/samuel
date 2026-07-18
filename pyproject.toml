@@ -13,6 +13,7 @@ dependencies = [
     "faster-whisper>=1.0",
     "hydra-core>=1.3",
     "jiwer>=3.0",
+    "julius>=0.2.8",
     "librosa>=0.11.0",
     "numpy>=2.4.4",
     "plotly>=6.7.0",
@@ -21,6 +22,7 @@ dependencies = [
     "soundfile>=0.12",
     "torch==2.8.*",
     "tqdm>=4.67.3",
+    "transformers>=5.14.1",
     "wandb>=0.18",
 ]
 
