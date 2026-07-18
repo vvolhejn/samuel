@@ -398,7 +398,6 @@ def _run_eval_batched(
             params,
             seed=fixed_seed,
             ir_length=cfg.synth.ir_length,
-            ir_impl=cfg.synth.ir_impl,
             control_rate=frame_rate,
         )
         params_all.append(params)
@@ -686,7 +685,6 @@ def main(hydra_cfg: DictConfig) -> None:
         pred = pink_trombone_ola(
             params,
             ir_length=cfg.synth.ir_length,
-            ir_impl=cfg.synth.ir_impl,
             control_rate=frame_rate,
         )
         S = min(pred.shape[-1], target.shape[-1])
