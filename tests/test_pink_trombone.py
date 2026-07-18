@@ -11,6 +11,7 @@ from samuel.pink_trombone import (
     _NOSE_START,
     _TRACT_N,
     _compute_batch_irs,
+    _ola_convolve,
     _compute_batch_irs_eig,
     _compute_diameter_profile,
     _upsample_params,
@@ -624,3 +625,54 @@ class TestNewApi:
         same_seeds = torch.tensor([3, 3], dtype=torch.long)
         out_same = pink_trombone_ola(params, seed=same_seeds, ir_length=64)
         assert torch.allclose(out_same[0], out_same[1], atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Batched-mask IR computation and vectorized OLA
+# ---------------------------------------------------------------------------
+
+
+class TestBatchedIrAndOla:
+    def test_mask_batched_irs_match_separate_calls(self):
+        """A [2*BT] bool-mask call must equal two scalar-mode calls."""
+        helper = TestComputeBatchIrsEig()
+        r, r_L, r_R, r_N = helper._realistic_coefs(BT=4, seed=2)
+        L = 256
+        inject_pos = torch.tensor([5, 12, 24, 35], dtype=torch.long)
+
+        h_g = _compute_batch_irs(r, r_L, r_R, r_N, _NOSE_R_CPU, True, inject_pos, L)
+        h_t = _compute_batch_irs(r, r_L, r_R, r_N, _NOSE_R_CPU, False, inject_pos, L)
+
+        mask = torch.tensor([True] * 4 + [False] * 4)
+        h_both = _compute_batch_irs(
+            torch.cat([r, r]),
+            torch.cat([r_L, r_L]),
+            torch.cat([r_R, r_R]),
+            torch.cat([r_N, r_N]),
+            _NOSE_R_CPU,
+            mask,
+            torch.cat([inject_pos, inject_pos]),
+            L,
+        )
+        torch.testing.assert_close(h_both[:4], h_g)
+        torch.testing.assert_close(h_both[4:], h_t)
+
+    def test_ola_convolve_matches_loop_reference(self):
+        """Vectorized OLA must match the per-frame loop it replaced."""
+        torch.manual_seed(0)
+        B, T, L, hop = 3, 7, 96, 64
+        source = torch.randn(B, T * hop)
+        h = torch.randn(B, T, L)
+
+        ref = torch.zeros(B, T * hop + L - 1)
+        h_flip = h.flip(-1)
+        for i in range(T):
+            seg = source[:, i * hop : (i + 1) * hop]
+            conv_out = torch.nn.functional.conv1d(
+                seg.unsqueeze(0), h_flip[:, i, :].unsqueeze(1), groups=B, padding=L - 1
+            ).squeeze(0)
+            ref[:, i * hop : i * hop + hop + L - 1] += conv_out
+        ref = ref[:, : T * hop]
+
+        out = _ola_convolve(source, h, hop)
+        torch.testing.assert_close(out, ref)

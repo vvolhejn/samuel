@@ -645,14 +645,31 @@ def _tract(
 # ---------------------------------------------------------------------------
 
 
+_COMPILED_WAVEGUIDE_STEP: dict[str, object] = {}
+
+
+def _waveguide_step_for(device: torch.device):
+    """``_waveguide_step``, ``torch.compile``'d on CUDA.
+
+    Eager, each step launches ~35 tiny kernels, so the L-step IR loop is
+    kernel-launch-bound; fusing the pointwise ops makes it ~10x faster.
+    CPU keeps the eager version (compile warmup would dominate test runs).
+    """
+    if device.type != "cuda":
+        return _waveguide_step
+    if "cuda" not in _COMPILED_WAVEGUIDE_STEP:
+        _COMPILED_WAVEGUIDE_STEP["cuda"] = torch.compile(_waveguide_step, dynamic=False)
+    return _COMPILED_WAVEGUIDE_STEP["cuda"]
+
+
 def _compute_batch_irs(
     r: Tensor,  # [BT, N]
     r_L: Tensor,  # [BT]
     r_R: Tensor,  # [BT]
     r_N: Tensor,  # [BT]
     nose_r: Tensor,  # [M]
-    inject_glottis: bool,
-    inject_pos: Tensor,  # [BT] long  (tube index; used when inject_glottis=False)
+    inject_glottis: bool | Tensor,
+    inject_pos: Tensor,  # [BT] long  (tube index; used where inject_glottis is False)
     L: int,
 ) -> Tensor:  # [BT, L]
     """Compute impulse responses for a batch of waveguide configurations.
@@ -660,6 +677,10 @@ def _compute_batch_irs(
     Each entry starts from zero state.  At step 0 a unit impulse is injected
     either at the glottis or at a tube position (turbulence IR).  Uses the
     same double-pass structure as ``_tract``.
+
+    ``inject_glottis`` is a scalar bool (one injection mode for the whole
+    batch) or a ``[BT]`` bool tensor selecting the mode per row, which lets
+    the glottis and turbulence IRs share a single sequential loop.
     """
     BT = r.shape[0]
     N = r.shape[1]
@@ -677,24 +698,32 @@ def _compute_batch_irs(
     zeros_turb = torch.zeros(BT, N, device=device, dtype=dtype)
     ones_B = torch.ones(BT, device=device, dtype=dtype)
 
-    # Pre-build turbulence impulse (one-hot at inject_pos)
-    if inject_glottis:
-        turb_impulse = zeros_turb
+    # Step-0 impulses: glottis rows get a unit glottis input, the rest get a
+    # one-hot turbulence injection at inject_pos.
+    if isinstance(inject_glottis, Tensor):
+        glottis_impulse = inject_glottis.to(dtype)  # [BT]
     else:
-        turb_impulse = torch.zeros(BT, N, device=device, dtype=dtype)
-        turb_impulse.scatter_(1, inject_pos.clamp(0, N - 1).unsqueeze(1), 1.0)
+        glottis_impulse = ones_B if inject_glottis else zeros_B
+    turb_impulse = torch.zeros(BT, N, device=device, dtype=dtype)
+    turb_impulse.scatter_(
+        1,
+        inject_pos.clamp(0, N - 1).unsqueeze(1),
+        (1.0 - glottis_impulse).unsqueeze(1),
+    )
+
+    step_fn = _waveguide_step_for(device)
 
     outputs: list[Tensor] = []
     for s in range(L):
         if s == 0:
-            glottis_s = ones_B if inject_glottis else zeros_B
-            turb_s = zeros_turb if inject_glottis else turb_impulse
+            glottis_s = glottis_impulse
+            turb_s = turb_impulse
         else:
             glottis_s = zeros_B
             turb_s = zeros_turb
 
         # Double pass — matches _tract
-        right, left, nose_right, nose_left, out1 = _waveguide_step(
+        right, left, nose_right, nose_left, out1 = step_fn(
             right,
             left,
             nose_right,
@@ -710,7 +739,7 @@ def _compute_batch_irs(
             M,
             ns,
         )
-        right, left, nose_right, nose_left, out2 = _waveguide_step(
+        right, left, nose_right, nose_left, out2 = step_fn(
             right,
             left,
             nose_right,
@@ -924,29 +953,28 @@ def _ola_convolve(source: Tensor, h: Tensor, hop: int) -> Tensor:
     L = h.shape[2]
     device = source.device
 
-    output = torch.zeros(B, S + L - 1, device=device, dtype=source.dtype)
-
+    # All T per-frame convolutions in one grouped conv1d call:
+    # input [1, B*T, hop] × weight [B*T, 1, L] with groups=B*T → [B*T, hop+L-1]
+    src = source[:, : T * hop]
+    if src.shape[1] < T * hop:
+        src = F.pad(src, (0, T * hop - src.shape[1]))
+    frames = src.reshape(B * T, hop)
     # Flip: conv1d does cross-correlation; flip gives causal convolution
-    h_flip = h.flip(-1)  # [B, T, L]
+    h_flip = h.reshape(B * T, 1, L).flip(-1)
+    conv = F.conv1d(frames.unsqueeze(0), h_flip, groups=B * T, padding=L - 1).view(
+        B, T, hop + L - 1
+    )
 
-    for i in range(T):
-        start = i * hop
-        end = min(start + hop, S)
-        seg = source[:, start:end]
-        if seg.shape[1] < hop:
-            seg = F.pad(seg, (0, hop - seg.shape[1]))
+    # Overlap-add: frame i lands at offset i*hop. scatter_add_ accumulates
+    # duplicate positions, so any L (even > hop) overlaps correctly.
+    idx = torch.arange(T, device=device).unsqueeze(1) * hop + torch.arange(
+        hop + L - 1, device=device
+    )  # [T, hop+L-1]
+    output = torch.zeros(B, T * hop + L - 1, device=device, dtype=source.dtype)
+    output.scatter_add_(1, idx.reshape(1, -1).expand(B, -1), conv.reshape(B, -1))
 
-        # Per-batch-item linear convolution via grouped conv1d
-        # input [1, B, hop] × weight [B, 1, L] with groups=B → [B, hop+L-1]
-        conv_out = F.conv1d(
-            seg.unsqueeze(0),
-            h_flip[:, i, :].unsqueeze(1),
-            groups=B,
-            padding=L - 1,
-        ).squeeze(0)  # [B, hop + L - 1]
-
-        output[:, start : start + hop + L - 1] += conv_out
-
+    if output.shape[1] < S:
+        output = F.pad(output, (0, S - output.shape[1]))
     return output[:, :S]
 
 
@@ -1023,27 +1051,44 @@ def _tract_ola(
 
     nose_r = _NOSE_R_CPU.to(device=device, dtype=dtype)
 
-    _ir_fn = _compute_batch_irs_eig if ir_impl == "eig" else _compute_batch_irs
-    h_glottis_flat = _ir_fn(
-        r_flat,
-        r_L_flat,
-        r_R_flat,
-        r_N_flat,
-        nose_r,
-        inject_glottis=True,
-        inject_pos=ci_flat,
-        L=ir_length,
-    )  # [BT, L]
-    h_turb_flat = _ir_fn(
-        r_flat,
-        r_L_flat,
-        r_R_flat,
-        r_N_flat,
-        nose_r,
-        inject_glottis=False,
-        inject_pos=ci_flat,
-        L=ir_length,
-    )  # [BT, L]
+    if ir_impl == "sequential":
+        # One batched call for both IR sets — rows [0, BT) inject at the
+        # glottis, rows [BT, 2BT) inject turbulence — so the L-step
+        # sequential loop runs once instead of twice.
+        mask = torch.zeros(2 * BT, dtype=torch.bool, device=device)
+        mask[:BT] = True
+        h_both = _compute_batch_irs(
+            torch.cat([r_flat, r_flat], dim=0),
+            torch.cat([r_L_flat, r_L_flat], dim=0),
+            torch.cat([r_R_flat, r_R_flat], dim=0),
+            torch.cat([r_N_flat, r_N_flat], dim=0),
+            nose_r,
+            inject_glottis=mask,
+            inject_pos=torch.cat([ci_flat, ci_flat], dim=0),
+            L=ir_length,
+        )  # [2*BT, L]
+        h_glottis_flat, h_turb_flat = h_both[:BT], h_both[BT:]
+    else:
+        h_glottis_flat = _compute_batch_irs_eig(
+            r_flat,
+            r_L_flat,
+            r_R_flat,
+            r_N_flat,
+            nose_r,
+            inject_glottis=True,
+            inject_pos=ci_flat,
+            L=ir_length,
+        )  # [BT, L]
+        h_turb_flat = _compute_batch_irs_eig(
+            r_flat,
+            r_L_flat,
+            r_R_flat,
+            r_N_flat,
+            nose_r,
+            inject_glottis=False,
+            inject_pos=ci_flat,
+            L=ir_length,
+        )  # [BT, L]
 
     h_glottis = h_glottis_flat.reshape(B, T, ir_length)
     h_turb = h_turb_flat.reshape(B, T, ir_length)
