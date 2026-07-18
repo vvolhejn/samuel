@@ -595,18 +595,13 @@ def main(hydra_cfg: DictConfig) -> None:
 
     # Data
     loader = build_dataloader(
-        manifest_path=cfg.data.manifest_path,
+        cfg.data,
         batch_size=cfg.batch_size,
-        num_workers=cfg.data.num_workers,
-        sample_rate=cfg.data.sample_rate,
-        chunk_seconds=cfg.data.chunk_seconds,
         rank=rank,
         world_size=world_size,
         epoch=0,
         seed=cfg.run.seed,
-        pitch_cache_path=cfg.data.pitch_cache_path,
         samples_per_frame=samples_per_frame,
-        val_fraction=cfg.data.val_fraction,
     )
 
     # Eval setup (rank 0 only): preloads the fixed val-clip tensors + ASR model.

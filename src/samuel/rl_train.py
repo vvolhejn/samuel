@@ -56,18 +56,13 @@ def main(hydra_cfg: DictConfig) -> None:
 
     # Data
     _loader = build_dataloader(
-        manifest_path=cfg.data.manifest_path,
+        cfg.data,
         batch_size=cfg.batch_size,
-        num_workers=cfg.data.num_workers,
-        sample_rate=cfg.data.sample_rate,
-        chunk_seconds=cfg.data.chunk_seconds,
         rank=0,
         world_size=1,
         epoch=0,
         seed=cfg.run.seed,
-        pitch_cache_path=cfg.data.pitch_cache_path,
         samples_per_frame=samples_per_frame,
-        val_fraction=cfg.data.val_fraction,
     )
 
     _whisper = WhisperEvaluator(

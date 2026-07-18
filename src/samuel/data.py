@@ -19,6 +19,8 @@ import torch
 from pydantic import BaseModel, ConfigDict
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
+from samuel.config import DataConfig
+
 
 class DatasetFile(BaseModel):
     path: Path
@@ -263,38 +265,34 @@ class LibriLightChunks(IterableDataset):
 
 
 def build_dataloader(
-    manifest_path: Path,
+    cfg: DataConfig,
+    *,
     batch_size: int,
-    num_workers: int = 4,
-    sample_rate: int = 44100,
-    chunk_seconds: float = 4.0,
     rank: int = 0,
     world_size: int = 1,
     epoch: int = 0,
     seed: int = 0,
     drop_last: bool = True,
     pin_memory: bool = True,
-    pitch_cache_path: Path | None = None,
     samples_per_frame: int | None = None,
-    val_fraction: float = 0.0,
 ) -> DataLoader:
     dataset = LibriLightChunks(
-        manifest_path=manifest_path,
-        sample_rate=sample_rate,
-        chunk_seconds=chunk_seconds,
+        manifest_path=cfg.manifest_path,
+        sample_rate=cfg.sample_rate,
+        chunk_seconds=cfg.chunk_seconds,
         rank=rank,
         world_size=world_size,
         epoch=epoch,
         seed=seed,
         drop_last=drop_last,
-        pitch_cache_path=pitch_cache_path,
+        pitch_cache_path=cfg.pitch_cache_path,
         samples_per_frame=samples_per_frame,
-        val_fraction=val_fraction,
+        val_fraction=cfg.val_fraction,
     )
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        num_workers=num_workers,
+        num_workers=cfg.num_workers,
         pin_memory=pin_memory,
         drop_last=True,
     )
