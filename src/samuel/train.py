@@ -45,6 +45,7 @@ from samuel.evals.pitch import pitch_mae_cents
 from samuel.losses import MelSpecLoss, MFCCLoss, MultiScaleLogMagSTFTLoss
 from samuel.model import PinkTromboneController
 from samuel.pink_trombone import PARAM_NAMES, pink_trombone_ola
+from samuel.ssl_loss import SSLFeatureLoss
 
 
 class CombinedReconLoss(nn.Module):
@@ -240,7 +241,8 @@ def _eval_setup(
     """
     files = load_manifest(cfg.data.manifest_path)
     _, val_files = split_train_val(files, cfg.data.val_fraction)
-    chunk_samples = int(round(cfg.data.sample_rate * cfg.data.chunk_seconds))
+    eval_chunk_seconds = cfg.log.eval_chunk_seconds or cfg.data.chunk_seconds
+    chunk_samples = int(round(cfg.data.sample_rate * eval_chunk_seconds))
     # Round chunk_samples down to a multiple of samples_per_frame so eval and
     # training use the same alignment.
     chunk_samples = (chunk_samples // samples_per_frame) * samples_per_frame
@@ -564,20 +566,35 @@ def main(hydra_cfg: DictConfig) -> None:
     model = PinkTromboneController(cfg.model).to(device)
     frame_rate = cfg.model.frame_rate
     samples_per_frame = cfg.model.samples_per_frame
-    loss_fn = CombinedReconLoss(
-        [
-            (
-                "mfcc",
-                cfg.loss.mfcc,
-                MFCCLoss(
-                    samples_per_frame=samples_per_frame,
-                    n_fft=cfg.loss.mfcc_n_fft,
-                ),
+    loss_components: list[tuple[str, float, nn.Module]] = [
+        (
+            "mfcc",
+            cfg.loss.mfcc,
+            MFCCLoss(
+                samples_per_frame=samples_per_frame,
+                n_fft=cfg.loss.mfcc_n_fft,
             ),
-            ("mel", cfg.loss.mel, MelSpecLoss(samples_per_frame=samples_per_frame)),
-            ("stft", cfg.loss.stft, MultiScaleLogMagSTFTLoss()),
-        ]
-    ).to(device)
+        ),
+        ("mel", cfg.loss.mel, MelSpecLoss(samples_per_frame=samples_per_frame)),
+        ("stft", cfg.loss.stft, MultiScaleLogMagSTFTLoss()),
+    ]
+    # Only build the SSL encoder when it's actually weighted — CombinedReconLoss
+    # evaluates every component each step (for logging), so a zero-weight SSL
+    # entry would run the encoder for nothing.
+    if cfg.loss.ssl != 0.0:
+        loss_components.append(
+            (
+                "ssl",
+                cfg.loss.ssl,
+                SSLFeatureLoss(
+                    model_name=cfg.loss.ssl_model,
+                    layer=cfg.loss.ssl_layer,
+                    distance=cfg.loss.ssl_distance,
+                    source_sr=cfg.data.sample_rate,
+                ),
+            )
+        )
+    loss_fn = CombinedReconLoss(loss_components).to(device)
 
     ddp_module: nn.Module
     if is_ddp:

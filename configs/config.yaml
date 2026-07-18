@@ -30,10 +30,17 @@ loss:
   mfcc: 1.0
   mel: 0.0
   stft: 0.0
-  entropy: 0.01    # encourage softmax(logits) to stay near uniform
+  entropy: 0.1    # encourage softmax(logits) to stay near uniform
   # 4x window overlap (n_fft=2048, hop=samples_per_frame=512). Null falls
   # back to n_fft=samples_per_frame (no overlap).
   mfcc_n_fft: 2048
+  # SSL feature-matching (perceptual) loss
+  ssl: 0.0
+  # HF id. Others tried: facebook/hubert-base-ls960,
+  # facebook/wav2vec2-base-960h, unclear which wins
+  ssl_model: microsoft/wavlm-base-plus
+  ssl_layer: 6
+  ssl_distance: L1  # L1 | L2 | cosine
 
 log:
   wandb_project: samuel
@@ -43,6 +50,9 @@ log:
   eval_every: 1000
   ckpt_every: 2000
   n_eval_clips: 100
+  # Eval-clip length (s). null -> match training (data.chunk_seconds). Set e.g.
+  # 10.0 for finer WER/CER and sustained-intelligibility measurement.
+  eval_chunk_seconds: null
   n_audio_samples: 10
   pitch_fmin: 70.0
   pitch_fmax: 500.0
