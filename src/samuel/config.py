@@ -149,3 +149,33 @@ class TrainConfig(BaseModel):
         data = OmegaConf.to_container(cfg, resolve=True)
         assert isinstance(data, dict)
         return cls.model_validate(data)
+
+
+class RLConfig(BaseModel):
+    """Top-level schema for RL post-training (``rl_train.py``).
+
+    Deliberately separate from ``TrainConfig``: RL uses rewards rather than
+    the supervised reconstruction ``loss``/``optim`` blocks, so those are
+    omitted here. The data/model/synth/log building blocks are shared.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    run: RunConfig
+    data: DataConfig
+    model: PinkTromboneControllerConfig = Field(
+        default_factory=PinkTromboneControllerConfig
+    )
+    synth: SynthConfig = Field(default_factory=SynthConfig)
+    log: LogConfig = Field(default_factory=LogConfig)
+    batch_size: int = 8
+    # Warm-start weights. Either a local path to a ``.pt`` checkpoint or a
+    # wandb artifact reference (``entity/project/name:alias``). None starts
+    # from a freshly initialised model.
+    checkpoint: str | None = None
+
+    @classmethod
+    def from_hydra(cls, cfg: DictConfig) -> "RLConfig":
+        data = OmegaConf.to_container(cfg, resolve=True)
+        assert isinstance(data, dict)
+        return cls.model_validate(data)

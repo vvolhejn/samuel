@@ -1,0 +1,40 @@
+defaults:
+  - model
+  - _self_
+
+batch_size: 96
+
+# Warm-start weights for post-training. Local ``.pt`` path or a wandb artifact
+# reference (``entity/project/name:alias``). This is run i30dfe0t
+# (onset-off_20260527-193518); a local copy also lives at
+# runs/onset-off_20260527-193518/checkpoints/last.pt.
+checkpoint: moboehle-kyutai/samuel/onset-off_20260527-193518-checkpoint:latest
+
+data:
+  manifest_path: manifests/librilight_1000h.jsonl
+  pitch_cache_path: manifests/pitch_cache/librilight_1000h_spf512.npz
+  sample_rate: 44100
+  chunk_seconds: 4.0
+  num_workers: 4
+  val_fraction: 0.05
+
+synth:
+  ir_length: 256
+  ir_impl: sequential
+
+log:
+  wandb_project: samuel-rl
+  wandb_entity: moboehle-kyutai
+  wandb_mode: online
+
+run:
+  runs_root: runs-rl
+  name: ???
+  seed: 0
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    chdir: false
