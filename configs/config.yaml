@@ -14,7 +14,6 @@ data:
 
 synth:
   ir_length: 256
-  ir_impl: sequential
 
 optim:
   lr: 3.0e-4

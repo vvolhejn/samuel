@@ -67,7 +67,6 @@ class SynthConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     ir_length: int = 256
-    ir_impl: Literal["eig", "sequential"] = "eig"
     # frame_rate is the parameter control rate; lives on the model config
     # (it drives T_ctrl) but the synth path reads it from the same field.
 
