@@ -1,5 +1,6 @@
 """Differentiable Pink Trombone vocal synthesizer in PyTorch."""
 
+import functools
 import math
 from typing import Literal
 
@@ -645,21 +646,17 @@ def _tract(
 # ---------------------------------------------------------------------------
 
 
-_COMPILED_WAVEGUIDE_STEP: dict[str, object] = {}
-
-
-def _waveguide_step_for(device: torch.device):
+@functools.cache
+def _waveguide_step_for(device_type: str):
     """``_waveguide_step``, ``torch.compile``'d on CUDA.
 
     Eager, each step launches ~35 tiny kernels, so the L-step IR loop is
     kernel-launch-bound; fusing the pointwise ops makes it ~10x faster.
     CPU keeps the eager version (compile warmup would dominate test runs).
     """
-    if device.type != "cuda":
+    if device_type != "cuda":
         return _waveguide_step
-    if "cuda" not in _COMPILED_WAVEGUIDE_STEP:
-        _COMPILED_WAVEGUIDE_STEP["cuda"] = torch.compile(_waveguide_step, dynamic=False)
-    return _COMPILED_WAVEGUIDE_STEP["cuda"]
+    return torch.compile(_waveguide_step, dynamic=False)
 
 
 def _compute_batch_irs(
@@ -711,7 +708,7 @@ def _compute_batch_irs(
         (1.0 - glottis_impulse).unsqueeze(1),
     )
 
-    step_fn = _waveguide_step_for(device)
+    step_fn = _waveguide_step_for(device.type)
 
     outputs: list[Tensor] = []
     for s in range(L):
