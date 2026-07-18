@@ -5,6 +5,7 @@ from typing import Literal
 
 import torch
 import torch.nn.functional as F
+from einops import rearrange, repeat
 from torch import Tensor
 
 SAMPLE_RATE = 44100
@@ -205,9 +206,12 @@ def _upsample_params(
         return params.expand(B, T_samples, P)
     # F.interpolate wants [B, C, L]
     up = F.interpolate(
-        params.permute(0, 2, 1), size=T_samples, mode="linear", align_corners=True
+        rearrange(params, "b t p -> b p t"),
+        size=T_samples,
+        mode="linear",
+        align_corners=True,
     )
-    return up.permute(0, 2, 1)
+    return rearrange(up, "b p t -> b t p")
 
 
 def _samples_per_frame(control_rate: float) -> int:
@@ -394,7 +398,7 @@ def _compute_diameter_profile(
             j < (12.0 / 44) * N, torch.full_like(j, 1.1), torch.full_like(j, 1.5)
         ),
     )  # [N]
-    diameter = base.unsqueeze(0).unsqueeze(0).expand(B, S, N).contiguous()
+    diameter = repeat(base, "n -> b s n", b=B, s=S)
 
     # 2. Tongue shape (blade_start:lip_start)
     L = lip - blade
@@ -779,16 +783,16 @@ def _compute_batch_irs_eig(
     #   [2N+M, d)      -> nose_left
     eye = torch.eye(d, device=device, dtype=dtype)  # [d, d]
     # Expand to batch BT*d: for each frame i, rows (i*d + j) test basis state e_j.
-    eye_rep = eye.unsqueeze(0).expand(BT, d, d).reshape(BT * d, d)
+    eye_rep = repeat(eye, "i j -> (bt i) j", bt=BT)
     r0 = eye_rep[:, :N]
     l0 = eye_rep[:, N : 2 * N]
     nr0 = eye_rep[:, 2 * N : 2 * N + M]
     nl0 = eye_rep[:, 2 * N + M :]
 
-    r_rep = r.repeat_interleave(d, dim=0)  # [BT*d, N]
-    r_L_rep = r_L.repeat_interleave(d)
-    r_R_rep = r_R.repeat_interleave(d)
-    r_N_rep = r_N.repeat_interleave(d)
+    r_rep = repeat(r, "bt n -> (bt d) n", d=d)
+    r_L_rep = repeat(r_L, "bt -> (bt d)", d=d)
+    r_R_rep = repeat(r_R, "bt -> (bt d)", d=d)
+    r_N_rep = repeat(r_N, "bt -> (bt d)", d=d)
     zero_g_bd = torch.zeros(BT * d, device=device, dtype=dtype)
     zero_t_bd = torch.zeros(BT * d, N, device=device, dtype=dtype)
 
@@ -810,7 +814,7 @@ def _compute_batch_irs_eig(
     )
     # Row (i*d + j) holds A_step[i] @ e_j, i.e., column j of A_step[i].
     out_cat = torch.cat([r_a, l_a, nr_a, nl_a], dim=-1)  # [BT*d, d]
-    A_step = out_cat.reshape(BT, d, d).transpose(-1, -2)  # [BT, d, d]
+    A_step = rearrange(out_cat, "(bt col) row -> bt row col", col=d)  # [BT, d, d]
 
     # --- Step 2: probe b_glottis (state=0, glottis_s=1, turb=0) ---
     z_N = torch.zeros(BT, N, device=device, dtype=dtype)
@@ -888,7 +892,7 @@ def _compute_batch_irs_eig(
         return ir_0.unsqueeze(-1)
 
     # For s ≥ 1: ir[s] = c̃ᵀ A_full^{s-1} b_full, where c̃ = (A_step + A_full)ᵀ c.
-    c_col = c.view(1, d, 1).expand(BT, d, 1)  # [BT, d, 1]
+    c_col = repeat(c, "d -> bt d 1", bt=BT)  # [BT, d, 1]
     c_tilde = ((A_step + A_full).transpose(-1, -2) @ c_col).squeeze(-1)  # [BT, d]
 
     # --- Step 5: eigendecomposition and closed-form IR (complex128) ---

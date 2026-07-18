@@ -14,6 +14,7 @@ import math
 
 import torch
 import torch.nn.functional as F
+from einops import rearrange, repeat
 from pydantic import BaseModel, ConfigDict, Field
 from torch import Tensor, nn
 
@@ -176,9 +177,10 @@ class PinkTromboneController(nn.Module):
         if z.shape[-1] != T_ctrl:
             z = F.interpolate(z, size=T_ctrl, mode="linear", align_corners=True)
 
-        n_trainable = self.bucket_centers.shape[0]
-        logits = self.head(z.transpose(1, 2)).float()  # [B, T_ctrl, n_t*n_b]
-        logits = logits.view(B, T_ctrl, n_trainable, self.n_buckets)
+        logits = self.head(
+            rearrange(z, "b d t -> b t d")
+        ).float()  # [B, T_ctrl, n_t*n_b]
+        logits = rearrange(logits, "b t (p k) -> b t p k", k=self.n_buckets)
 
         if self.training:
             # hard=False: the forward output is the soft Gumbel-softmax
@@ -197,12 +199,12 @@ class PinkTromboneController(nn.Module):
         out = torch.zeros(
             B, T_ctrl, N_PARAMS, device=wav.device, dtype=constrained.dtype
         )
-        train_idx = self._trainable_idx.view(1, 1, -1).expand(B, T_ctrl, -1)
+        train_idx = repeat(self._trainable_idx, "p -> b t p", b=B, t=T_ctrl)
         out = out.scatter(2, train_idx, constrained)
 
         if self._frozen_idx.numel() > 0:
-            frozen_idx = self._frozen_idx.view(1, 1, -1).expand(B, T_ctrl, -1)
-            frozen_vals = self._frozen_vals.view(1, 1, -1).expand(B, T_ctrl, -1)
+            frozen_idx = repeat(self._frozen_idx, "p -> b t p", b=B, t=T_ctrl)
+            frozen_vals = repeat(self._frozen_vals, "p -> b t p", b=B, t=T_ctrl)
             out = out.scatter(2, frozen_idx, frozen_vals.to(out.dtype))
 
         freq_idx = torch.full(
