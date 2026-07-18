@@ -20,6 +20,7 @@ from pathlib import Path
 
 import hydra
 import numpy as np
+from einops import rearrange
 import plotly.graph_objects as go
 import torch
 import torch.distributed as dist
@@ -197,14 +198,13 @@ def _controller_diagnostics(
 
 def _volume_match(pred: torch.Tensor, target: torch.Tensor, hop: int) -> torch.Tensor:
     """Per-frame RMS-match ``pred`` to ``target``. Both ``[B, S]``, S a multiple of hop."""
-    B = pred.shape[0]
     T = pred.shape[-1] // hop
-    pred_f = pred[..., : T * hop].view(B, T, hop)
-    tgt_f = target[..., : T * hop].view(B, T, hop)
+    pred_f = rearrange(pred[..., : T * hop], "b (t h) -> b t h", h=hop)
+    tgt_f = rearrange(target[..., : T * hop], "b (t h) -> b t h", h=hop)
     pred_rms = pred_f.pow(2).mean(-1).clamp_min(1e-12).sqrt()
     tgt_rms = tgt_f.pow(2).mean(-1).clamp_min(1e-12).sqrt()
     gain = (tgt_rms / pred_rms).unsqueeze(-1)
-    return (pred_f * gain).reshape(B, T * hop)
+    return rearrange(pred_f * gain, "b t h -> b (t h)")
 
 
 @dataclass

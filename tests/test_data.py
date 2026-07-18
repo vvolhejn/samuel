@@ -53,8 +53,10 @@ class TestLibriLightChunks:
         )
         chunks = list(ds)
         expected_samples = int(round(44100 * 0.5))
-        assert all(c.shape == (expected_samples,) for c in chunks)
-        assert all(c.dtype == torch.float32 for c in chunks)
+        # No pitch cache configured, so chunks are audio-only dicts.
+        assert all(set(c.keys()) == {"audio"} for c in chunks)
+        assert all(c["audio"].shape == (expected_samples,) for c in chunks)
+        assert all(c["audio"].dtype == torch.float32 for c in chunks)
         # 1.5 s / 0.5 s = 3 chunks per file, 2 files -> 6 chunks
         assert len(chunks) == 6
 

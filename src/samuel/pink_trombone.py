@@ -5,6 +5,7 @@ import math
 
 import torch
 import torch.nn.functional as F
+from einops import rearrange, repeat
 from torch import Tensor
 
 SAMPLE_RATE = 44100
@@ -205,9 +206,12 @@ def _upsample_params(
         return params.expand(B, T_samples, P)
     # F.interpolate wants [B, C, L]
     up = F.interpolate(
-        params.permute(0, 2, 1), size=T_samples, mode="linear", align_corners=True
+        rearrange(params, "b t p -> b p t"),
+        size=T_samples,
+        mode="linear",
+        align_corners=True,
     )
-    return up.permute(0, 2, 1)
+    return rearrange(up, "b p t -> b t p")
 
 
 def _samples_per_frame(control_rate: float) -> int:
@@ -394,7 +398,7 @@ def _compute_diameter_profile(
             j < (12.0 / 44) * N, torch.full_like(j, 1.1), torch.full_like(j, 1.5)
         ),
     )  # [N]
-    diameter = base.unsqueeze(0).unsqueeze(0).expand(B, S, N).contiguous()
+    diameter = repeat(base, "n -> b s n", b=B, s=S)
 
     # 2. Tongue shape (blade_start:lip_start)
     L = lip - blade
