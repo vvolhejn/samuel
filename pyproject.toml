@@ -26,6 +26,12 @@ dependencies = [
     "wandb>=0.18",
 ]
 
+[project.optional-dependencies]
+server = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+]
+
 [project.scripts]
 samuel = "samuel:main"
 

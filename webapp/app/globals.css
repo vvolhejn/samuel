@@ -1,0 +1,35 @@
+@import "tailwindcss";
+
+/* Light theme; highlight pink matches maps.vvolhejn.com (Tailwind fuchsia). */
+:root {
+  --background: #ffffff;
+  --foreground: #1c1520;
+  color-scheme: light;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: "Helvetica Neue", Helvetica, Arial, Roboto, "Noto Sans",
+    sans-serif;
+  --font-display: var(--font-montreuil-play);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: "Helvetica Neue", Helvetica, Arial, Roboto, "Noto Sans",
+    sans-serif;
+}
+
+.font-display {
+  font-family: var(--font-montreuil-play), system-ui, sans-serif;
+}
+
+/* Pink Trombone: show only the animated tract, not the manual glottis pad
+   or the touch buttons. !important because the UI sets inline display
+   styles when showing/hiding. */
+pink-trombone #glottisUI,
+pink-trombone #buttonsUI {
+  display: none !important;
+}
