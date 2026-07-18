@@ -38,9 +38,11 @@ loss:
   # building the encoder. E.g. mfcc+ssl run: loss.ssl=1.0; ssl-only: loss.mfcc=0
   # loss.ssl=1.0. Recommended entropy=0.1 for SSL runs (Gumbel-head stability).
   ssl: 0.0
+  # HF id. Others tried: facebook/hubert-base-ls960,
+  # facebook/wav2vec2-base-960h (wavlm won; wav2vec2 needs entropy>=0.1).
   ssl_model: microsoft/wavlm-base-plus
   ssl_layer: 6
-  ssl_distance: l1
+  ssl_distance: L1  # L1 | L2 | cosine
 
 log:
   wandb_project: samuel

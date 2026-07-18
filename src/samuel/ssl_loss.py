@@ -38,7 +38,7 @@ class SSLFeatureLoss(nn.Module):
             output; ``1..N`` are transformer layer outputs. Mid layers (~6-9 for
             base models) are the most phonetic; the last layer drifts toward the
             pretraining objective. Pass ``-1`` for the last layer.
-        distance: ``"l1"`` (default), ``"l2"``, or ``"cosine"``.
+        distance: ``"L1"`` (default), ``"L2"``, or ``"cosine"``.
         source_sr: Sample rate of the waveforms handed to ``forward`` (44.1 kHz
             Pink-Trombone output).
     """
@@ -47,13 +47,13 @@ class SSLFeatureLoss(nn.Module):
         self,
         model_name: str = "microsoft/wavlm-base-plus",
         layer: int = 6,
-        distance: str = "l1",
+        distance: str = "L1",
         source_sr: int = 44100,
     ) -> None:
         super().__init__()
         from transformers import AutoModel
 
-        if distance not in ("l1", "l2", "cosine"):
+        if distance not in ("L1", "L2", "cosine"):
             raise ValueError(f"unknown distance {distance!r}")
         self.model_name = model_name
         self.layer = layer
@@ -87,9 +87,9 @@ class SSLFeatureLoss(nn.Module):
         T = min(f_pred.shape[1], f_tgt.shape[1])
         f_pred, f_tgt = f_pred[:, :T], f_tgt[:, :T]
 
-        if self.distance == "l1":
+        if self.distance == "L1":
             return (f_pred - f_tgt).abs().mean()
-        if self.distance == "l2":
+        if self.distance == "L2":
             return (f_pred - f_tgt).pow(2).mean()
         # cosine distance, averaged over frames
         cos = torch.nn.functional.cosine_similarity(f_pred, f_tgt, dim=-1)
