@@ -219,7 +219,10 @@ class EvalSetup:
     val_wavs: torch.Tensor  # [N_eval, S] float32, CPU
     val_f0: torch.Tensor  # [N_eval, T_ctrl] float32, CPU
     val_names: list[str]  # caption per clip
-    val_full_idx: list[int]  # stable per-clip key (for Whisper target cache)
+    # (index_in_manifest, chunk_start_sample) per clip — stable key for the
+    # Whisper target cache. The chunk_start component keeps keys distinct if
+    # eval ever draws more than one chunk from the same file.
+    val_target_keys: list[tuple[int, int]]
     chunk_samples: int
     T_ctrl: int
     whisper: "WhisperEvaluator | None"
@@ -253,20 +256,21 @@ def _eval_setup(
 
     n_eval = min(cfg.log.n_eval_clips, len(val_files))
     selected = val_files[:n_eval]
-    full_idx_for_id = {id(df): i for i, df in enumerate(files)}
 
     wavs: list[torch.Tensor] = []
     f0s: list[torch.Tensor] = []
     names: list[str] = []
-    full_indices: list[int] = []
+    target_keys: list[tuple[int, int]] = []
+    # Eval always takes the first chunk of each file; if that ever changes,
+    # thread the real start offset through here so target keys stay distinct.
+    chunk_start = 0
     for df in selected:
-        full_idx = full_idx_for_id[id(df)]
         audio = _load_resampled(df.path, cfg.data.sample_rate)
         if len(audio) < chunk_samples:
             audio = np.pad(audio, (0, chunk_samples - len(audio)))
-        audio = audio[:chunk_samples]
+        audio = audio[chunk_start : chunk_start + chunk_samples]
 
-        f0_full, voiced_full = pitch.by_file[full_idx]
+        f0_full, voiced_full = pitch.by_file[df.index_in_manifest]
         f0_chunk = np.zeros(T_ctrl, dtype=np.float32)
         voiced_chunk = np.zeros(T_ctrl, dtype=bool)
         have = min(T_ctrl, len(f0_full))
@@ -278,7 +282,7 @@ def _eval_setup(
         wavs.append(torch.from_numpy(audio))
         f0s.append(torch.from_numpy(f0_filled))
         names.append(df.path.name)
-        full_indices.append(full_idx)
+        target_keys.append((df.index_in_manifest, chunk_start))
 
     whisper: WhisperEvaluator | None = None
     if cfg.log.asr_whisper_size:
@@ -291,7 +295,7 @@ def _eval_setup(
         val_wavs=torch.stack(wavs),
         val_f0=torch.stack(f0s),
         val_names=names,
-        val_full_idx=full_indices,
+        val_target_keys=target_keys,
         chunk_samples=chunk_samples,
         T_ctrl=T_ctrl,
         whisper=whisper,
@@ -479,7 +483,7 @@ def _evaluate(
                 tgt_np,
                 pred_np,
                 sr,
-                target_key=eval_setup.val_full_idx[i],
+                target_key=eval_setup.val_target_keys[i],
             )
             if not np.isnan(scores.wer):
                 wer_vals.append(scores.wer)

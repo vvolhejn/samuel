@@ -13,6 +13,7 @@ CPU — eval is slower but training never crashes.
 
 from __future__ import annotations
 
+from collections.abc import Hashable
 from dataclasses import dataclass
 
 import jiwer
@@ -67,7 +68,7 @@ class WhisperEvaluator:
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
-        self._target_cache: dict[int, str] = {}
+        self._target_cache: dict[Hashable, str] = {}
         self.model_size = model_size
         self.model = _load_whisper(model_size, device)
 
@@ -90,13 +91,14 @@ class WhisperEvaluator:
         return " ".join(s.text.strip() for s in segments).strip()
 
     def transcribe_target(
-        self, target: np.ndarray, sr: int, key: int | None = None
+        self, target: np.ndarray, sr: int, key: Hashable | None = None
     ) -> str:
         """Cached transcription of a target clip.
 
-        ``key`` is the cache key — a stable per-clip identifier (e.g. the
-        full-manifest file index). When ``None``, the array's ``id`` is used
-        which only deduplicates within a single eval call.
+        ``key`` is the cache key — a stable per-clip identifier, e.g. the
+        ``(index_in_manifest, chunk_start)`` pair identifying the exact source
+        chunk. When ``None``, the array's ``id`` is used which only
+        deduplicates within a single eval call.
         """
         cache_key = key if key is not None else id(target)
         if cache_key not in self._target_cache:
@@ -108,7 +110,7 @@ class WhisperEvaluator:
         target: np.ndarray,
         pred: np.ndarray,
         sr: int,
-        target_key: int | None = None,
+        target_key: Hashable | None = None,
     ) -> AsrScores:
         ref = self.transcribe_target(target, sr, key=target_key)
         hyp = self.transcribe(pred, sr)

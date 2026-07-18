@@ -27,6 +27,7 @@ class DatasetFile(BaseModel):
     duration: float | None = None
     sample_rate: int | None = None
     size_bytes: int | None = None
+    index_in_manifest: int = -1
 
 
 def load_manifest(path: Path) -> list[DatasetFile]:
@@ -36,7 +37,9 @@ def load_manifest(path: Path) -> list[DatasetFile]:
             line = line.strip()
             if not line:
                 continue
-            files.append(DatasetFile(**json.loads(line)))
+            df = DatasetFile(**json.loads(line))
+            df.index_in_manifest = len(files)
+            files.append(df)
     return files
 
 
@@ -177,11 +180,6 @@ class LibriLightChunks(IterableDataset):
         self.seed = seed
         self.drop_last = drop_last
         full_manifest = load_manifest(manifest_path)
-        # Pitch-cache lookup uses the full-manifest index, so build the id→idx
-        # map *before* slicing off the val tail.
-        self._idx_for_file: dict[int, int] = {
-            id(df): i for i, df in enumerate(full_manifest)
-        }
         train_files, _ = split_train_val(full_manifest, val_fraction)
         self._all_files = train_files
         self._rank_files = _shard(self._all_files, rank, world_size)
@@ -228,10 +226,9 @@ class LibriLightChunks(IterableDataset):
                 audio = _load_resampled(df.path, self.sample_rate)
             except Exception:  # noqa: BLE001 - skip unreadable files
                 continue
-            file_idx = self._idx_for_file.get(id(df))
             pitch_f0 = pitch_voiced = None
-            if self._pitch is not None and file_idx is not None:
-                pitch_f0, pitch_voiced = self._pitch.by_file[file_idx]
+            if self._pitch is not None:
+                pitch_f0, pitch_voiced = self._pitch.by_file[df.index_in_manifest]
             n = len(audio)
             for i in range(0, n, self.chunk_samples):
                 chunk = audio[i : i + self.chunk_samples]
