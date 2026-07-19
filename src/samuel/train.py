@@ -45,7 +45,7 @@ from samuel.evals.pitch import pitch_mae_cents
 from samuel.losses import MelSpecLoss, MFCCLoss, MultiScaleLogMagSTFTLoss
 from samuel.model import PinkTromboneController
 from samuel.pink_trombone import PARAM_NAMES, pink_trombone_ola
-from samuel.ssl_loss import CTCPosteriorLoss, SSLFeatureLoss
+from samuel.ssl_loss import ASRDistillLoss, SSLFeatureLoss
 
 
 class CombinedReconLoss(nn.Module):
@@ -594,15 +594,15 @@ def main(hydra_cfg: DictConfig) -> None:
                 ),
             )
         )
-    if cfg.loss.ctc != 0.0:
+    if cfg.loss.asr_distill != 0.0:
         loss_components.append(
             (
-                "ctc",
-                cfg.loss.ctc,
-                CTCPosteriorLoss(
-                    model_name=cfg.loss.ctc_model,
+                "asr_distill",
+                cfg.loss.asr_distill,
+                ASRDistillLoss(
+                    model_name=cfg.loss.asr_distill_model,
                     source_sr=cfg.data.sample_rate,
-                    temperature=cfg.loss.ctc_temperature,
+                    temperature=cfg.loss.asr_distill_temperature,
                 ),
             )
         )

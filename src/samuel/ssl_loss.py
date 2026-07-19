@@ -29,7 +29,7 @@ from torch import Tensor, nn
 _SSL_SR = 16000
 
 
-class CTCPosteriorLoss(nn.Module):
+class ASRDistillLoss(nn.Module):
     """Frame-wise KL between CTC character posteriors of ``pred`` and ``target``.
 
     Both waveforms go through a frozen CTC-fine-tuned ASR model
