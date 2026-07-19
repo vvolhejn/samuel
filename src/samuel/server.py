@@ -9,9 +9,11 @@ Run:
 
 Env:
     SAMUEL_CHECKPOINT   local .pt path or wandb artifact ref
-                        (default: runs/onset-off_20260527-193518/checkpoints/last.pt)
+                        (default: runs/reg-f1.0-s0.1_20260719-120003/checkpoints/last.pt)
     SAMUEL_RUN_CONFIG   run config.json to build the model from
                         (default: the same run's config.json)
+    SAMUEL_MANIFEST     dataset manifest (jsonl) for /api/dataset_clip
+                        (default: the run config's data.manifest_path)
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ import io
 import json
 import logging
 import os
+import random
 from pathlib import Path
 
 import librosa
@@ -37,7 +40,8 @@ from samuel.pink_trombone import PARAM_NAMES, SAMPLE_RATE, pink_trombone_ola
 logger = logging.getLogger("samuel.server")
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_DEFAULT_RUN_DIR = _REPO_ROOT / "runs" / "onset-off_20260527-193518"
+# wandb: moboehle-kyutai/samuel/xl45k4i7
+_DEFAULT_RUN_DIR = _REPO_ROOT / "runs" / "reg-f1.0-s0.1_20260719-120003"
 
 # pyin settings matching scripts/precompute_pitch.py defaults (the settings
 # the pitch cache for this run was built with).
@@ -48,6 +52,9 @@ PYIN_FRAME_LENGTH = 4096
 # Matches the run's synth.ir_length (read raw — the stored synth block has
 # keys the current SynthConfig rejects).
 IR_LENGTH = 256
+
+# Length of the clips /api/dataset_clip serves (matches the eval chunking).
+CLIP_SECONDS = 10.0
 
 # Cap on the per-frame volume-match gain. Training's _volume_match is
 # unclamped, but near-silent synth frames against noisy mic input can
@@ -67,18 +74,21 @@ def _resolve_checkpoint(ref: str) -> Path:
     return Path(artifact.download()) / "last.pt"
 
 
-def _load_model() -> PinkTromboneController:
+def _run_config() -> dict:
     config_path = Path(
         os.environ.get("SAMUEL_RUN_CONFIG", _DEFAULT_RUN_DIR / "config.json")
     )
+    return json.loads(config_path.read_text())
+
+
+def _load_model() -> PinkTromboneController:
     checkpoint_ref = os.environ.get(
         "SAMUEL_CHECKPOINT", str(_DEFAULT_RUN_DIR / "checkpoints" / "last.pt")
     )
 
     # Only the "model" block is read: the run's full config may contain keys
     # from other branches that the current pydantic configs reject.
-    run_config = json.loads(config_path.read_text())
-    model_config = PinkTromboneControllerConfig.model_validate(run_config["model"])
+    model_config = PinkTromboneControllerConfig.model_validate(_run_config()["model"])
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = PinkTromboneController(model_config).to(device)
@@ -159,12 +169,37 @@ app.add_middleware(
 )
 
 _model: PinkTromboneController | None = None
+_clips: list[dict] | None = None
 
 
 @app.on_event("startup")
 def _startup() -> None:
     global _model
     _model = _load_model()
+
+
+def _get_clips() -> list[dict]:
+    """Manifest entries long enough for CLIP_SECONDS, loaded on first use
+    (the manifest may live on a filesystem that isn't always mounted)."""
+    global _clips
+    if _clips is None:
+        manifest_path = Path(
+            os.environ.get("SAMUEL_MANIFEST") or _run_config()["data"]["manifest_path"]
+        )
+        entries = [
+            json.loads(line)
+            for line in manifest_path.read_text().splitlines()
+            if line.strip()
+        ]
+        _clips = [e for e in entries if e["duration"] >= CLIP_SECONDS]
+        logger.info(
+            "manifest %s: %d/%d clips >= %.0fs",
+            manifest_path,
+            len(_clips),
+            len(entries),
+            CLIP_SECONDS,
+        )
+    return _clips
 
 
 @app.get("/api/health")
@@ -177,22 +212,10 @@ def health() -> dict:
     }
 
 
-@app.post("/api/synthesize")
-async def synthesize(request: Request) -> dict:
+def _mimic(audio: np.ndarray) -> dict:
+    """Run the controller on ``audio`` (float32 at SAMPLE_RATE) and build the
+    response payload shared by /api/synthesize and /api/dataset_clip."""
     assert _model is not None
-    body = await request.body()
-    if not body:
-        raise HTTPException(status_code=400, detail="empty request body")
-    try:
-        audio, sr = sf.read(io.BytesIO(body), dtype="float32", always_2d=False)
-    except Exception as e:  # noqa: BLE001 - malformed uploads
-        raise HTTPException(status_code=400, detail=f"could not decode audio: {e}")
-
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
-    if sr != SAMPLE_RATE:
-        audio = librosa.resample(audio, orig_sr=sr, target_sr=SAMPLE_RATE)
-    audio = audio.astype(np.float32, copy=False)
     if len(audio) < _model.samples_per_frame:
         raise HTTPException(status_code=400, detail="audio too short")
 
@@ -232,3 +255,62 @@ async def synthesize(request: Request) -> dict:
         "gain": gain.tolist(),
         "synth_audio_b64": _encode_wav_b64(synth_norm),
     }
+
+
+@app.post("/api/synthesize")
+async def synthesize(request: Request) -> dict:
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="empty request body")
+    try:
+        audio, sr = sf.read(io.BytesIO(body), dtype="float32", always_2d=False)
+    except Exception as e:  # noqa: BLE001 - malformed uploads
+        raise HTTPException(status_code=400, detail=f"could not decode audio: {e}")
+
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    if sr != SAMPLE_RATE:
+        audio = librosa.resample(audio, orig_sr=sr, target_sr=SAMPLE_RATE)
+    return _mimic(audio.astype(np.float32, copy=False))
+
+
+@app.post("/api/dataset_clip")
+def dataset_clip() -> dict:
+    """Mimic a random CLIP_SECONDS window from the training manifest.
+
+    The response is /api/synthesize's payload plus the source clip itself
+    (``clip_audio_b64``) so the browser can play it before the imitation.
+    """
+    try:
+        clips = _get_clips()
+    except OSError as e:
+        raise HTTPException(status_code=503, detail=f"manifest unavailable: {e}")
+    if not clips:
+        raise HTTPException(status_code=503, detail="no manifest clip is long enough")
+
+    entry = random.choice(clips)
+    try:
+        info = sf.info(entry["path"])
+        n_clip = int(CLIP_SECONDS * info.samplerate)
+        start = random.randint(0, max(0, info.frames - n_clip))
+        audio, sr = sf.read(
+            entry["path"],
+            start=start,
+            frames=n_clip,
+            dtype="float32",
+            always_2d=False,
+        )
+    except OSError as e:
+        raise HTTPException(status_code=503, detail=f"could not read clip: {e}")
+
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    if sr != SAMPLE_RATE:
+        audio = librosa.resample(audio, orig_sr=sr, target_sr=SAMPLE_RATE)
+    audio = audio.astype(np.float32, copy=False)
+
+    result = _mimic(audio)
+    result["clip_path"] = entry["path"]
+    result["clip_offset_s"] = start / sr
+    result["clip_audio_b64"] = _encode_wav_b64(audio)
+    return result
