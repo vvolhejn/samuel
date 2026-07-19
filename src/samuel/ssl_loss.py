@@ -51,24 +51,77 @@ class SSLFeatureLoss(nn.Module):
         source_sr: int = 44100,
     ) -> None:
         super().__init__()
-        from transformers import AutoModel
-
         if distance not in ("L1", "L2", "cosine"):
             raise ValueError(f"unknown distance {distance!r}")
         self.model_name = model_name
         self.layer = layer
         self.distance = distance
+        self.is_whisper = "whisper" in model_name.lower()
 
-        self.model = AutoModel.from_pretrained(model_name)
+        if self.is_whisper:
+            # Whisper is encoder-decoder and takes a log-mel spectrogram, not a
+            # raw waveform. Keep only the encoder; build a differentiable log-mel
+            # that matches HF's WhisperFeatureExtractor so the frozen encoder sees
+            # the input distribution it was trained on, with the graph intact.
+            from transformers import WhisperFeatureExtractor, WhisperModel
+
+            fe = WhisperFeatureExtractor.from_pretrained(model_name)
+            self._n_fft = fe.n_fft
+            self._hop = fe.hop_length
+            self._n_samples = fe.n_samples  # 30 s * 16 kHz = 480000
+            self.register_buffer("_window", torch.hann_window(fe.n_fft))
+            self.register_buffer(
+                "_mel_filters", torch.tensor(fe.mel_filters, dtype=torch.float32)
+            )  # [n_fft//2+1, n_mels]
+            # large-v3's checkpoint is stored fp16; training is fp32, so upcast
+            # the frozen encoder to keep dtypes consistent through the graph.
+            self.model = WhisperModel.from_pretrained(model_name).encoder.float()
+        else:
+            from transformers import AutoModel
+
+            self.model = AutoModel.from_pretrained(model_name)
         self.model.eval()
         self.model.requires_grad_(False)
 
         # julius sinc resampler is differentiable and pure-torch (no torchaudio).
         self.resample = julius.ResampleFrac(source_sr, _SSL_SR)
 
+    def _log_mel(self, x16: Tensor) -> tuple[Tensor, int]:
+        """[B, S16] 16 kHz waveform -> ([B, n_mels, 3000] log-mel, valid_frames).
+
+        Replicates WhisperFeatureExtractor: pad/truncate to 30 s, power STFT
+        (drop last frame), mel projection, log10, per-utterance dynamic-range
+        clamp and (log+4)/4 scaling. ``valid_frames`` is how many mel frames hold
+        real audio (the rest is 30 s zero-padding) so callers can crop it away.
+        """
+        S = x16.shape[-1]
+        valid_frames = min(S // self._hop, self._n_samples // self._hop)
+        if S < self._n_samples:
+            x16 = torch.nn.functional.pad(x16, (0, self._n_samples - S))
+        else:
+            x16 = x16[..., : self._n_samples]
+        stft = torch.stft(
+            x16, self._n_fft, self._hop, window=self._window, return_complex=True
+        )
+        mags = stft[..., :-1].abs() ** 2  # [B, freq, 3000]
+        mel = self._mel_filters.T @ mags  # [B, n_mels, 3000]
+        log = torch.clamp(mel, min=1e-10).log10()
+        # per-utterance dynamic-range floor, then Whisper's fixed scaling
+        peak = log.amax(dim=(-2, -1), keepdim=True)
+        log = torch.maximum(log, peak - 8.0)
+        log = (log + 4.0) / 4.0
+        return log, valid_frames
+
     def _features(self, wav: Tensor) -> Tensor:
         """[B, S] waveform at source_sr -> [B, T, D] SSL hidden states."""
         x = self.resample(wav)
+        if self.is_whisper:
+            mel, valid = self._log_mel(x)
+            out = self.model(mel, output_hidden_states=True)
+            feats = out.hidden_states[self.layer]  # [B, 1500, D]
+            # Encoder conv stack downsamples time by 2; crop off the 30 s padding.
+            valid_enc = max(1, valid // 2)
+            return feats[:, :valid_enc]
         # WavLM/HuBERT/wav2vec2 were trained on zero-mean unit-variance input;
         # the HF feature extractor does this per-utterance. Replicate in torch
         # so the graph stays intact.
