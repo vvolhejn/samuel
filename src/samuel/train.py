@@ -196,20 +196,18 @@ def _controller_diagnostics(
     return out
 
 
-def _volume_match(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """RMS-match ``pred`` to ``target`` with a single per-utterance gain.
+def _rms_normalize(wav: torch.Tensor, target_rms: float) -> torch.Tensor:
+    """Scale each clip to ``target_rms`` (per-clip gain). ``wav`` is ``[B, S]``.
 
-    Both ``[B, S]``. A single scalar gain per clip corrects the global loudness
-    offset (absolute level is uncontrollable at inference: f0 is external and
-    there's no target to match against) while leaving the *within-utterance*
-    energy contour intact — stop gaps, nasal/approximant dips — so the loss can
-    see it and the model has a reason to shape it via intensity/voiceness. A
-    per-frame match (the old behaviour) normalised that contour away, removing
-    both the silence cue stops depend on and any gradient toward closure.
+    Applied to the audio used as *both* encoder input and loss target, so the
+    dataset has one canonical loudness. The synth output is deliberately NOT
+    gain-matched: the model must produce this absolute level itself, so going
+    silent (e.g. driving ``intensity`` to 0) is penalised rather than corrected
+    for free — which removes the constant-output collapse basin that a post-hoc
+    output match creates. Within-utterance energy dynamics are untouched.
     """
-    pred_rms = pred.pow(2).mean(-1, keepdim=True).clamp_min(1e-12).sqrt()
-    tgt_rms = target.pow(2).mean(-1, keepdim=True).clamp_min(1e-12).sqrt()
-    return pred * (tgt_rms / pred_rms)
+    rms = wav.pow(2).mean(-1, keepdim=True).clamp_min(1e-12).sqrt()
+    return wav * (target_rms / rms)
 
 
 @dataclass
@@ -436,16 +434,16 @@ def _evaluate(
     ddp_module.eval()
 
     target = eval_setup.val_wavs.to(device)  # [N, S] float32
+    target = _rms_normalize(target, cfg.data.target_rms)  # same canonical level
     f0 = eval_setup.val_f0.to(device)  # [N, T_ctrl]
     frame_rate = model.config.frame_rate
 
     params, pred_ola = _run_eval_batched(model, target, f0, cfg, frame_rate)
 
+    # Synth output is used as-is (no gain match): the model must hit target_rms.
     S = min(pred_ola.shape[-1], target.shape[-1])
-    pred_norm = _volume_match(pred_ola[..., :S].float(), target[..., :S].float())
-
-    S_norm = pred_norm.shape[-1]
-    total, components = loss_fn.with_components(pred_norm, target[..., :S_norm].float())
+    pred_norm = pred_ola[..., :S].float()
+    total, components = loss_fn.with_components(pred_norm, target[..., :S].float())
 
     out: dict[str, object] = {
         "eval/loss": total.item(),
@@ -679,6 +677,9 @@ def main(hydra_cfg: DictConfig) -> None:
 
         wav = batch["audio"].to(device, non_blocking=True)  # [B, S]
         f0 = batch["pitch"].to(device, non_blocking=True)  # [B, T_ctrl]
+        # One canonical loudness for both what the model hears and what it's
+        # scored against; the synth output is not gain-matched downstream.
+        wav = _rms_normalize(wav, cfg.data.target_rms)
         target = wav
         wav_in = wav.unsqueeze(1)  # [B, 1, S]
 
@@ -706,10 +707,8 @@ def main(hydra_cfg: DictConfig) -> None:
             control_rate=frame_rate,
         )
         S = min(pred.shape[-1], target.shape[-1])
-        pred_norm = _volume_match(pred[..., :S], target[..., :S])
-        S_norm = pred_norm.shape[-1]
         recon_loss, recon_components = loss_fn.with_components(
-            pred_norm, target[..., :S_norm]
+            pred[..., :S], target[..., :S]
         )
 
         # Hinged entropy penalty on softmax(logits) — penalizes only
