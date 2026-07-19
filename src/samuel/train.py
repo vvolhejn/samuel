@@ -20,7 +20,6 @@ from pathlib import Path
 
 import hydra
 import numpy as np
-from einops import rearrange
 import plotly.graph_objects as go
 import torch
 import torch.distributed as dist
@@ -197,15 +196,20 @@ def _controller_diagnostics(
     return out
 
 
-def _volume_match(pred: torch.Tensor, target: torch.Tensor, hop: int) -> torch.Tensor:
-    """Per-frame RMS-match ``pred`` to ``target``. Both ``[B, S]``, S a multiple of hop."""
-    T = pred.shape[-1] // hop
-    pred_f = rearrange(pred[..., : T * hop], "b (t h) -> b t h", h=hop)
-    tgt_f = rearrange(target[..., : T * hop], "b (t h) -> b t h", h=hop)
-    pred_rms = pred_f.pow(2).mean(-1).clamp_min(1e-12).sqrt()
-    tgt_rms = tgt_f.pow(2).mean(-1).clamp_min(1e-12).sqrt()
-    gain = (tgt_rms / pred_rms).unsqueeze(-1)
-    return rearrange(pred_f * gain, "b t h -> b (t h)")
+def _volume_match(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """RMS-match ``pred`` to ``target`` with a single per-utterance gain.
+
+    Both ``[B, S]``. A single scalar gain per clip corrects the global loudness
+    offset (absolute level is uncontrollable at inference: f0 is external and
+    there's no target to match against) while leaving the *within-utterance*
+    energy contour intact — stop gaps, nasal/approximant dips — so the loss can
+    see it and the model has a reason to shape it via intensity/voiceness. A
+    per-frame match (the old behaviour) normalised that contour away, removing
+    both the silence cue stops depend on and any gradient toward closure.
+    """
+    pred_rms = pred.pow(2).mean(-1, keepdim=True).clamp_min(1e-12).sqrt()
+    tgt_rms = target.pow(2).mean(-1, keepdim=True).clamp_min(1e-12).sqrt()
+    return pred * (tgt_rms / pred_rms)
 
 
 @dataclass
@@ -433,15 +437,12 @@ def _evaluate(
 
     target = eval_setup.val_wavs.to(device)  # [N, S] float32
     f0 = eval_setup.val_f0.to(device)  # [N, T_ctrl]
-    samples_per_frame = model.samples_per_frame
     frame_rate = model.config.frame_rate
 
     params, pred_ola = _run_eval_batched(model, target, f0, cfg, frame_rate)
 
     S = min(pred_ola.shape[-1], target.shape[-1])
-    pred_norm = _volume_match(
-        pred_ola[..., :S].float(), target[..., :S].float(), samples_per_frame
-    )
+    pred_norm = _volume_match(pred_ola[..., :S].float(), target[..., :S].float())
 
     S_norm = pred_norm.shape[-1]
     total, components = loss_fn.with_components(pred_norm, target[..., :S_norm].float())
@@ -705,7 +706,7 @@ def main(hydra_cfg: DictConfig) -> None:
             control_rate=frame_rate,
         )
         S = min(pred.shape[-1], target.shape[-1])
-        pred_norm = _volume_match(pred[..., :S], target[..., :S], samples_per_frame)
+        pred_norm = _volume_match(pred[..., :S], target[..., :S])
         S_norm = pred_norm.shape[-1]
         recon_loss, recon_components = loss_fn.with_components(
             pred_norm, target[..., :S_norm]
