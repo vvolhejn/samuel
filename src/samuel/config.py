@@ -150,6 +150,9 @@ class LossConfig(BaseModel):
     # target audio).
     ctc: float = 0.0
     ctc_model: str = "facebook/wav2vec2-base-960h"
+    # Softmax temperature on teacher+student logits. T=1 gives near-one-hot
+    # teachers whose KL gradient spikes saturate the Gumbel head; T>1 softens.
+    ctc_temperature: float = 2.0
 
 
 class TrainConfig(BaseModel):

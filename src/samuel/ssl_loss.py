@@ -43,12 +43,18 @@ class CTCPosteriorLoss(nn.Module):
     Args:
         model_name: HF id of a CTC-fine-tuned ASR model.
         source_sr: Sample rate of the waveforms handed to ``forward``.
+        temperature: Softmax temperature applied to both teacher and student
+            logits. The CTC head is a confident classifier (~one-hot posteriors),
+            and KL against a near-one-hot target has unbounded gradients — the
+            resulting spikes saturated the controller's Gumbel head at T=1
+            (run ctc-kl_20260719-094658). T>1 caps the teacher's peakedness.
     """
 
     def __init__(
         self,
         model_name: str = "facebook/wav2vec2-base-960h",
         source_sr: int = 44100,
+        temperature: float = 2.0,
     ) -> None:
         super().__init__()
         from transformers import AutoModelForCTC
@@ -62,6 +68,7 @@ class CTCPosteriorLoss(nn.Module):
         # (base-960h) on raw waveforms. Unlike the symmetric feature loss, the
         # CTC head is scale-sensitive, so match the convention.
         self.do_normalize = self.model.config.feat_extract_norm == "layer"
+        self.temperature = temperature
         self.resample = julius.ResampleFrac(source_sr, _SSL_SR)
 
     def _log_probs(self, wav: Tensor) -> Tensor:
@@ -71,7 +78,7 @@ class CTCPosteriorLoss(nn.Module):
             x = (x - x.mean(dim=-1, keepdim=True)) / (
                 x.std(dim=-1, keepdim=True) + 1e-7
             )
-        return self.model(x).logits.log_softmax(dim=-1)
+        return (self.model(x).logits / self.temperature).log_softmax(dim=-1)
 
     def forward(self, pred: Tensor, target: Tensor) -> Tensor:
         """``pred``/``target`` are ``[B, S]`` waveforms at ``source_sr``."""

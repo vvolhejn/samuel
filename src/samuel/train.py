@@ -602,6 +602,7 @@ def main(hydra_cfg: DictConfig) -> None:
                 CTCPosteriorLoss(
                     model_name=cfg.loss.ctc_model,
                     source_sr=cfg.data.sample_rate,
+                    temperature=cfg.loss.ctc_temperature,
                 ),
             )
         )
