@@ -45,7 +45,7 @@ from samuel.evals.pitch import pitch_mae_cents
 from samuel.losses import MelSpecLoss, MFCCLoss, MultiScaleLogMagSTFTLoss
 from samuel.model import PinkTromboneController
 from samuel.pink_trombone import PARAM_NAMES, pink_trombone_ola
-from samuel.ssl_loss import SSLFeatureLoss
+from samuel.ssl_loss import CTCPosteriorLoss, SSLFeatureLoss
 
 
 class CombinedReconLoss(nn.Module):
@@ -590,6 +590,17 @@ def main(hydra_cfg: DictConfig) -> None:
                     model_name=cfg.loss.ssl_model,
                     layer=cfg.loss.ssl_layer,
                     distance=cfg.loss.ssl_distance,
+                    source_sr=cfg.data.sample_rate,
+                ),
+            )
+        )
+    if cfg.loss.ctc != 0.0:
+        loss_components.append(
+            (
+                "ctc",
+                cfg.loss.ctc,
+                CTCPosteriorLoss(
+                    model_name=cfg.loss.ctc_model,
                     source_sr=cfg.data.sample_rate,
                 ),
             )

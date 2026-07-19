@@ -42,6 +42,10 @@ loss:
   ssl_model: microsoft/wavlm-base-plus
   ssl_layer: 6
   ssl_distance: L1  # L1 | L2 | cosine
+  # Frame-wise KL between CTC char posteriors of a frozen ASR (content-only
+  # perceptual loss; no CTC marginalization needed since we have target audio)
+  ctc: 0.0
+  ctc_model: facebook/wav2vec2-base-960h
 
 log:
   wandb_project: samuel

@@ -144,6 +144,13 @@ class LossConfig(BaseModel):
     ssl_layer: int = 6  # mid transformer layer is most phonetic
     ssl_distance: str = "L1"  # "L1" | "L2" | "cosine"
 
+    # Frame-wise KL between CTC character posteriors of a frozen ASR model.
+    # Content-only perceptual loss: constrains which character is said when,
+    # not timbre/prosody. No CTC marginalization (alignment comes from the
+    # target audio).
+    ctc: float = 0.0
+    ctc_model: str = "facebook/wav2vec2-base-960h"
+
 
 class TrainConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")

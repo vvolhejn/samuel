@@ -29,6 +29,64 @@ from torch import Tensor, nn
 _SSL_SR = 16000
 
 
+class CTCPosteriorLoss(nn.Module):
+    """Frame-wise KL between CTC character posteriors of ``pred`` and ``target``.
+
+    Both waveforms go through a frozen CTC-fine-tuned ASR model
+    (wav2vec2-base-960h: 32-char vocab, ~50 posterior frames/sec) and we take
+    KL(target ‖ pred) per frame. The CTC head is a content bottleneck: unlike
+    ``SSLFeatureLoss`` this only constrains *which character is being said
+    when*, not timbre/prosody/speaker. Note no CTC marginalization is involved
+    — with reference audio available, the frame alignment is given, so this is
+    plain posterior distillation.
+
+    Args:
+        model_name: HF id of a CTC-fine-tuned ASR model.
+        source_sr: Sample rate of the waveforms handed to ``forward``.
+    """
+
+    def __init__(
+        self,
+        model_name: str = "facebook/wav2vec2-base-960h",
+        source_sr: int = 44100,
+    ) -> None:
+        super().__init__()
+        from transformers import AutoModelForCTC
+
+        self.model_name = model_name
+        self.model = AutoModelForCTC.from_pretrained(model_name)
+        self.model.eval()
+        self.model.requires_grad_(False)
+        # Models with layer-norm feature extractors (e.g. the -lv60 variants)
+        # were fine-tuned on per-utterance z-scored input; group-norm ones
+        # (base-960h) on raw waveforms. Unlike the symmetric feature loss, the
+        # CTC head is scale-sensitive, so match the convention.
+        self.do_normalize = self.model.config.feat_extract_norm == "layer"
+        self.resample = julius.ResampleFrac(source_sr, _SSL_SR)
+
+    def _log_probs(self, wav: Tensor) -> Tensor:
+        """[B, S] waveform at source_sr -> [B, T, V] CTC log-posteriors."""
+        x = self.resample(wav)
+        if self.do_normalize:
+            x = (x - x.mean(dim=-1, keepdim=True)) / (
+                x.std(dim=-1, keepdim=True) + 1e-7
+            )
+        return self.model(x).logits.log_softmax(dim=-1)
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        """``pred``/``target`` are ``[B, S]`` waveforms at ``source_sr``."""
+        lp_pred = self._log_probs(pred)
+        with torch.no_grad():
+            lp_tgt = self._log_probs(target)
+
+        T = min(lp_pred.shape[1], lp_tgt.shape[1])
+        lp_pred, lp_tgt = lp_pred[:, :T], lp_tgt[:, :T]
+
+        # KL(target ‖ pred) summed over the vocab, averaged over batch+frames.
+        kl = (lp_tgt.exp() * (lp_tgt - lp_pred)).sum(dim=-1)
+        return kl.mean()
+
+
 class SSLFeatureLoss(nn.Module):
     """Distance between frozen-SSL-encoder features of ``pred`` and ``target``.
 
