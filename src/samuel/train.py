@@ -45,7 +45,7 @@ from samuel.evals.pitch import pitch_mae_cents
 from samuel.losses import MelSpecLoss, MFCCLoss, MultiScaleLogMagSTFTLoss
 from samuel.model import PinkTromboneController
 from samuel.pink_trombone import PARAM_NAMES, pink_trombone_ola
-from samuel.ssl_loss import ASRDistillLoss, SSLFeatureLoss
+from samuel.ssl_loss import ASRDistillLoss, SSLDistillLoss
 
 
 class CombinedReconLoss(nn.Module):
@@ -581,15 +581,15 @@ def main(hydra_cfg: DictConfig) -> None:
     # Only build the SSL encoder when it's actually weighted — CombinedReconLoss
     # evaluates every component each step (for logging), so a zero-weight SSL
     # entry would run the encoder for nothing.
-    if cfg.loss.ssl != 0.0:
+    if cfg.loss.ssl_distill != 0.0:
         loss_components.append(
             (
-                "ssl",
-                cfg.loss.ssl,
-                SSLFeatureLoss(
-                    model_name=cfg.loss.ssl_model,
-                    layer=cfg.loss.ssl_layer,
-                    distance=cfg.loss.ssl_distance,
+                "ssl_distill",
+                cfg.loss.ssl_distill,
+                SSLDistillLoss(
+                    model_name=cfg.loss.ssl_distill_model,
+                    layer=cfg.loss.ssl_distill_layer,
+                    distance=cfg.loss.ssl_distill_distance,
                     source_sr=cfg.data.sample_rate,
                 ),
             )

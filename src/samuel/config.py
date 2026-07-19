@@ -137,12 +137,12 @@ class LossConfig(BaseModel):
 
     # SSL feature-matching (perceptual) loss on a frozen speech encoder.
     # L1 distance between the encoder's hidden states for pred vs. target audio.
-    ssl: float = 0.0
+    ssl_distill: float = 0.0
     # HF model id. Others tried: facebook/hubert-base-ls960,
     # facebook/wav2vec2-base-960h (wavlm won; wav2vec2 needs entropy>=0.1).
-    ssl_model: str = "microsoft/wavlm-base-plus"
-    ssl_layer: int = 6  # mid transformer layer is most phonetic
-    ssl_distance: str = "L1"  # "L1" | "L2" | "cosine"
+    ssl_distill_model: str = "microsoft/wavlm-base-plus"
+    ssl_distill_layer: int = 6  # mid transformer layer is most phonetic
+    ssl_distill_distance: str = "L1"  # "L1" | "L2" | "cosine"
 
     # Frame-wise KL between CTC character posteriors of a frozen ASR model.
     # Content-only perceptual loss: constrains which character is said when,

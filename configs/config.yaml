@@ -36,12 +36,12 @@ loss:
   # back to n_fft=samples_per_frame (no overlap).
   mfcc_n_fft: 2048
   # SSL feature-matching (perceptual) loss
-  ssl: 0.0
+  ssl_distill: 0.0
   # HF id. Others tried: facebook/hubert-base-ls960,
   # facebook/wav2vec2-base-960h, unclear which wins
-  ssl_model: microsoft/wavlm-base-plus
-  ssl_layer: 6
-  ssl_distance: L1  # L1 | L2 | cosine
+  ssl_distill_model: microsoft/wavlm-base-plus
+  ssl_distill_layer: 6
+  ssl_distill_distance: L1  # L1 | L2 | cosine
   # Frame-wise KL between CTC char posteriors of a frozen ASR (content-only
   # perceptual loss; no CTC marginalization needed since we have target audio)
   asr_distill: 0.0

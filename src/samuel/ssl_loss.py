@@ -35,7 +35,7 @@ class ASRDistillLoss(nn.Module):
     Both waveforms go through a frozen CTC-fine-tuned ASR model
     (wav2vec2-base-960h: 32-char vocab, ~50 posterior frames/sec) and we take
     KL(target ‖ pred) per frame. The CTC head is a content bottleneck: unlike
-    ``SSLFeatureLoss`` this only constrains *which character is being said
+    ``SSLDistillLoss`` this only constrains *which character is being said
     when*, not timbre/prosody/speaker. Note no CTC marginalization is involved
     — with reference audio available, the frame alignment is given, so this is
     plain posterior distillation.
@@ -94,7 +94,7 @@ class ASRDistillLoss(nn.Module):
         return kl.mean()
 
 
-class SSLFeatureLoss(nn.Module):
+class SSLDistillLoss(nn.Module):
     """Distance between frozen-SSL-encoder features of ``pred`` and ``target``.
 
     Args:
