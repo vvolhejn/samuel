@@ -1,8 +1,9 @@
 """1D-CNN controller that turns audio into Pink Trombone parameter trajectories.
 
 The head emits a categorical distribution over ``n_buckets`` evenly spaced
-values per trainable parameter. During training a (hard) Gumbel-softmax
-sample selects one bucket center; at eval time the argmax bucket is used.
+values per trainable parameter. During training a Gumbel-softmax sample
+weights the bucket centers (soft by default; one-hot straight-through with
+``gumbel_hard``); at eval time the argmax bucket is used.
 The ``frequency`` parameter is supplied externally (precomputed pyin) and
 ``intensity`` is frozen to 1.0 — volume is matched post-synth in the train
 loop.
@@ -60,6 +61,12 @@ class PinkTromboneControllerConfig(BaseModel):
     )
     samples_per_frame: int = 2048
     n_buckets: int = 32
+    # Straight-through Gumbel-softmax during training: the forward output is a
+    # one-hot sample (matching eval's argmax snap exactly), gradients flow
+    # through the soft distribution. With False (default), the forward output
+    # is the soft distribution and the synth sees a smooth expectation between
+    # bucket centers.
+    gumbel_hard: bool = False
 
     @property
     def frame_rate(self) -> float:
@@ -195,10 +202,14 @@ class PinkTromboneController(nn.Module):
             # hard=False: the forward output is the soft Gumbel-softmax
             # distribution; (weights * centers).sum is then a smooth
             # expectation between bucket centers. Eval still snaps to the
-            # argmax bucket, so there's a mild train/eval mismatch — but
-            # hard=True (straight-through) tends to lock the argmax in this
-            # setup, with eval loss bit-identical across many steps.
-            weights = F.gumbel_softmax(logits, tau=tau, hard=False, dim=-1)
+            # argmax bucket, so there's a mild train/eval mismatch.
+            # hard=True (straight-through) removes that mismatch but locked
+            # the argmax when tried before the hinged entropy floor existed
+            # (eval loss bit-identical across many steps) — watch
+            # train/bucket_usage if enabling it.
+            weights = F.gumbel_softmax(
+                logits, tau=tau, hard=self.config.gumbel_hard, dim=-1
+            )
         else:
             argmax = logits.argmax(dim=-1)
             weights = F.one_hot(argmax, num_classes=self.n_buckets).to(logits.dtype)

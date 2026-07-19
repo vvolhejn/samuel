@@ -16,6 +16,9 @@ model:
   # pitch-cache hop.
   samples_per_frame: 512
   n_buckets: 32
+  # Straight-through (one-hot) Gumbel-softmax during training instead of the
+  # soft expectation over bucket centers. Eval always snaps to argmax.
+  gumbel_hard: false
 
   # (lo, hi, init) per trainable parameter. ``frequency`` is supplied
   # externally from the pyin cache; ``intensity`` is frozen at 1.0 and the
