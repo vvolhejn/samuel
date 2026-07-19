@@ -711,12 +711,18 @@ def main(hydra_cfg: DictConfig) -> None:
             pred_norm, target[..., :S_norm]
         )
 
-        # Entropy bonus on softmax(logits) — keeps logits from saturating
-        # to one-hot, which otherwise kills the soft-Gumbel gradient.
+        # Hinged entropy penalty on softmax(logits) — penalizes only
+        # positions whose entropy drops below the floor, so logits can't
+        # saturate to one-hot (which kills the soft-Gumbel gradient) but
+        # positions above the floor feel no pressure toward uniform.
+        # Hinged per position, not on the mean: uncertain positions must
+        # not offset saturated ones.
         logits = aux["logits"].float()
         log_probs = F.log_softmax(logits, dim=-1)
-        entropy = -(log_probs.exp() * log_probs).sum(-1).mean()
-        loss = recon_loss - cfg.loss.entropy * entropy
+        entropy_per_pos = -(log_probs.exp() * log_probs).sum(-1)  # [B, T, P]
+        entropy = entropy_per_pos.mean()
+        entropy_penalty = F.relu(cfg.loss.entropy_floor - entropy_per_pos).mean()
+        loss = recon_loss + cfg.loss.entropy * entropy_penalty
 
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -742,6 +748,7 @@ def main(hydra_cfg: DictConfig) -> None:
                 "train/loss": loss.item(),
                 "train/recon_loss": recon_loss.item(),
                 "train/entropy": entropy.item(),
+                "train/entropy_penalty": entropy_penalty.item(),
                 "train/lr": optimizer.param_groups[0]["lr"],
                 "train/tau": tau,
                 "train/grad_norm": float(grad_norm),

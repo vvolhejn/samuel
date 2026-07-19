@@ -30,7 +30,8 @@ loss:
   mfcc: 1.0
   mel: 0.0
   stft: 0.0
-  entropy: 0.1    # encourage softmax(logits) to stay near uniform
+  entropy: 1.0        # weight of the hinged entropy penalty
+  entropy_floor: 1.0  # per-position entropy floor in nats; no pressure above it
   # 4x window overlap (n_fft=2048, hop=samples_per_frame=512). Null falls
   # back to n_fft=samples_per_frame (no overlap).
   mfcc_n_fft: 2048

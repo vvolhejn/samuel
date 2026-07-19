@@ -116,14 +116,19 @@ class LossConfig(BaseModel):
 
     # Reconstruction-loss weights. Components with weight 0 are skipped.
     # Total training loss is:
-    #   sum(w_i * loss_i(pred, target)) - entropy * H(softmax(logits))
-    # The entropy bonus keeps the per-position softmax distribution near
-    # uniform — without it, logits saturate and the soft Gumbel becomes
-    # effectively hard, killing gradients.
+    #   sum(w_i * loss_i(pred, target))
+    #     + entropy * mean(relu(entropy_floor - H_pos(softmax(logits))))
+    # The hinged entropy penalty keeps each position's softmax from
+    # saturating to one-hot (which kills the soft-Gumbel gradient), but
+    # exerts zero pressure once a position's entropy is above the floor —
+    # positions are free to commit down to the floor, and unused buckets
+    # are allowed.
     mfcc: float = 1.0  # L1 on first 20 MFCCs (frame-aligned to samples_per_frame)
     mel: float = 0.0  # L1 on log-mel spectrogram (frame-aligned to samples_per_frame)
     stft: float = 0.0  # Multi-scale log-magnitude STFT, n_ffts (512, 1024, 2048)
-    entropy: float = 0.01
+    entropy: float = 1.0
+    # Per-position entropy floor in nats (1.0 ~ spread over e ~ 2.7 buckets).
+    entropy_floor: float = 1.0
     # MFCC-loss STFT window size. Default 2048 with samples_per_frame=512 gives
     # 4x window overlap and better-resolved spectra (vs. no overlap at
     # n_fft=samples_per_frame), which improves voicedness and recon. Set to
