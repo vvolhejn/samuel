@@ -28,7 +28,7 @@ model:
     # tongue tip or the lips, so positions further back in the tract are
     # not used. Buckets cover the regime that's actually picked.
     constrictionIndex:    [22.0, 44.0, 33.0]
-    constrictionDiameter: [-0.5, 3.0, 1.25]
+    constrictionDiameter: [-2.0, 3.0, 1.25]
 
   frozen_values:
     intensity: 1.0

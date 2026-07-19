@@ -2,7 +2,7 @@ defaults:
   - model
   - _self_
 
-batch_size: 96
+batch_size: 64
 
 data:
   manifest_path: manifests/librilight_1000h.jsonl
@@ -49,10 +49,10 @@ log:
   log_every: 200
   eval_every: 1000
   ckpt_every: 2000
-  n_eval_clips: 100
+  n_eval_clips: 200
   # Eval-clip length (s). null -> match training (data.chunk_seconds). Set e.g.
   # 10.0 for finer WER/CER and sustained-intelligibility measurement.
-  eval_chunk_seconds: null
+  eval_chunk_seconds: 10.0
   n_audio_samples: 10
   pitch_fmin: 70.0
   pitch_fmax: 500.0
