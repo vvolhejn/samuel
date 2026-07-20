@@ -401,6 +401,7 @@ def _run_eval_batched(
             seed=fixed_seed,
             ir_length=cfg.synth.ir_length,
             control_rate=frame_rate,
+            closure_softplus_beta=cfg.synth.closure_softplus_beta,
         )
         params_all.append(params)
         ola_all.append(ola)
@@ -703,6 +704,7 @@ def main(hydra_cfg: DictConfig) -> None:
             params,
             ir_length=cfg.synth.ir_length,
             control_rate=frame_rate,
+            closure_softplus_beta=cfg.synth.closure_softplus_beta,
         )
         S = min(pred.shape[-1], target.shape[-1])
         pred_norm = _volume_match(pred[..., :S], target[..., :S], samples_per_frame)

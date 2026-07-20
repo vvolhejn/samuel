@@ -375,12 +375,22 @@ def glottis(
 # ---------------------------------------------------------------------------
 
 
+def _soft_unit_clamp(x: Tensor, beta: float) -> Tensor:
+    """Smooth approximation of ``clamp(x, 0, 1)`` with rounded corners.
+
+    Equals ``clamp(x, 0, 1)`` in the interior; the two hard corners at 0 and 1
+    are rounded over a width ~1/beta so gradient survives just outside [0, 1].
+    """
+    return F.softplus(x, beta=beta) - F.softplus(x - 1.0, beta=beta)
+
+
 def _compute_diameter_profile(
     tongue_index: Tensor,  # [B, S]
     tongue_diameter: Tensor,  # [B, S]
     constriction_index: Tensor,  # [B, S]
     constriction_diameter: Tensor,  # [B, S]
     N: int = _TRACT_N,
+    closure_softplus_beta: float | None = None,
 ) -> Tensor:  # [B, S, N]
     B, S = tongue_index.shape
     device = tongue_index.device
@@ -460,7 +470,12 @@ def _compute_diameter_profile(
         ),
     )  # [B, S, N]
 
-    new_diam = (c_diam - 0.3).clamp(min=0)  # [B, S, 1]
+    if closure_softplus_beta is None:
+        new_diam = (c_diam - 0.3).clamp(min=0)  # [B, S, 1]
+    else:
+        # Smooth, strictly-positive replacement for the hard clamp so the
+        # oral-closure band (c_diam <= 0.3) carries a nonzero gradient.
+        new_diam = F.softplus(c_diam - 0.3, beta=closure_softplus_beta)
     diff = diameter - new_diam  # [B, S, N]
     new_diameter = new_diam + diff * scalar  # [B, S, N]
     # Below -0.85 - noseOffset the constriction only opens the velum and does
@@ -544,6 +559,7 @@ def _tract(
     tongue_diameter: Tensor,  # [B, S]
     constriction_index: Tensor,  # [B, S]
     constriction_diameter: Tensor,  # [B, S]
+    closure_softplus_beta: float | None = None,
 ) -> Tensor:  # [B, S]
     B, S = glottis_out.shape
     N = _TRACT_N
@@ -553,7 +569,12 @@ def _tract(
 
     # 1. Diameter profile [B, S, N] and oral reflections [B, S, N]
     diameter = _compute_diameter_profile(
-        tongue_index, tongue_diameter, constriction_index, constriction_diameter, N
+        tongue_index,
+        tongue_diameter,
+        constriction_index,
+        constriction_diameter,
+        N,
+        closure_softplus_beta=closure_softplus_beta,
     )
     amplitude = diameter**2  # [B, S, N]
     A_prev = amplitude[:, :, :-1]
@@ -578,8 +599,12 @@ def _tract(
     # 3. Turbulence injection [B, S, N] with STE
     c_idx = constriction_index
     c_diam = constriction_diameter
-    thinness = torch.clamp(8 * (0.7 - c_diam), 0, 1)
-    openness = torch.clamp(30 * (c_diam - 0.3), 0, 1)
+    if closure_softplus_beta is None:
+        thinness = torch.clamp(8 * (0.7 - c_diam), 0, 1)
+        openness = torch.clamp(30 * (c_diam - 0.3), 0, 1)
+    else:
+        thinness = _soft_unit_clamp(8 * (0.7 - c_diam), closure_softplus_beta)
+        openness = _soft_unit_clamp(30 * (c_diam - 0.3), closure_softplus_beta)
     noise_amount = noise_mod * glottis_out * 0.66 * (thinness * openness) / 2  # [B, S]
     valid_mask = ((c_idx >= 2) & (c_idx <= N) & (c_diam > 0)).float()  # [B, S]
 
@@ -813,6 +838,7 @@ def _tract_ola(
     constriction_diameter: Tensor,  # [B, S]
     ir_length: int = 4096,
     samples_per_frame: int = SAMPLES_PER_FRAME,
+    closure_softplus_beta: float | None = None,
 ) -> Tensor:  # [B, S]
     B, S = glottis_out.shape
     N = _TRACT_N
@@ -830,7 +856,9 @@ def _tract_ola(
     cd_f = constriction_diameter[:, mid]
 
     # Oral reflection coefficients [B, T, N]
-    diameter_f = _compute_diameter_profile(ti_f, td_f, ci_f, cd_f, N)
+    diameter_f = _compute_diameter_profile(
+        ti_f, td_f, ci_f, cd_f, N, closure_softplus_beta=closure_softplus_beta
+    )
     amplitude_f = diameter_f**2
     r_inner = (amplitude_f[:, :, :-1] - amplitude_f[:, :, 1:]) / (
         amplitude_f[:, :, :-1] + amplitude_f[:, :, 1:] + 1e-10
@@ -854,8 +882,16 @@ def _tract_ola(
     r_N_f = (2 * A_N_f - sum_A_f) / sum_A_f
 
     # --- Turbulence source at full sample rate ---
-    thinness = torch.clamp(8 * (0.7 - constriction_diameter), 0.0, 1.0)
-    openness = torch.clamp(30 * (constriction_diameter - 0.3), 0.0, 1.0)
+    if closure_softplus_beta is None:
+        thinness = torch.clamp(8 * (0.7 - constriction_diameter), 0.0, 1.0)
+        openness = torch.clamp(30 * (constriction_diameter - 0.3), 0.0, 1.0)
+    else:
+        thinness = _soft_unit_clamp(
+            8 * (0.7 - constriction_diameter), closure_softplus_beta
+        )
+        openness = _soft_unit_clamp(
+            30 * (constriction_diameter - 0.3), closure_softplus_beta
+        )
     valid_mask = (
         (constriction_index >= 2)
         & (constriction_index <= N)
@@ -912,6 +948,7 @@ def pink_trombone(
     params: Tensor,
     seed: int | Tensor | None = None,
     control_rate: float = CONTROL_RATE,
+    closure_softplus_beta: float | None = None,
 ) -> Tensor:
     """Differentiable Pink Trombone vocal synthesizer.
 
@@ -957,6 +994,7 @@ def pink_trombone(
         tongue_diameter=p["tongueDiameter"],
         constriction_index=p["constrictionIndex"],
         constriction_diameter=p["constrictionDiameter"],
+        closure_softplus_beta=closure_softplus_beta,
     )
 
 
@@ -965,6 +1003,7 @@ def pink_trombone_ola(
     seed: int | Tensor | None = None,
     ir_length: int = 4096,
     control_rate: float = CONTROL_RATE,
+    closure_softplus_beta: float | None = None,
 ) -> Tensor:
     """OLA FIR approximation of the Pink Trombone vocal synthesizer.
 
@@ -1018,4 +1057,5 @@ def pink_trombone_ola(
         constriction_diameter=p["constrictionDiameter"],
         ir_length=ir_length,
         samples_per_frame=spf,
+        closure_softplus_beta=closure_softplus_beta,
     )

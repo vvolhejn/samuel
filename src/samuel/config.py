@@ -70,6 +70,17 @@ class SynthConfig(BaseModel):
     # frame_rate is the parameter control rate; lives on the model config
     # (it drives T_ctrl) but the synth path reads it from the same field.
 
+    # Closure-region gradient fix. When None (default), the constricted tract
+    # diameter is ``(constrictionDiameter - 0.3).clamp(min=0)`` — identically
+    # zero (and zero-gradient) across the whole oral-closure band, so the model
+    # can never *learn* to close the tract for plosives. When set to a float
+    # ``beta``, the clamp is replaced by ``softplus(x, beta)``: strictly
+    # positive, ~0 well inside closure, but with nonzero gradient everywhere so
+    # the optimizer can descend toward a closure. The turbulence gates are
+    # likewise corner-smoothed with the same beta. Open-vowel behavior is
+    # unchanged (softplus == identity for large diameters). Try ~8.0.
+    closure_softplus_beta: float | None = None
+
 
 class LogConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")

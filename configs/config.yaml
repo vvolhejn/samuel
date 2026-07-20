@@ -14,6 +14,10 @@ data:
 
 synth:
   ir_length: 256
+  # null -> hard clamp (zero gradient in the oral-closure band, plosives
+  # can't be learned). A float beta -> softplus closure so the band carries
+  # gradient (see SynthConfig). Try ~8.0.
+  closure_softplus_beta: null
 
 optim:
   lr: 3.0e-4

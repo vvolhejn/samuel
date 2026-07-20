@@ -19,6 +19,10 @@ model:
   # Straight-through (one-hot) Gumbel-softmax during training instead of the
   # soft expectation over bucket centers. Eval always snaps to argmax.
   gumbel_hard: false
+  # Bucket keep-alive exploration: mix training-time Gumbel weights with a
+  # uniform distribution ((1-eps)*w + eps/n_buckets) so closure buckets keep
+  # getting gradient. 0.0 disables. Try ~0.05.
+  explore_eps: 0.0
 
   # (lo, hi, init) per trainable parameter. ``frequency`` is supplied
   # externally from the pyin cache; ``intensity`` is frozen at 1.0 and the

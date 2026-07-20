@@ -67,6 +67,14 @@ class PinkTromboneControllerConfig(BaseModel):
     # is the soft distribution and the synth sees a smooth expectation between
     # bucket centers.
     gumbel_hard: bool = False
+    # Bucket keep-alive exploration. When > 0, the training-time Gumbel weights
+    # are mixed with a uniform distribution: ``(1-eps)*w + eps/n_buckets``. This
+    # guarantees every bucket — including the oral-closure buckets the recon
+    # loss otherwise drives to zero weight — keeps receiving gradient and shows
+    # up in the synthesized (expected) signal, so closures can be discovered.
+    # Eval (argmax) is unaffected. Try ~0.05. Only useful in combination with a
+    # working closure gradient (see synth.closure_softplus_beta).
+    explore_eps: float = 0.0
 
     @property
     def frame_rate(self) -> float:
@@ -210,6 +218,9 @@ class PinkTromboneController(nn.Module):
             weights = F.gumbel_softmax(
                 logits, tau=tau, hard=self.config.gumbel_hard, dim=-1
             )
+            eps = self.config.explore_eps
+            if eps > 0.0:
+                weights = (1.0 - eps) * weights + eps / self.n_buckets
         else:
             argmax = logits.argmax(dim=-1)
             weights = F.one_hot(argmax, num_classes=self.n_buckets).to(logits.dtype)
