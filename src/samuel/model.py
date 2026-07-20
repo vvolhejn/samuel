@@ -1,12 +1,12 @@
 """1D-CNN controller that turns audio into Pink Trombone parameter trajectories.
 
 The head emits a categorical distribution over ``n_buckets`` evenly spaced
-values per trainable parameter. During training a (hard) Gumbel-softmax
-sample selects one bucket center; at eval time the argmax bucket is used.
-The ``frequency`` parameter is supplied externally (precomputed pyin).
-Overall loudness is matched to the target with a single per-utterance gain in
-the train loop, so ``intensity`` is trainable and carries the within-utterance
-energy contour.
+values per trainable parameter. During training a Gumbel-softmax sample
+weights the bucket centers (soft by default; one-hot straight-through with
+``gumbel_hard``); at eval time the argmax bucket is used.
+The ``frequency`` parameter is supplied externally (precomputed pyin) and
+``intensity`` is frozen to 1.0 — volume is matched post-synth in the train
+loop.
 """
 
 from __future__ import annotations
@@ -22,12 +22,10 @@ from torch import Tensor, nn
 from samuel.encoder import SEANetEncoder, SEANetEncoderConfig
 from samuel.pink_trombone import N_PARAMS, PARAM_NAMES, SAMPLE_RATE
 
-# (lo, hi, init) per trainable parameter. ``frequency`` is intentionally
-# absent — it comes from pyin. ``intensity`` is trainable (overall gain /
-# voicing onset); only a per-utterance loudness match is applied downstream.
+# (lo, hi, init) per trainable parameter. ``frequency`` and ``intensity`` are
+# intentionally absent — frequency comes from pyin, intensity is frozen.
 _DEFAULT_PARAM_SPEC: dict[str, tuple[float, float, float]] = {
     "voiceness": (0.0, 1.0, 0.6),
-    "intensity": (0.0, 1.0, 1.0),
     "tongueIndex": (10.0, 35.0, 20.0),
     "tongueDiameter": (1.5, 3.5, 2.4),
     "constrictionIndex": (22.0, 44.0, 33.0),
@@ -43,6 +41,7 @@ _DEFAULT_PARAM_SPEC: dict[str, tuple[float, float, float]] = {
     "constrictionDiameter": (-2.0, 3.0, 1.25),
 }
 _DEFAULT_FROZEN_VALUES: dict[str, float] = {
+    "intensity": 1.0,
     "vibratoWobble": 0.0,
     "vibratoFrequency": 6.0,
     "vibratoGain": 0.0,
@@ -62,6 +61,20 @@ class PinkTromboneControllerConfig(BaseModel):
     )
     samples_per_frame: int = 2048
     n_buckets: int = 32
+    # Straight-through Gumbel-softmax during training: the forward output is a
+    # one-hot sample (matching eval's argmax snap exactly), gradients flow
+    # through the soft distribution. With False (default), the forward output
+    # is the soft distribution and the synth sees a smooth expectation between
+    # bucket centers.
+    gumbel_hard: bool = False
+    # Bucket keep-alive exploration. When > 0, the training-time Gumbel weights
+    # are mixed with a uniform distribution: ``(1-eps)*w + eps/n_buckets``. This
+    # guarantees every bucket — including the oral-closure buckets the recon
+    # loss otherwise drives to zero weight — keeps receiving gradient and shows
+    # up in the synthesized (expected) signal, so closures can be discovered.
+    # Eval (argmax) is unaffected. Try ~0.05. Only useful in combination with a
+    # working closure gradient (see synth.closure_softplus_beta).
+    explore_eps: float = 0.0
 
     @property
     def frame_rate(self) -> float:
@@ -197,10 +210,17 @@ class PinkTromboneController(nn.Module):
             # hard=False: the forward output is the soft Gumbel-softmax
             # distribution; (weights * centers).sum is then a smooth
             # expectation between bucket centers. Eval still snaps to the
-            # argmax bucket, so there's a mild train/eval mismatch — but
-            # hard=True (straight-through) tends to lock the argmax in this
-            # setup, with eval loss bit-identical across many steps.
-            weights = F.gumbel_softmax(logits, tau=tau, hard=False, dim=-1)
+            # argmax bucket, so there's a mild train/eval mismatch.
+            # hard=True (straight-through) removes that mismatch but locked
+            # the argmax when tried before the hinged entropy floor existed
+            # (eval loss bit-identical across many steps) — watch
+            # train/bucket_usage if enabling it.
+            weights = F.gumbel_softmax(
+                logits, tau=tau, hard=self.config.gumbel_hard, dim=-1
+            )
+            eps = self.config.explore_eps
+            if eps > 0.0:
+                weights = (1.0 - eps) * weights + eps / self.n_buckets
         else:
             argmax = logits.argmax(dim=-1)
             weights = F.one_hot(argmax, num_classes=self.n_buckets).to(logits.dtype)
