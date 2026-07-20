@@ -57,6 +57,7 @@ function cancelAndHold(param: AudioParam, t: number) {
 function automatedParams(
   element: PinkTromboneElement,
   constriction: PinkTromboneConstriction,
+  lipConstriction: PinkTromboneConstriction,
   masterGain: GainNode,
 ): AudioParam[] {
   return [
@@ -67,6 +68,7 @@ function automatedParams(
     element.tongue.diameter,
     constriction.index,
     constriction.diameter,
+    lipConstriction.diameter,
     masterGain.gain,
   ];
 }
@@ -84,6 +86,10 @@ function curveValues(response: SynthResponse): Float32Array[] {
     Float32Array.from(params.tongueDiameter),
     Float32Array.from(params.constrictionIndex),
     Float32Array.from(params.constrictionDiameter),
+    // Older checkpoints predate the lip constriction; leave it open then.
+    params.lipDiameter
+      ? Float32Array.from(params.lipDiameter)
+      : new Float32Array(params.voiceness.length).fill(3),
     Float32Array.from(response.gain),
   ];
 }
@@ -107,6 +113,7 @@ function scheduleCurve(
 export function usePinkTrombone(): PinkTromboneHandle {
   const elementRef = useRef<PinkTromboneElement | null>(null);
   const constrictionRef = useRef<PinkTromboneConstriction | null>(null);
+  const lipConstrictionRef = useRef<PinkTromboneConstriction | null>(null);
   const masterGainRef = useRef<GainNode | null>(null);
   /** Audio-clock time when the last scheduled utterance ends. */
   const scheduleEndRef = useRef(0);
@@ -139,9 +146,12 @@ export function usePinkTrombone(): PinkTromboneHandle {
     element.vibrato.wobble.value = 0;
     element.intensity.value = 0;
 
-    // Single persistent constriction slot driven by the model trajectories.
+    // Two persistent constriction slots driven by the model trajectories:
+    // the tongue-tip constriction (movable index) and the lip constriction
+    // (fixed at the last tract index, mirrors _LIP_INDEX in pink_trombone.py).
     // Start fully open (diameter 3 ≈ no constriction).
     constrictionRef.current = element.newConstriction(33, 3);
+    lipConstrictionRef.current = element.newConstriction(43, 3);
 
     // Master gain for the per-frame volume-match envelope (training only
     // ever evaluated volume-matched audio, so the raw synth has no
@@ -169,8 +179,9 @@ export function usePinkTrombone(): PinkTromboneHandle {
       const { speed = 1, startFrac = 0, onProgress } = options;
       const element = elementRef.current;
       const constriction = constrictionRef.current;
+      const lipConstriction = lipConstrictionRef.current;
       const masterGain = masterGainRef.current;
-      if (!element || !constriction || !masterGain)
+      if (!element || !constriction || !lipConstriction || !masterGain)
         throw new Error("Pink Trombone not ready");
 
       const ctx = element.audioContext;
@@ -194,7 +205,12 @@ export function usePinkTrombone(): PinkTromboneHandle {
       // inside its interval throw NotSupportedError.
       const t0 = Math.max(now + LEAD_S, scheduleEndRef.current + 0.02);
 
-      const params = automatedParams(element, constriction, masterGain);
+      const params = automatedParams(
+        element,
+        constriction,
+        lipConstriction,
+        masterGain,
+      );
       params.forEach((param, i) => {
         scheduleCurve(param, values[i].subarray(startFrame), now, t0, duration);
       });
@@ -245,10 +261,16 @@ export function usePinkTrombone(): PinkTromboneHandle {
     playTokenRef.current++;
     const element = elementRef.current;
     const constriction = constrictionRef.current;
+    const lipConstriction = lipConstrictionRef.current;
     const masterGain = masterGainRef.current;
-    if (!element || !constriction || !masterGain) return;
+    if (!element || !constriction || !lipConstriction || !masterGain) return;
     const now = element.audioContext.currentTime;
-    for (const param of automatedParams(element, constriction, masterGain)) {
+    for (const param of automatedParams(
+      element,
+      constriction,
+      lipConstriction,
+      masterGain,
+    )) {
       cancelAndHold(param, now);
     }
     cancelAndHold(element.intensity, now);
@@ -260,8 +282,9 @@ export function usePinkTrombone(): PinkTromboneHandle {
     playTokenRef.current++;
     const element = elementRef.current;
     const constriction = constrictionRef.current;
+    const lipConstriction = lipConstrictionRef.current;
     const masterGain = masterGainRef.current;
-    if (!element || !constriction || !masterGain) return;
+    if (!element || !constriction || !lipConstriction || !masterGain) return;
     const ctx = element.audioContext;
     void ctx.resume(); // called from a user gesture
 
@@ -272,7 +295,12 @@ export function usePinkTrombone(): PinkTromboneHandle {
       Math.max(0, Math.round(frac * (nFrames - 1))),
     );
     const now = ctx.currentTime;
-    const params = automatedParams(element, constriction, masterGain);
+    const params = automatedParams(
+      element,
+      constriction,
+      lipConstriction,
+      masterGain,
+    );
     params.forEach((param, i) => {
       cancelAndHold(param, now);
       param.setTargetAtTime(values[i][frame], now, SCRUB_TAU_S);
