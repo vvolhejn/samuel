@@ -8,31 +8,45 @@ visualization animates along.
 
 ## Run
 
-1. Vendor the browser assets (once, and after rebuilding `../Pink-Trombone`
-   or bumping `@ricky0123/vad-web`):
+Vendor the browser assets first (once, and after rebuilding `../Pink-Trombone`
+or bumping `@ricky0123/vad-web`):
 
-   ```bash
-   pnpm install
-   ./scripts/vendor-pink-trombone.sh
-   ```
+```bash
+pnpm install
+./scripts/vendor-pink-trombone.sh
+```
 
-2. Start the model backend (from the repo root):
+### One process (recommended)
 
-   ```bash
-   uv run --extra server uvicorn samuel.server:app --port 8000
-   ```
+The backend serves both the UI and the API. On startup it builds the Next.js
+static export (`out/`, via `pnpm build`) and mounts it at `/`:
 
-   Env overrides: `SAMUEL_CHECKPOINT` (local `.pt` or wandb artifact ref),
-   `SAMUEL_RUN_CONFIG` (run `config.json`; only its `model` block is used).
+```bash
+uv run --extra server python -m samuel.server
+```
 
-3. Start the frontend:
+Open http://127.0.0.1:8471, click Start, allow the microphone, speak, pause —
+it speaks back. Env overrides:
 
-   ```bash
-   pnpm dev
-   ```
+- `SAMUEL_CHECKPOINT` — local `.pt` or wandb artifact ref. The run's
+  `config.json` is found next to it (`<run_dir>/config.json`) automatically
+- `SAMUEL_RUN_CONFIG` — override the auto-found config (only its `model` block
+  is used); required only for a wandb-artifact checkpoint
+- `SAMUEL_PORT` / `SAMUEL_HOST` — default `127.0.0.1:8471`
+- `SAMUEL_FRONTEND_SKIP_BUILD=1` — serve an existing `out/` without rebuilding
+- `SAMUEL_SERVE_FRONTEND=0` — API only (use the dev-mode workflow below)
 
-   Open http://localhost:3000 (`/api/*` is proxied to the backend), click
-   Start, allow the microphone, speak, pause — it speaks back.
+### Two processes (frontend dev mode)
+
+For live-reloading frontend work, run the backend API-only and Next's dev
+server separately:
+
+```bash
+SAMUEL_SERVE_FRONTEND=0 uv run --extra server uvicorn samuel.server:app --port 8471
+pnpm dev   # in another shell
+```
+
+Open http://localhost:3000 — `/api/*` is proxied to the backend on :8471.
 
 ## How it works
 
