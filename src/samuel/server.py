@@ -84,9 +84,6 @@ IR_LENGTH = 256
 # Length of the clips /api/dataset_clip serves (matches the eval chunking).
 CLIP_SECONDS = 10.0
 
-# Fallback for checkpoints whose run config predates data.target_rms.
-DEFAULT_TARGET_RMS = 0.05
-
 
 # https://wandb.ai/<entity>/<project>/runs/<id>[/...][?query], or the bare
 # <entity>/<project>/runs/<id> path.
@@ -240,7 +237,7 @@ def _pitch_track(
 
 def _target_rms() -> float:
     """``data.target_rms`` for the loaded checkpoint, so inference matches training."""
-    return float(_run_config().get("data", {}).get("target_rms", DEFAULT_TARGET_RMS))
+    return float(_run_config()["data"]["target_rms"])
 
 
 def _rms_normalize(wav: np.ndarray, target_rms: float) -> np.ndarray:
