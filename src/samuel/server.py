@@ -17,12 +17,17 @@ Run (serves UI + API on http://127.0.0.1:8471):
 Env:
     SAMUEL_PORT / SAMUEL_HOST   override the default 127.0.0.1:8471
                                 (python -m samuel.server entrypoint only)
-    SAMUEL_CHECKPOINT   local .pt path or wandb artifact ref
+    SAMUEL_CHECKPOINT   local .pt path, wandb run URL/path, or wandb artifact ref
                         (default: runs/reg-f1.0-s0.1_20260719-120003/checkpoints/last.pt)
+                        A run URL (https://wandb.ai/<entity>/<project>/runs/<id>,
+                        or just <entity>/<project>/runs/<id>) is self-contained:
+                        the run's model artifact and its config both come from
+                        wandb, so no SAMUEL_RUN_CONFIG is needed.
     SAMUEL_RUN_CONFIG   run config.json to build the model from. Optional:
                         by default it is found next to the checkpoint's run
-                        dir (<run_dir>/config.json). Required only for a
-                        wandb-artifact checkpoint, which has no config beside it.
+                        dir (<run_dir>/config.json), or taken from the wandb run
+                        when SAMUEL_CHECKPOINT is a run URL. Required only for a
+                        bare wandb-artifact checkpoint, which has no config beside it.
     SAMUEL_MANIFEST     dataset manifest (jsonl) for /api/dataset_clip
                         (default: the run config's data.manifest_path)
     SAMUEL_SERVE_FRONTEND    "0" to serve only the API (no build/mount).
@@ -39,6 +44,7 @@ import json
 import logging
 import os
 import random
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -85,15 +91,59 @@ CLIP_SECONDS = 10.0
 MAX_GAIN = 30.0
 
 
-def _resolve_checkpoint(ref: str) -> Path:
-    """Local ``.pt`` path, or a wandb artifact ref downloaded on demand."""
+# https://wandb.ai/<entity>/<project>/runs/<id>[/...][?query], or the bare
+# <entity>/<project>/runs/<id> path.
+_WANDB_RUN_RE = re.compile(
+    r"^(?:https?://[^/]*wandb\.ai/)?(?P<entity>[^/?#]+)/(?P<project>[^/?#]+)"
+    r"/runs/(?P<run_id>[^/?#]+)"
+)
+
+
+def _resolve_wandb_run(ref: str) -> tuple[Path, dict]:
+    """Download a wandb run's checkpoint artifact; return (path, run config).
+
+    The run config comes from wandb (``train.py`` logs the full config dump as
+    ``wandb.init(config=...)``), so a run URL needs no local run dir.
+    """
+    import wandb
+
+    match = _WANDB_RUN_RE.match(ref)
+    assert match is not None, ref
+    run_path = "{entity}/{project}/{run_id}".format(**match.groupdict())
+    run = wandb.Api().run(run_path)
+
+    models = [a for a in run.logged_artifacts() if a.type == "model"]
+    if not models:
+        raise FileNotFoundError(
+            f"wandb run {run_path} ({run.name}) logged no model artifact; "
+            "point SAMUEL_CHECKPOINT at a local .pt instead (only runs that "
+            "finished cleanly with log.ckpt_wandb_artifact upload one)"
+        )
+    # Runs log a single checkpoint artifact at the end; take the newest if more.
+    artifact = models[-1]
+    logger.info(
+        "wandb run %s (%s): using artifact %s", run_path, run.name, artifact.name
+    )
+    return Path(artifact.download()) / "last.pt", dict(run.config)
+
+
+def _resolve_checkpoint(ref: str) -> tuple[Path, dict | None]:
+    """Resolve a checkpoint ref to a local path, plus its run config if known.
+
+    ``ref`` is a local ``.pt`` path, a wandb run URL/path, or a wandb artifact
+    ref. Only the run form carries a config; the others return None and leave
+    config resolution to :func:`_resolve_config_path`.
+    """
     if Path(ref).exists():
-        return Path(ref)
+        return Path(ref), None
+
+    if _WANDB_RUN_RE.match(ref):
+        return _resolve_wandb_run(ref)
 
     import wandb
 
     artifact = wandb.Api().artifact(ref, type="model")
-    return Path(artifact.download()) / "last.pt"
+    return Path(artifact.download()) / "last.pt", None
 
 
 def _resolve_config_path(checkpoint_path: Path) -> Path:
@@ -138,9 +188,15 @@ def _load_model() -> PinkTromboneController:
     checkpoint_ref = os.environ.get(
         "SAMUEL_CHECKPOINT", str(_DEFAULT_RUN_DIR / "checkpoints" / "last.pt")
     )
-    checkpoint_path = _resolve_checkpoint(checkpoint_ref)
-    config_path = _resolve_config_path(checkpoint_path)
-    _run_cfg = json.loads(config_path.read_text())
+    checkpoint_path, run_cfg = _resolve_checkpoint(checkpoint_ref)
+    override = os.environ.get("SAMUEL_RUN_CONFIG")
+    if run_cfg is not None and not override:
+        config_source = f"wandb run config ({checkpoint_ref})"
+        _run_cfg = run_cfg
+    else:
+        config_path = _resolve_config_path(checkpoint_path)
+        config_source = str(config_path)
+        _run_cfg = json.loads(config_path.read_text())
 
     # Only the "model" block is read: the run's full config may contain keys
     # from other branches that the current pydantic configs reject.
@@ -154,7 +210,7 @@ def _load_model() -> PinkTromboneController:
     logger.info(
         "loaded checkpoint %s (config %s) on %s (frame_rate=%.3f)",
         checkpoint_path,
-        config_path,
+        config_source,
         device,
         model_config.frame_rate,
     )
