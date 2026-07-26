@@ -215,6 +215,41 @@ def _tau_for_step(step: int, cfg: TrainConfig) -> float:
     return cfg.optim.tau_start + frac * (cfg.optim.tau_end - cfg.optim.tau_start)
 
 
+def _normalized_trainable_diffs(
+    params: torch.Tensor, module: PinkTromboneController
+) -> torch.Tensor:
+    """Per-frame absolute change of trainable params, each rescaled to [0, 1].
+
+    Uses the bucket-center range per parameter so no single wide-range
+    parameter dominates. Returns ``[B, T-1, n_trainable]``; differentiable.
+    """
+    trainable_idx = module._trainable_idx
+    train_params = params.index_select(-1, trainable_idx).float()
+    lo = module.bucket_centers[:, 0].view(1, 1, -1)
+    hi = module.bucket_centers[:, -1].view(1, 1, -1)
+    p_norm = (train_params - lo) / (hi - lo).clamp_min(1e-8)
+    return (p_norm[:, 1:] - p_norm[:, :-1]).abs()
+
+
+def _smoothness_loss(
+    params: torch.Tensor,
+    module: PinkTromboneController,
+    weights: dict[str, float],
+) -> torch.Tensor:
+    """L1 temporal-smoothness penalty on the control trajectories.
+
+    ``sum_p weights[p] * mean_{batch,time} |Δp_norm|`` over trainable params;
+    params absent from ``weights`` contribute 0 (see LossConfig.smooth_weights).
+    """
+    diff = _normalized_trainable_diffs(params, module)  # [B, T-1, n_t]
+    coeffs = torch.tensor(
+        [weights.get(n, 0.0) for n in module.trainable_names_],
+        dtype=diff.dtype,
+        device=diff.device,
+    )
+    return (diff.mean(dim=(0, 1)) * coeffs).sum()
+
+
 @torch.no_grad()
 def _param_variation(params: torch.Tensor, module: PinkTromboneController) -> float:
     """Mean per-frame absolute change of trainable params, normalised to [0, 1].
@@ -226,28 +261,20 @@ def _param_variation(params: torch.Tensor, module: PinkTromboneController) -> fl
     rate?" check: a value of 0.1 means the average param moves 10 % of its
     range per control frame.
     """
-    trainable_idx = module._trainable_idx
-    train_params = params.index_select(-1, trainable_idx).float()
-    lo = module.bucket_centers[:, 0].view(1, 1, -1)
-    hi = module.bucket_centers[:, -1].view(1, 1, -1)
-    p_norm = (train_params - lo) / (hi - lo).clamp_min(1e-8)
-    diff = (p_norm[:, 1:] - p_norm[:, :-1]).abs()
-    return float(diff.mean().item())
+    return float(_normalized_trainable_diffs(params, module).mean().item())
 
 
 @torch.no_grad()
 def _controller_diagnostics(
-    aux: dict[str, torch.Tensor], trainable_names: list[str], tau: float
+    aux: dict[str, torch.Tensor], trainable_names: list[str]
 ) -> dict[str, float | wandb.Histogram]:
     """Per-step diagnostics for the categorical head + encoder.
 
     Logits and z come from ``model.forward(..., return_aux=True)``. Logged
     under ``diag/`` to keep the train/eval namespaces clean.
 
-    Two bucket histograms per trainable param:
-      - ``bucket_usage``: hard argmax counts (what eval and hard-Gumbel pick).
-      - ``bucket_usage_tempered``: average softmax(logits/tau) per bucket
-        (what the soft Gumbel feeds into the synth in expectation).
+    One bucket histogram per trainable param, ``bucket_usage``: hard argmax
+    counts (what eval and hard-Gumbel pick).
     """
     logits = aux["logits"].detach().float()  # [B, T, n_t, n_b]
     z = aux["z"].detach().float()  # [B, dim, T]
@@ -256,8 +283,6 @@ def _controller_diagnostics(
     top2 = logits.topk(2, dim=-1).values
     margin = top2[..., 0] - top2[..., 1]  # [B, T, n_t]
     argmax = logits.argmax(-1)  # [B, T, n_t]
-    tempered = F.softmax(logits / max(tau, 1e-6), dim=-1)
-    tempered_per_bucket = tempered.mean(dim=(0, 1))  # [n_t, n_b]
     edges = np.arange(n_b + 1) - 0.5
 
     out: dict[str, float | wandb.Histogram] = {}
@@ -267,9 +292,6 @@ def _controller_diagnostics(
         out[f"diag/margin/{name}"] = margin[..., j].mean().item()
         out[f"diag/bucket_usage/{name}"] = wandb.Histogram(
             np_histogram=(counts.cpu().numpy(), edges)
-        )
-        out[f"diag/bucket_usage_tempered/{name}"] = wandb.Histogram(
-            np_histogram=(tempered_per_bucket[j].cpu().numpy(), edges)
         )
 
     out["diag/margin/mean"] = margin.mean().item()
@@ -538,6 +560,9 @@ def _evaluate(
     out: dict[str, object] = {
         "eval/loss": total.item(),
         "eval/param_variation": _param_variation(params, model),
+        "eval/smooth_loss": _smoothness_loss(
+            params, model, cfg.loss.smooth_weights
+        ).item(),
     }
     for name, value in components.items():
         out[f"eval/recon/{name}"] = value.item()
@@ -653,6 +678,11 @@ def main(hydra_cfg: DictConfig) -> None:
 
     # Model
     model = PinkTromboneController(cfg.model).to(device)
+    unknown_smooth = set(cfg.loss.smooth_weights) - set(model.trainable_names_)
+    if unknown_smooth:
+        raise ValueError(
+            f"loss.smooth_weights names non-trainable params: {sorted(unknown_smooth)}"
+        )
     frame_rate = cfg.model.frame_rate
     samples_per_frame = cfg.model.samples_per_frame
     loss_components: list[tuple[str, float, nn.Module]] = [
@@ -822,7 +852,14 @@ def main(hydra_cfg: DictConfig) -> None:
         entropy_per_pos = -(log_probs.exp() * log_probs).sum(-1)  # [B, T, P]
         entropy = entropy_per_pos.mean()
         entropy_penalty = F.relu(cfg.loss.entropy_floor - entropy_per_pos).mean()
-        loss = recon_loss + cfg.loss.entropy * entropy_penalty
+        # Always computed (it's cheap) so the raw value can be compared across
+        # runs; contributes to the gradient only when weighted.
+        smooth_loss = _smoothness_loss(params, module, cfg.loss.smooth_weights)
+        loss = (
+            recon_loss
+            + cfg.loss.entropy * entropy_penalty
+            + cfg.loss.smooth * smooth_loss
+        )
 
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -849,6 +886,7 @@ def main(hydra_cfg: DictConfig) -> None:
                 "train/recon_loss": recon_loss.item(),
                 "train/entropy": entropy.item(),
                 "train/entropy_penalty": entropy_penalty.item(),
+                "train/smooth_loss": smooth_loss.item(),
                 "train/lr": optimizer.param_groups[0]["lr"],
                 "train/tau": tau,
                 "train/grad_norm": float(grad_norm),
@@ -859,9 +897,7 @@ def main(hydra_cfg: DictConfig) -> None:
             for name, value in recon_components.items():
                 log_payload[f"train/recon/{name}"] = value.item()
             log_payload["train/param_variation"] = _param_variation(params, module)
-            log_payload.update(
-                _controller_diagnostics(aux, model.trainable_names_, tau)
-            )
+            log_payload.update(_controller_diagnostics(aux, model.trainable_names_))
             wandb.log(log_payload, step=step)
 
         if rank == 0 and eval_setup is not None and step % cfg.log.eval_every == 0:

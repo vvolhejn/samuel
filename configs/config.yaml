@@ -37,6 +37,16 @@ loss:
   # 4x window overlap (n_fft=2048, hop=samples_per_frame=512). Null falls
   # back to n_fft=samples_per_frame (no overlap).
   mfcc_n_fft: 2048
+  # Temporal smoothness: L1 on per-frame changes of range-normalised control
+  # trajectories, sum_p smooth_weights[p] * mean|Δp_norm|. Params not listed
+  # in smooth_weights are unpenalised. See LossConfig for details.
+  smooth: 0.0
+  smooth_weights:
+    tongueIndex: 1.0
+    tongueDiameter: 1.0
+    constrictionIndex: 1.0
+    constrictionDiameter: 0.5
+    lipDiameter: 0.5
   # SSL feature-matching (perceptual) loss
   ssl: 0.0
   # HF id. Others tried: facebook/hubert-base-ls960,

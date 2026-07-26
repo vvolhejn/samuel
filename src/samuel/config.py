@@ -138,6 +138,21 @@ class LossConfig(BaseModel):
     # None to revert to n_fft = samples_per_frame.
     mfcc_n_fft: int | None = 2048
 
+    # Temporal-smoothness penalty: L1 on the per-frame change of the predicted
+    # control trajectories, computed on range-normalised params (each trainable
+    # param rescaled to [0, 1]. Contribution to the training loss:
+    #   smooth * sum_p smooth_weights[p] * mean_{batch,time} |Δp_norm|
+    smooth: float = 0.0
+    smooth_weights: dict[str, float] = Field(
+        default_factory=lambda: {
+            "tongueIndex": 1.0,
+            "tongueDiameter": 1.0,
+            "constrictionIndex": 1.0,
+            "constrictionDiameter": 0.5,
+            "lipDiameter": 0.5,
+        }
+    )
+
     # SSL feature-matching (perceptual) loss on a frozen speech encoder.
     # L1 distance between the encoder's hidden states for pred vs. target audio.
     ssl: float = 0.0
