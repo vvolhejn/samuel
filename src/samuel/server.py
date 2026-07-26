@@ -84,11 +84,8 @@ IR_LENGTH = 256
 # Length of the clips /api/dataset_clip serves (matches the eval chunking).
 CLIP_SECONDS = 10.0
 
-# Cap on the per-frame volume-match gain. Training's _volume_match is
-# unclamped, but near-silent synth frames against noisy mic input can
-# produce absurd gains; the JS synth's absolute level differs from the
-# Python synth's anyway, so the envelope shape is what matters.
-MAX_GAIN = 30.0
+# Fallback for checkpoints whose run config predates data.target_rms.
+DEFAULT_TARGET_RMS = 0.05
 
 
 # https://wandb.ai/<entity>/<project>/runs/<id>[/...][?query], or the bare
@@ -240,26 +237,15 @@ def _pitch_track(
     return fill_unvoiced(f0, voiced, PYIN_FMIN, PYIN_FMAX), voiced
 
 
-def _volume_match(
-    synth: np.ndarray, target: np.ndarray, hop: int, t_ctrl: int
-) -> tuple[np.ndarray, np.ndarray]:
-    """Per-frame RMS gain matching ``synth`` to ``target`` (train._volume_match).
+def _target_rms() -> float:
+    """``data.target_rms`` for the loaded checkpoint, so inference matches training."""
+    return float(_run_config().get("data", {}).get("target_rms", DEFAULT_TARGET_RMS))
 
-    Returns (gain [t_ctrl], synth_normalized). The gain vector is padded with
-    its last value up to ``t_ctrl`` so it aligns with the parameter frames.
-    """
-    S = min(len(synth), len(target))
-    T = S // hop
-    synth_f = synth[: T * hop].reshape(T, hop)
-    tgt_f = target[: T * hop].reshape(T, hop)
-    synth_rms = np.sqrt(np.clip((synth_f**2).mean(-1), 1e-12, None))
-    tgt_rms = np.sqrt(np.clip((tgt_f**2).mean(-1), 1e-12, None))
-    gain = np.clip(tgt_rms / synth_rms, 0.0, MAX_GAIN).astype(np.float32)
-    synth_norm = (synth_f * gain[:, None]).reshape(-1).astype(np.float32)
-    if len(gain) < t_ctrl:
-        pad_value = gain[-1] if len(gain) else 1.0
-        gain = np.pad(gain, (0, t_ctrl - len(gain)), constant_values=pad_value)
-    return gain[:t_ctrl], synth_norm
+
+def _rms_normalize(wav: np.ndarray, target_rms: float) -> np.ndarray:
+    """Scale ``wav`` to ``target_rms`` (train._rms_normalize)."""
+    rms = float(np.sqrt(np.clip((wav.astype(np.float64) ** 2).mean(), 1e-12, None)))
+    return (wav * (target_rms / rms)).astype(np.float32)
 
 
 def _encode_wav_b64(audio: np.ndarray) -> str:
@@ -383,13 +369,16 @@ def _mimic(audio: np.ndarray) -> dict:
     t_ctrl = _model.t_ctrl_for(len(audio))
     f0, voiced = _pitch_track(audio, _model.samples_per_frame, t_ctrl)
 
+    # The model was trained on RMS-normalised input, so normalise here too.
+    audio_in = _rms_normalize(audio, _target_rms())
+
     device = next(_model.parameters()).device
-    wav = torch.from_numpy(audio).to(device)[None, None, :]
+    wav = torch.from_numpy(audio_in).to(device)[None, None, :]
     f0_t = torch.from_numpy(f0).to(device)[None, :]
     with torch.no_grad():
-        params = _model(wav, f0_t)  # [1, T_ctrl, N_PARAMS]
         # Reference resynthesis with the Python synth (for A/B debugging),
-        # mirroring the eval loop: OLA synth + per-frame RMS match to target.
+        # mirroring the eval loop.
+        params = _model(wav, f0_t)  # [1, T_ctrl, N_PARAMS]
         synth = (
             pink_trombone_ola(
                 params,
@@ -401,7 +390,8 @@ def _mimic(audio: np.ndarray) -> dict:
             .numpy()
         )
 
-    gain, synth_norm = _volume_match(synth, audio, _model.samples_per_frame, t_ctrl)
+    # The synth output is used as-is: the model was scored on its own output
+    # level, so it carries the energy envelope itself (via intensity).
     params = params[0].cpu().numpy()
 
     return {
@@ -410,11 +400,7 @@ def _mimic(audio: np.ndarray) -> dict:
         "duration_s": len(audio) / SAMPLE_RATE,
         "params": {name: params[:, i].tolist() for i, name in enumerate(PARAM_NAMES)},
         "voiced": voiced.tolist(),
-        # Per-frame gain the browser synth should apply (training's loss only
-        # ever saw volume-matched output, so the raw model output has no
-        # meaningful envelope — silence would hum without this).
-        "gain": gain.tolist(),
-        "synth_audio_b64": _encode_wav_b64(synth_norm),
+        "synth_audio_b64": _encode_wav_b64(synth.astype(np.float32)),
     }
 
 

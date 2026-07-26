@@ -30,6 +30,14 @@ class DataConfig(BaseModel):
     chunk_seconds: float = 4.0
     num_workers: int = 4
     pitch_cache_path: Path | None = None
+    # Every clip is RMS-normalised to this level and the normalised audio is
+    # used as *both* the encoder input and the loss target. The synth output is
+    # never gain-matched, so the model has to produce the absolute level itself
+    # (via ``intensity``) and going quiet is penalised rather than corrected for
+    # free. 0.05 sits mid-range of the synth's reachable output (~0.044 at mid
+    # params, ~0.067 at intensity=1) so ``intensity`` can modulate both up and
+    # down. At inference, normalise the input clip to the same level.
+    target_rms: float = 0.05
     # Fraction of the manifest reserved as the held-out validation split.
     # Files at the tail of the manifest (after the train cut) are never seen
     # during training; eval samples from them for the val_* metrics.

@@ -8,9 +8,8 @@ export interface SynthResponse {
   duration_s: number;
   params: Record<string, number[]>;
   voiced: boolean[];
-  /** Per-frame RMS volume-match gain (training's _volume_match). */
-  gain: number[];
-  /** Python-synth reference audio (volume-matched WAV), for A/B debugging. */
+  /** Python-synth reference audio (WAV) for A/B debugging. Not volume-matched:
+   * the model produces its own level via the `intensity` trajectory. */
   synth_audio_b64: string;
 }
 

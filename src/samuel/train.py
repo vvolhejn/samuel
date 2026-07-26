@@ -20,7 +20,6 @@ from pathlib import Path
 
 import hydra
 import numpy as np
-from einops import rearrange
 import plotly.graph_objects as go
 import torch
 import torch.distributed as dist
@@ -197,15 +196,23 @@ def _controller_diagnostics(
     return out
 
 
-def _volume_match(pred: torch.Tensor, target: torch.Tensor, hop: int) -> torch.Tensor:
-    """Per-frame RMS-match ``pred`` to ``target``. Both ``[B, S]``, S a multiple of hop."""
-    T = pred.shape[-1] // hop
-    pred_f = rearrange(pred[..., : T * hop], "b (t h) -> b t h", h=hop)
-    tgt_f = rearrange(target[..., : T * hop], "b (t h) -> b t h", h=hop)
-    pred_rms = pred_f.pow(2).mean(-1).clamp_min(1e-12).sqrt()
-    tgt_rms = tgt_f.pow(2).mean(-1).clamp_min(1e-12).sqrt()
-    gain = (tgt_rms / pred_rms).unsqueeze(-1)
-    return rearrange(pred_f * gain, "b t h -> b (t h)")
+def _rms_normalize(wav: torch.Tensor, target_rms: float) -> torch.Tensor:
+    """Scale each clip to ``target_rms`` (one gain per clip). ``wav`` is ``[B, S]``.
+
+    Applied to the audio used as *both* encoder input and loss target, so the
+    dataset has a single canonical loudness. The synth output is deliberately
+    left alone: the model must produce this absolute level itself, so going
+    silent (e.g. driving ``intensity`` to 0) is penalised rather than corrected
+    for free. Within-utterance energy dynamics are untouched.
+
+    This replaced a per-frame RMS match of the synth output to the target. That
+    match copied the target's energy contour onto the prediction, so the loss
+    carried no loudness gradient at all, and with a trainable ``intensity`` it
+    opened a constant-output collapse basin (entropy and param_variation to
+    zero, WER above 1).
+    """
+    rms = wav.pow(2).mean(-1, keepdim=True).clamp_min(1e-12).sqrt()
+    return wav * (target_rms / rms)
 
 
 @dataclass
@@ -432,16 +439,15 @@ def _evaluate(
     ddp_module.eval()
 
     target = eval_setup.val_wavs.to(device)  # [N, S] float32
+    target = _rms_normalize(target, cfg.data.target_rms)  # same level as training
     f0 = eval_setup.val_f0.to(device)  # [N, T_ctrl]
-    samples_per_frame = model.samples_per_frame
     frame_rate = model.config.frame_rate
 
     params, pred_ola = _run_eval_batched(model, target, f0, cfg, frame_rate)
 
+    # Synth output used as-is: the model is scored on hitting target_rms.
     S = min(pred_ola.shape[-1], target.shape[-1])
-    pred_norm = _volume_match(
-        pred_ola[..., :S].float(), target[..., :S].float(), samples_per_frame
-    )
+    pred_norm = pred_ola[..., :S].float()
 
     S_norm = pred_norm.shape[-1]
     total, components = loss_fn.with_components(pred_norm, target[..., :S_norm].float())
@@ -678,6 +684,9 @@ def main(hydra_cfg: DictConfig) -> None:
 
         wav = batch["audio"].to(device, non_blocking=True)  # [B, S]
         f0 = batch["pitch"].to(device, non_blocking=True)  # [B, T_ctrl]
+        # One canonical loudness for both what the model hears and what it is
+        # scored against; the synth output is not gain-matched below.
+        wav = _rms_normalize(wav, cfg.data.target_rms)
         target = wav
         wav_in = wav.unsqueeze(1)  # [B, 1, S]
 
@@ -705,7 +714,7 @@ def main(hydra_cfg: DictConfig) -> None:
             control_rate=frame_rate,
         )
         S = min(pred.shape[-1], target.shape[-1])
-        pred_norm = _volume_match(pred[..., :S], target[..., :S], samples_per_frame)
+        pred_norm = pred[..., :S]
         S_norm = pred_norm.shape[-1]
         recon_loss, recon_components = loss_fn.with_components(
             pred_norm, target[..., :S_norm]

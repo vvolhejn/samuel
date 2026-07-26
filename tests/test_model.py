@@ -39,7 +39,7 @@ class TestController:
         params = model(wav, f0)
         assert params.shape == (2, T_ctrl, N_PARAMS)
 
-    def test_external_f0_and_intensity_frozen(self):
+    def test_external_f0(self):
         cfg = _small_config()
         model = PinkTromboneController(cfg).eval()
         S = cfg.samples_per_frame * 4
@@ -47,10 +47,35 @@ class TestController:
         wav = torch.randn(2, 1, S)
         f0 = torch.linspace(80, 400, T_ctrl).expand(2, T_ctrl).contiguous()
         params = model(wav, f0)
-        freq_idx = PARAM_NAMES.index("frequency")
-        intensity_idx = PARAM_NAMES.index("intensity")
-        assert torch.allclose(params[..., freq_idx], f0)
-        assert (params[..., intensity_idx] == 1.0).all()
+        assert torch.allclose(params[..., PARAM_NAMES.index("frequency")], f0)
+
+    def test_intensity_trainable_by_default(self):
+        """Default config leaves the model its own level knob.
+
+        Nothing corrects the synth output level downstream (the dataset is
+        normalised to ``data.target_rms`` instead), so ``intensity`` has to be
+        predicted.
+        """
+        cfg = _small_config()
+        assert "intensity" in cfg.param_spec
+        assert "intensity" not in cfg.frozen_values
+        model = PinkTromboneController(cfg).eval()
+        S = cfg.samples_per_frame * 4
+        T_ctrl = S // cfg.samples_per_frame
+        params = model(torch.randn(2, 1, S), _zero_f0(model, 2, T_ctrl))
+        intensity = params[..., PARAM_NAMES.index("intensity")]
+        assert intensity.min() >= 0.0 and intensity.max() <= 1.0
+
+    def test_params_can_be_frozen(self):
+        """frozen_values pins a param the head would otherwise predict."""
+        cfg = _small_config()
+        cfg.param_spec = {k: v for k, v in cfg.param_spec.items() if k != "intensity"}
+        cfg.frozen_values = {**cfg.frozen_values, "intensity": 1.0}
+        model = PinkTromboneController(cfg).eval()
+        S = cfg.samples_per_frame * 4
+        T_ctrl = S // cfg.samples_per_frame
+        params = model(torch.randn(2, 1, S), _zero_f0(model, 2, T_ctrl))
+        assert (params[..., PARAM_NAMES.index("intensity")] == 1.0).all()
 
     def test_eval_outputs_are_bucket_centers(self):
         cfg = _small_config()
