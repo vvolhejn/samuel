@@ -56,6 +56,27 @@ def split_train_val(
     return files[: n - n_val], files[n - n_val :] if n_val > 0 else []
 
 
+def pair_manifests(inputs: list[DatasetFile], targets: list[DatasetFile]) -> None:
+    """Validate that ``targets`` is the same dataset as ``inputs``, file for file.
+
+    The pairing is positional (line i of the target manifest is the target for
+    line i of the input manifest); a stem mismatch anywhere means the manifests
+    were built in different orders and the pairing would silently train on
+    wrong targets.
+    """
+    if len(inputs) != len(targets):
+        raise ValueError(
+            f"target manifest has {len(targets)} files, input manifest has "
+            f"{len(inputs)} — they must be parallel"
+        )
+    for df, tdf in zip(inputs, targets):
+        if df.path.stem != tdf.path.stem:
+            raise ValueError(
+                f"target manifest is not aligned with the input manifest: "
+                f"line {df.index_in_manifest} pairs {df.path} with {tdf.path}"
+            )
+
+
 def _load_resampled(path: Path, target_sr: int) -> np.ndarray:
     """Load a file and resample to ``target_sr`` mono float32."""
     audio, sr = sf.read(str(path), dtype="float32", always_2d=False)
@@ -144,7 +165,10 @@ class LibriLightChunks(IterableDataset):
     Always yields ``{"audio": ...}`` dicts. When ``pitch_cache_path`` is
     given, the dict also has a ``"pitch"`` key with the per-chunk pyin f0
     (linearly interpolated through unvoiced regions) at ``samples_per_frame``
-    hop.
+    hop. When ``target_manifest_path`` is given (a parallel manifest with the
+    same files in the same order, e.g. an enhanced copy of the dataset), the
+    dict also has an ``"audio_target"`` key with the time-aligned chunk from
+    that manifest, for use as the reconstruction target.
     """
 
     def __init__(
@@ -160,6 +184,7 @@ class LibriLightChunks(IterableDataset):
         pitch_cache_path: Path | None = None,
         samples_per_frame: int | None = None,
         val_fraction: float = 0.0,
+        target_manifest_path: Path | None = None,
     ):
         super().__init__()
         self.manifest_path = manifest_path
@@ -183,6 +208,17 @@ class LibriLightChunks(IterableDataset):
         train_files, _ = split_train_val(full_manifest, val_fraction)
         self._all_files = train_files
         self._rank_files = _shard(self._all_files, rank, world_size)
+
+        # index_in_manifest -> target path; pairing keyed by manifest index so
+        # it survives the split/shard/shuffle reorderings of the input files.
+        self._target_by_index: dict[int, Path] | None = None
+        if target_manifest_path is not None:
+            target_manifest = load_manifest(target_manifest_path)
+            pair_manifests(full_manifest, target_manifest)
+            self._target_by_index = {
+                df.index_in_manifest: tdf.path
+                for df, tdf in zip(full_manifest, target_manifest)
+            }
 
         self.pitch_cache_path = pitch_cache_path
         self.samples_per_frame = samples_per_frame
@@ -226,6 +262,18 @@ class LibriLightChunks(IterableDataset):
                 audio = _load_resampled(df.path, self.sample_rate)
             except Exception:  # noqa: BLE001 - skip unreadable files
                 continue
+            target = None
+            if self._target_by_index is not None:
+                try:
+                    target = _load_resampled(
+                        self._target_by_index[df.index_in_manifest], self.sample_rate
+                    )
+                except Exception:  # noqa: BLE001 - skip unreadable files
+                    continue
+                # Resampling rounding can leave the pair a few samples apart;
+                # trim both so chunk offsets stay time-aligned.
+                common = min(len(audio), len(target))
+                audio, target = audio[:common], target[:common]
             pitch_f0 = pitch_voiced = None
             if self._pitch is not None:
                 pitch_f0, pitch_voiced = self._pitch.by_file[df.index_in_manifest]
@@ -238,8 +286,18 @@ class LibriLightChunks(IterableDataset):
                     pad = np.zeros(self.chunk_samples - len(chunk), dtype=np.float32)
                     chunk = np.concatenate([chunk, pad])
 
+                out = {"audio": torch.from_numpy(chunk)}
+                if target is not None:
+                    t_chunk = target[i : i + self.chunk_samples]
+                    if len(t_chunk) < self.chunk_samples:
+                        pad = np.zeros(
+                            self.chunk_samples - len(t_chunk), dtype=np.float32
+                        )
+                        t_chunk = np.concatenate([t_chunk, pad])
+                    out["audio_target"] = torch.from_numpy(t_chunk)
+
                 if self._pitch is None:
-                    yield {"audio": torch.from_numpy(chunk)}
+                    yield out
                     continue
 
                 p_start = i // spf  # type: ignore[operator]
@@ -255,10 +313,8 @@ class LibriLightChunks(IterableDataset):
                     f0_chunk = pitch_f0[p_start:p_end].astype(np.float32, copy=False)
                     voiced_chunk = pitch_voiced[p_start:p_end]
                 f0_filled = fill_unvoiced(f0_chunk, voiced_chunk, fmin, fmax)
-                yield {
-                    "audio": torch.from_numpy(chunk),
-                    "pitch": torch.from_numpy(f0_filled),
-                }
+                out["pitch"] = torch.from_numpy(f0_filled)
+                yield out
 
 
 def build_dataloader(
@@ -285,6 +341,7 @@ def build_dataloader(
         pitch_cache_path=cfg.pitch_cache_path,
         samples_per_frame=samples_per_frame,
         val_fraction=cfg.val_fraction,
+        target_manifest_path=cfg.target_manifest_path,
     )
     return DataLoader(
         dataset,

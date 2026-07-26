@@ -26,6 +26,13 @@ class DataConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     manifest_path: Path
+    # Optional parallel manifest of reconstruction *targets* (e.g. the
+    # resemble-enhance'd copy of the dataset). Must have the same files in the
+    # same order as ``manifest_path``. The model still hears the audio from
+    # ``manifest_path``; all reconstruction losses (MFCC/mel/STFT/SSL) compare
+    # against the aligned chunk from this manifest instead — baking the
+    # enhancement into the model. None (default) targets the input itself.
+    target_manifest_path: Path | None = None
     sample_rate: int = 44100
     chunk_seconds: float = 4.0
     num_workers: int = 4
@@ -39,6 +46,11 @@ class DataConfig(BaseModel):
     @classmethod
     def _resolve_manifest_path(cls, v: Path) -> Path:
         return _resolve_repo_relative(v)
+
+    @field_validator("target_manifest_path")
+    @classmethod
+    def _resolve_target_manifest_path(cls, v: Path | None) -> Path | None:
+        return _resolve_repo_relative(v) if v is not None else None
 
     @field_validator("pitch_cache_path")
     @classmethod

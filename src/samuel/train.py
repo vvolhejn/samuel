@@ -38,6 +38,7 @@ from samuel.data import (
     build_dataloader,
     fill_unvoiced,
     load_manifest,
+    pair_manifests,
     split_train_val,
 )
 from samuel.evals.asr import WhisperEvaluator
@@ -217,7 +218,10 @@ class EvalSetup:
     by step.
     """
 
-    val_wavs: torch.Tensor  # [N_eval, S] float32, CPU
+    val_wavs: torch.Tensor  # [N_eval, S] float32, CPU — model input
+    # Reconstruction target per clip; identical to ``val_wavs`` unless
+    # ``data.target_manifest_path`` is set (then: the enhanced version).
+    val_targets: torch.Tensor  # [N_eval, S] float32, CPU
     val_f0: torch.Tensor  # [N_eval, T_ctrl] float32, CPU
     val_names: list[str]  # caption per clip
     # (index_in_manifest, chunk_start_sample) per clip — stable key for the
@@ -240,6 +244,13 @@ def _eval_setup(
     about 17 MB — easily kept in memory for the run.
     """
     files = load_manifest(cfg.data.manifest_path)
+    target_by_index: dict[int, Path] | None = None
+    if cfg.data.target_manifest_path is not None:
+        target_files = load_manifest(cfg.data.target_manifest_path)
+        pair_manifests(files, target_files)
+        target_by_index = {
+            df.index_in_manifest: tdf.path for df, tdf in zip(files, target_files)
+        }
     _, val_files = split_train_val(files, cfg.data.val_fraction)
     eval_chunk_seconds = cfg.log.eval_chunk_seconds or cfg.data.chunk_seconds
     chunk_samples = int(round(cfg.data.sample_rate * eval_chunk_seconds))
@@ -260,6 +271,7 @@ def _eval_setup(
     selected = val_files[:n_eval]
 
     wavs: list[torch.Tensor] = []
+    tgt_wavs: list[torch.Tensor] = []
     f0s: list[torch.Tensor] = []
     names: list[str] = []
     target_keys: list[tuple[int, int]] = []
@@ -272,6 +284,15 @@ def _eval_setup(
             audio = np.pad(audio, (0, chunk_samples - len(audio)))
         audio = audio[chunk_start : chunk_start + chunk_samples]
 
+        tgt_audio = audio
+        if target_by_index is not None:
+            tgt_audio = _load_resampled(
+                target_by_index[df.index_in_manifest], cfg.data.sample_rate
+            )
+            if len(tgt_audio) < chunk_samples:
+                tgt_audio = np.pad(tgt_audio, (0, chunk_samples - len(tgt_audio)))
+            tgt_audio = tgt_audio[chunk_start : chunk_start + chunk_samples]
+
         f0_full, voiced_full = pitch.by_file[df.index_in_manifest]
         f0_chunk = np.zeros(T_ctrl, dtype=np.float32)
         voiced_chunk = np.zeros(T_ctrl, dtype=bool)
@@ -282,6 +303,7 @@ def _eval_setup(
         f0_filled = fill_unvoiced(f0_chunk, voiced_chunk, pitch.fmin, pitch.fmax)
 
         wavs.append(torch.from_numpy(audio))
+        tgt_wavs.append(torch.from_numpy(tgt_audio))
         f0s.append(torch.from_numpy(f0_filled))
         names.append(df.path.name)
         target_keys.append((df.index_in_manifest, chunk_start))
@@ -295,6 +317,7 @@ def _eval_setup(
 
     return EvalSetup(
         val_wavs=torch.stack(wavs),
+        val_targets=torch.stack(tgt_wavs),
         val_f0=torch.stack(f0s),
         val_names=names,
         val_target_keys=target_keys,
@@ -431,12 +454,13 @@ def _evaluate(
     model_was_training = ddp_module.training
     ddp_module.eval()
 
-    target = eval_setup.val_wavs.to(device)  # [N, S] float32
+    wav_in = eval_setup.val_wavs.to(device)  # [N, S] float32 — model input
+    target = eval_setup.val_targets.to(device)  # [N, S] — loss/metric reference
     f0 = eval_setup.val_f0.to(device)  # [N, T_ctrl]
     samples_per_frame = model.samples_per_frame
     frame_rate = model.config.frame_rate
 
-    params, pred_ola = _run_eval_batched(model, target, f0, cfg, frame_rate)
+    params, pred_ola = _run_eval_batched(model, wav_in, f0, cfg, frame_rate)
 
     S = min(pred_ola.shape[-1], target.shape[-1])
     pred_norm = _volume_match(
@@ -678,7 +702,12 @@ def main(hydra_cfg: DictConfig) -> None:
 
         wav = batch["audio"].to(device, non_blocking=True)  # [B, S]
         f0 = batch["pitch"].to(device, non_blocking=True)  # [B, T_ctrl]
-        target = wav
+        # With data.target_manifest_path the model hears the raw audio but is
+        # trained to reconstruct the (e.g. enhanced) target version of it.
+        if "audio_target" in batch:
+            target = batch["audio_target"].to(device, non_blocking=True)
+        else:
+            target = wav
         wav_in = wav.unsqueeze(1)  # [B, 1, S]
 
         # LR warmup
