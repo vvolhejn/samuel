@@ -48,6 +48,7 @@ const PANEL_PARAMS: Array<{ key: string; label: string; digits: number }> = [
   { key: "tongueDiameter", label: "tongue diameter", digits: 2 },
   { key: "constrictionIndex", label: "constriction index", digits: 2 },
   { key: "constrictionDiameter", label: "constriction diameter", digits: 2 },
+  { key: "lipDiameter", label: "lip diameter", digits: 2 },
 ];
 
 /** Exact model-output values at the current playback/scrub position. */
@@ -78,7 +79,11 @@ function ParamPanel({
       </div>
       <dl className="space-y-1.5">
         {PANEL_PARAMS.map(({ key, label, digits }) =>
-          row(label, response ? response.params[key][frame].toFixed(digits) : "–"),
+          // Older checkpoints predate some params (e.g. lipDiameter).
+          row(
+            label,
+            response?.params[key] ? response.params[key][frame].toFixed(digits) : "–",
+          ),
         )}
         {row(
           "voiced (pyin)",

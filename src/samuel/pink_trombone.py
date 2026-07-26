@@ -25,8 +25,9 @@ PARAM_NAMES = [
     "tractLength",
     "constrictionIndex",
     "constrictionDiameter",
+    "lipDiameter",
 ]
-N_PARAMS = 11
+N_PARAMS = 12
 
 _TRACT_N = 44
 _NOSE_N = int(28 / 44 * _TRACT_N)  # 28
@@ -34,6 +35,8 @@ _NOSE_START = _TRACT_N - _NOSE_N + 1  # 17
 _BLADE_START = int(10 / 44 * _TRACT_N)  # 10
 _TIP_START = int(32 / 44 * _TRACT_N)  # 32
 _LIP_START = int(39 / 44 * _TRACT_N)  # 39
+# Fixed site of the lip constriction (controlled by ``lipDiameter``).
+_LIP_INDEX = _TRACT_N - 1  # 43
 _NOSE_OFFSET = 0.8
 
 # fmt: off
@@ -375,11 +378,60 @@ def glottis(
 # ---------------------------------------------------------------------------
 
 
+def _apply_constriction(
+    diameter: Tensor,  # [B, S, N]
+    c_idx: Tensor,  # [B, S]
+    c_diam: Tensor,  # [B, S]
+    N: int = _TRACT_N,
+) -> Tensor:  # [B, S, N]
+    """Narrow the tract profile with one constriction (cosine kernel)."""
+    device = diameter.device
+    j_all = torch.arange(N, device=device, dtype=torch.float32)  # [N]
+    norm_idx = c_idx / N  # [B, S]
+    lower_bound = 25.0 / 44
+    upper_bound = float(_TIP_START) / N
+
+    idx_range = torch.where(
+        norm_idx < lower_bound,
+        torch.full_like(norm_idx, 10.0),
+        torch.where(
+            norm_idx >= upper_bound,
+            torch.full_like(norm_idx, 5.0),
+            10.0
+            - (5.0 * (norm_idx - lower_bound)) / (upper_bound - lower_bound + 1e-10),
+        ),
+    )  # [B, S]
+
+    c_idx = c_idx.unsqueeze(-1)  # [B, S, 1]
+    c_diam = c_diam.unsqueeze(-1)  # [B, S, 1]
+    ir = idx_range.unsqueeze(-1)  # [B, S, 1]
+
+    offset = (j_all - c_idx).abs() - 0.5  # [B, S, N]
+    scalar = torch.where(
+        offset <= 0,
+        torch.zeros_like(offset),
+        torch.where(
+            offset > ir,
+            torch.ones_like(offset),
+            0.5 * (1 - torch.cos(math.pi * offset / (ir + 1e-10))),
+        ),
+    )  # [B, S, N]
+
+    new_diam = (c_diam - 0.3).clamp(min=0)  # [B, S, 1]
+    diff = diameter - new_diam  # [B, S, N]
+    new_diameter = new_diam + diff * scalar  # [B, S, N]
+    # Below -0.85 - noseOffset the constriction only opens the velum and does
+    # not touch the oral tract (Tract.js skips it) -> nasal vowels.
+    apply_c = c_diam >= -(0.85 + _NOSE_OFFSET)  # [B, S, 1]
+    return torch.where((diff > 0) & apply_c, new_diameter, diameter)
+
+
 def _compute_diameter_profile(
     tongue_index: Tensor,  # [B, S]
     tongue_diameter: Tensor,  # [B, S]
     constriction_index: Tensor,  # [B, S]
     constriction_diameter: Tensor,  # [B, S]
+    lip_diameter: Tensor,  # [B, S]
     N: int = _TRACT_N,
 ) -> Tensor:  # [B, S, N]
     B, S = tongue_index.shape
@@ -428,45 +480,12 @@ def _compute_diameter_profile(
         dim=2,
     )
 
-    # 3. Constriction kernel
-    j_all = torch.arange(N, device=device, dtype=torch.float32)  # [N]
-    norm_idx = constriction_index / N  # [B, S]
-    lower_bound = 25.0 / 44
-    upper_bound = float(tip) / N
-
-    idx_range = torch.where(
-        norm_idx < lower_bound,
-        torch.full_like(norm_idx, 10.0),
-        torch.where(
-            norm_idx >= upper_bound,
-            torch.full_like(norm_idx, 5.0),
-            10.0
-            - (5.0 * (norm_idx - lower_bound)) / (upper_bound - lower_bound + 1e-10),
-        ),
-    )  # [B, S]
-
-    c_idx = constriction_index.unsqueeze(-1)  # [B, S, 1]
-    c_diam = constriction_diameter.unsqueeze(-1)  # [B, S, 1]
-    ir = idx_range.unsqueeze(-1)  # [B, S, 1]
-
-    offset = (j_all - c_idx).abs() - 0.5  # [B, S, N]
-    scalar = torch.where(
-        offset <= 0,
-        torch.zeros_like(offset),
-        torch.where(
-            offset > ir,
-            torch.ones_like(offset),
-            0.5 * (1 - torch.cos(math.pi * offset / (ir + 1e-10))),
-        ),
-    )  # [B, S, N]
-
-    new_diam = (c_diam - 0.3).clamp(min=0)  # [B, S, 1]
-    diff = diameter - new_diam  # [B, S, N]
-    new_diameter = new_diam + diff * scalar  # [B, S, N]
-    # Below -0.85 - noseOffset the constriction only opens the velum and does
-    # not touch the oral tract (Tract.js skips it) -> nasal vowels.
-    apply_c = c_diam >= -(0.85 + _NOSE_OFFSET)  # [B, S, 1]
-    diameter = torch.where((diff > 0) & apply_c, new_diameter, diameter)
+    # 3. Constrictions: tongue-tip (learned index) then lips (fixed index)
+    diameter = _apply_constriction(
+        diameter, constriction_index, constriction_diameter, N
+    )
+    lip_idx = torch.full_like(lip_diameter, float(_LIP_INDEX))
+    diameter = _apply_constriction(diameter, lip_idx, lip_diameter, N)
 
     return diameter  # [B, S, N]
 
@@ -544,6 +563,7 @@ def _tract(
     tongue_diameter: Tensor,  # [B, S]
     constriction_index: Tensor,  # [B, S]
     constriction_diameter: Tensor,  # [B, S]
+    lip_diameter: Tensor,  # [B, S]
 ) -> Tensor:  # [B, S]
     B, S = glottis_out.shape
     N = _TRACT_N
@@ -553,7 +573,12 @@ def _tract(
 
     # 1. Diameter profile [B, S, N] and oral reflections [B, S, N]
     diameter = _compute_diameter_profile(
-        tongue_index, tongue_diameter, constriction_index, constriction_diameter, N
+        tongue_index,
+        tongue_diameter,
+        constriction_index,
+        constriction_diameter,
+        lip_diameter,
+        N,
     )
     amplitude = diameter**2  # [B, S, N]
     A_prev = amplitude[:, :, :-1]
@@ -562,6 +587,7 @@ def _tract(
     r = torch.cat([torch.zeros(B, S, 1, device=device), r_inner], dim=2)  # [B, S, N]
 
     # 2. Velum and 3-way junction reflections [B, S]
+    # (lipDiameter is non-negative and never gates the velum.)
     velum = torch.where(
         (constriction_index > ns) & (constriction_diameter < -_NOSE_OFFSET),
         torch.full_like(constriction_index, 0.4),
@@ -595,6 +621,15 @@ def _tract(
         mask1 * (noise_amount * frac).unsqueeze(-1)
         + mask2 * (noise_amount * (1 - frac)).unsqueeze(-1)
     ) * valid_mask.unsqueeze(-1)  # [B, S, N]
+
+    # Lip turbulence: fixed site at the last tube position, no STE needed.
+    lip_thinness = torch.clamp(8 * (0.7 - lip_diameter), 0, 1)
+    lip_openness = torch.clamp(30 * (lip_diameter - 0.3), 0, 1)
+    lip_noise = (noise_mod * glottis_out * 0.66 * (lip_thinness * lip_openness) / 2) * (
+        lip_diameter > 0
+    ).float()  # [B, S]
+    lip_site = F.one_hot(torch.tensor(N - 1, device=device), N).float()  # [N]
+    turb = turb + lip_site * lip_noise.unsqueeze(-1)  # [B, S, N]
 
     # 4. Fixed nose reflections
     nose_r = _NOSE_R_CPU.to(device=device, dtype=glottis_out.dtype)  # [M]
@@ -811,6 +846,7 @@ def _tract_ola(
     tongue_diameter: Tensor,  # [B, S]
     constriction_index: Tensor,  # [B, S]
     constriction_diameter: Tensor,  # [B, S]
+    lip_diameter: Tensor,  # [B, S]
     ir_length: int = 4096,
     samples_per_frame: int = SAMPLES_PER_FRAME,
 ) -> Tensor:  # [B, S]
@@ -828,9 +864,10 @@ def _tract_ola(
     td_f = tongue_diameter[:, mid]
     ci_f = constriction_index[:, mid]
     cd_f = constriction_diameter[:, mid]
+    ld_f = lip_diameter[:, mid]
 
     # Oral reflection coefficients [B, T, N]
-    diameter_f = _compute_diameter_profile(ti_f, td_f, ci_f, cd_f, N)
+    diameter_f = _compute_diameter_profile(ti_f, td_f, ci_f, cd_f, ld_f, N)
     amplitude_f = diameter_f**2
     r_inner = (amplitude_f[:, :, :-1] - amplitude_f[:, :, 1:]) / (
         amplitude_f[:, :, :-1] + amplitude_f[:, :, 1:] + 1e-10
@@ -865,6 +902,18 @@ def _tract_ola(
         noise_mod * glottis_out * 0.66 * (thinness * openness) / 2 * valid_mask
     )
 
+    # Lip turbulence source (fixed injection site at the last tube position)
+    lip_thinness = torch.clamp(8 * (0.7 - lip_diameter), 0.0, 1.0)
+    lip_openness = torch.clamp(30 * (lip_diameter - 0.3), 0.0, 1.0)
+    lip_turb_source = (
+        noise_mod
+        * glottis_out
+        * 0.66
+        * (lip_thinness * lip_openness)
+        / 2
+        * (lip_diameter > 0).to(dtype)
+    )
+
     # --- Impulse responses (parallel over B×T) ---
     BT = B * T
     r_flat = r_f.reshape(BT, N)
@@ -876,31 +925,37 @@ def _tract_ola(
 
     nose_r = _NOSE_R_CPU.to(device=device, dtype=dtype)
 
-    # One batched call for both IR sets — rows [0, BT) inject at the
-    # glottis, rows [BT, 2BT) inject turbulence — so the L-step
-    # sequential loop runs once instead of twice.
-    mask = torch.zeros(2 * BT, dtype=torch.bool, device=device)
+    # One batched call for all three IR sets — rows [0, BT) inject at the
+    # glottis, rows [BT, 2BT) inject constriction turbulence, rows
+    # [2BT, 3BT) inject lip turbulence — so the L-step sequential loop
+    # runs once instead of three times.
+    lip_flat = torch.full_like(ci_flat, N - 1)
+    mask = torch.zeros(3 * BT, dtype=torch.bool, device=device)
     mask[:BT] = True
-    h_both = _compute_batch_irs(
-        torch.cat([r_flat, r_flat], dim=0),
-        torch.cat([r_L_flat, r_L_flat], dim=0),
-        torch.cat([r_R_flat, r_R_flat], dim=0),
-        torch.cat([r_N_flat, r_N_flat], dim=0),
+    h_all = _compute_batch_irs(
+        torch.cat([r_flat, r_flat, r_flat], dim=0),
+        torch.cat([r_L_flat, r_L_flat, r_L_flat], dim=0),
+        torch.cat([r_R_flat, r_R_flat, r_R_flat], dim=0),
+        torch.cat([r_N_flat, r_N_flat, r_N_flat], dim=0),
         nose_r,
         inject_glottis=mask,
-        inject_pos=torch.cat([ci_flat, ci_flat], dim=0),
+        inject_pos=torch.cat([ci_flat, ci_flat, lip_flat], dim=0),
         L=ir_length,
-    )  # [2*BT, L]
-    h_glottis_flat, h_turb_flat = h_both[:BT], h_both[BT:]
+    )  # [3*BT, L]
+    h_glottis_flat = h_all[:BT]
+    h_turb_flat = h_all[BT : 2 * BT]
+    h_lip_flat = h_all[2 * BT :]
 
     h_glottis = h_glottis_flat.reshape(B, T, ir_length)
     h_turb = h_turb_flat.reshape(B, T, ir_length)
+    h_lip = h_lip_flat.reshape(B, T, ir_length)
 
     # --- OLA synthesis ---
     oral = _ola_convolve(glottis_out, h_glottis, hop)
     turb_out = _ola_convolve(turb_source, h_turb, hop)
+    lip_out = _ola_convolve(lip_turb_source, h_lip, hop)
 
-    return (oral + turb_out) * 0.125
+    return (oral + turb_out + lip_out) * 0.125
 
 
 # ---------------------------------------------------------------------------
@@ -916,10 +971,11 @@ def pink_trombone(
     """Differentiable Pink Trombone vocal synthesizer.
 
     Args:
-        params: [B, T, 11] at ``control_rate`` Hz.
+        params: [B, T, 12] at ``control_rate`` Hz.
             Parameters (in order): frequency, voiceness, intensity,
             tongueIndex, tongueDiameter, vibratoWobble, vibratoFrequency,
-            vibratoGain, tractLength, constrictionIndex, constrictionDiameter.
+            vibratoGain, tractLength, constrictionIndex, constrictionDiameter,
+            lipDiameter.
         seed: scalar int (all batch items share noise), a ``[B]`` int tensor
             (per-batch independent simplex noise), or ``None`` which draws
             a fresh ``[B]`` int tensor on every call.
@@ -957,6 +1013,7 @@ def pink_trombone(
         tongue_diameter=p["tongueDiameter"],
         constriction_index=p["constrictionIndex"],
         constriction_diameter=p["constrictionDiameter"],
+        lip_diameter=p["lipDiameter"],
     )
 
 
@@ -976,7 +1033,7 @@ def pink_trombone_ola(
     depth is O(ir_length) rather than O(T * samples_per_frame).
 
     Args:
-        params:    [B, T, 11] at ``control_rate`` Hz (same as ``pink_trombone``).
+        params:    [B, T, 12] at ``control_rate`` Hz (same as ``pink_trombone``).
         seed:      Same semantics as ``pink_trombone``: scalar, ``[B]`` tensor,
                    or ``None`` for fresh per-sample seeds.
         ir_length: FIR approximation length in samples.  Default 4096 (~93 ms
@@ -1016,6 +1073,7 @@ def pink_trombone_ola(
         tongue_diameter=p["tongueDiameter"],
         constriction_index=p["constrictionIndex"],
         constriction_diameter=p["constrictionDiameter"],
+        lip_diameter=p["lipDiameter"],
         ir_length=ir_length,
         samples_per_frame=spf,
     )

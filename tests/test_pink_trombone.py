@@ -346,6 +346,7 @@ class TestPinkTrombone:
             "vibratoFrequency": 6,
             "vibratoGain": 0.005,
             "tractLength": 44,
+            "lipDiameter": 3.0,
         }
         for i, name in enumerate(PARAM_NAMES):
             if name in defaults:
@@ -394,6 +395,7 @@ class TestPinkTromboneOla:
             "vibratoFrequency": 6,
             "vibratoGain": 0.005,
             "tractLength": 44,
+            "lipDiameter": 3.0,
         }
         for i, name in enumerate(PARAM_NAMES):
             if name in defaults:
@@ -463,9 +465,10 @@ def _realistic_coefs(BT=4, seed=0):
     tongue_dia = 1.8 + 1.0 * torch.rand(BT, 1, generator=g)
     constr_idx = 20 + 20 * torch.rand(BT, 1, generator=g)
     constr_dia = 1.5 + 1.5 * torch.rand(BT, 1, generator=g)  # open — no turb
+    lip_dia = torch.full((BT, 1), 3.0)  # lips open
 
     diameter = _compute_diameter_profile(
-        tongue_idx, tongue_dia, constr_idx, constr_dia, N
+        tongue_idx, tongue_dia, constr_idx, constr_dia, lip_dia, N
     ).squeeze(1)  # [BT, N]
     amplitude = diameter**2
     r_inner = (amplitude[:, :-1] - amplitude[:, 1:]) / (
@@ -502,6 +505,7 @@ class TestNewApi:
         params[..., PARAM_NAMES.index("tractLength")] = 44.0
         params[..., PARAM_NAMES.index("constrictionIndex")] = 30.0
         params[..., PARAM_NAMES.index("constrictionDiameter")] = 3.0
+        params[..., PARAM_NAMES.index("lipDiameter")] = 3.0
         params[..., PARAM_NAMES.index("vibratoFrequency")] = 6.0
 
         out_125 = pink_trombone_ola(params, seed=0, ir_length=64, control_rate=12.5)
@@ -526,6 +530,7 @@ class TestNewApi:
         params[..., PARAM_NAMES.index("tractLength")] = 44.0
         params[..., PARAM_NAMES.index("constrictionIndex")] = 30.0
         params[..., PARAM_NAMES.index("constrictionDiameter")] = 3.0
+        params[..., PARAM_NAMES.index("lipDiameter")] = 3.0
         params[..., PARAM_NAMES.index("vibratoFrequency")] = 6.0
         params[..., PARAM_NAMES.index("vibratoGain")] = 0.1  # engage simplex vib
         params[..., PARAM_NAMES.index("vibratoWobble")] = 1.0
