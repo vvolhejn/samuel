@@ -11,9 +11,7 @@ data:
   chunk_seconds: 4.0
   num_workers: 4
   val_fraction: 0.05
-  # Every clip is RMS-normalised to this level and used as both encoder input
-  # and loss target; the synth output is never gain-matched, so the model has
-  # to hit this level itself via intensity.
+  # Every clip is RMS-normalised to this level
   target_rms: 0.05
 
 synth:
