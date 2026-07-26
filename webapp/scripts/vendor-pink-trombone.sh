@@ -6,7 +6,9 @@
 #     script/ tree at the root).
 #   - Silero VAD model/worklet (@ricky0123/vad-web) and the onnxruntime-web
 #     wasm runtime it needs, so nothing is fetched from a CDN.
-# Re-run after rebuilding Pink-Trombone or bumping @ricky0123/vad-web.
+# Runs automatically as package.json's "prebuild" (public/pink-trombone is
+# gitignored, so a Pink-Trombone rebuild would otherwise leave a stale copy
+# here and in out/). Run it by hand only to refresh assets without a build.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
