@@ -113,11 +113,12 @@ def _resolve_wandb_run(ref: str) -> tuple[Path, dict]:
     if not models:
         raise FileNotFoundError(
             f"wandb run {run_path} ({run.name}) logged no model artifact; "
-            "point SAMUEL_CHECKPOINT at a local .pt instead (only runs that "
-            "finished cleanly with log.ckpt_wandb_artifact upload one)"
+            "point SAMUEL_CHECKPOINT at a local .pt instead (only runs with "
+            "log.ckpt_wandb_artifact upload one)"
         )
-    # Runs log a single checkpoint artifact at the end; take the newest if more.
-    artifact = models[-1]
+    # Runs mirror each checkpoint to the same artifact name, so pick the highest
+    # version (older versions are usually deleted, but not always).
+    artifact = max(models, key=lambda a: int(a.version.lstrip("v")))
     logger.info(
         "wandb run %s (%s): using artifact %s", run_path, run.name, artifact.name
     )
