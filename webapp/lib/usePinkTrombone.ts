@@ -150,8 +150,19 @@ export function usePinkTrombone(): PinkTromboneHandle {
     // the tongue-tip constriction (movable index) and the lip constriction
     // (fixed at the last tract index, mirrors _LIP_INDEX in pink_trombone.py).
     // Start fully open (diameter 3 ≈ no constriction).
-    constrictionRef.current = element.newConstriction(33, 3);
-    lipConstrictionRef.current = element.newConstriction(43, 3);
+    const constriction = element.newConstriction(33, 3);
+    const lipConstriction = element.newConstriction(43, 3);
+    // newConstriction() hands out the first slot it considers free, so a
+    // regression there would silently give both trajectories the same
+    // AudioParams (the second setValueCurveAtTime then overwrites the first).
+    if (!constriction || !lipConstriction)
+      throw new Error("Pink Trombone ran out of constriction slots");
+    if (constriction.diameter === lipConstriction.diameter)
+      throw new Error(
+        "Pink Trombone returned the same constriction slot twice — the tongue-tip and lip trajectories would collide",
+      );
+    constrictionRef.current = constriction;
+    lipConstrictionRef.current = lipConstriction;
 
     // Master gain for the per-frame volume-match envelope (training only
     // ever evaluated volume-matched audio, so the raw synth has no
