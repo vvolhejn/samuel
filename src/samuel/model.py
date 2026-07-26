@@ -28,7 +28,9 @@ _DEFAULT_PARAM_SPEC: dict[str, tuple[float, float, float]] = {
     "voiceness": (0.0, 1.0, 0.6),
     "tongueIndex": (10.0, 35.0, 20.0),
     "tongueDiameter": (1.5, 3.5, 2.4),
-    "constrictionIndex": (22.0, 44.0, 33.0),
+    # Capped at _LIP_START (39): this constriction models the tongue tip; the
+    # lips get their own fixed-position constriction via lipDiameter.
+    "constrictionIndex": (22.0, 39.0, 33.0),
     # constrictionDiameter controls the oral constriction and, past the nose
     # start, the velum. Effect by interval (thresholds from pink_trombone.py):
     #   < -1.65        : velum open, oral tract untouched      -> nasal vowels
@@ -39,6 +41,11 @@ _DEFAULT_PARAM_SPEC: dict[str, tuple[float, float, float]] = {
     #                    exceeds the local rest diameter it has no effect
     #                                                            -> approximants / open vowels
     "constrictionDiameter": (-2.0, 3.0, 1.25),
+    # Second constriction fixed at the last tract index (the lips).
+    # Non-negative: [0, 0.3] full closure (b/p), (0.3, 0.7) fricative (f),
+    # >= 0.7 open. No nasal range — the velum stays driven by
+    # constrictionDiameter only.
+    "lipDiameter": (0.0, 3.0, 1.25),
 }
 _DEFAULT_FROZEN_VALUES: dict[str, float] = {
     "intensity": 1.0,
