@@ -171,6 +171,9 @@ def _resolve_config_path(checkpoint_path: Path) -> Path:
 # Run config for the loaded checkpoint, populated by _load_model at startup so
 # request handlers (e.g. _get_clips) can reuse it without re-resolving paths.
 _run_cfg: dict | None = None
+# What the webapp shows for the loaded checkpoint: a wandb run URL, or the
+# resolved local .pt path (also set by _load_model).
+_checkpoint: str | None = None
 
 
 def _run_config() -> dict:
@@ -179,7 +182,7 @@ def _run_config() -> dict:
 
 
 def _load_model() -> PinkTromboneController:
-    global _run_cfg
+    global _run_cfg, _checkpoint
     checkpoint_ref = os.environ.get(
         "SAMUEL_CHECKPOINT", str(_DEFAULT_RUN_DIR / "checkpoints" / "last.pt")
     )
@@ -202,6 +205,18 @@ def _load_model() -> PinkTromboneController:
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"])
     model.eval()
+    # Same precedence as _resolve_checkpoint: a local path wins over the run form.
+    run_match = (
+        None if Path(checkpoint_ref).exists() else _WANDB_RUN_RE.match(checkpoint_ref)
+    )
+    if run_match is not None:
+        # Normalized so the webapp can link it even for the bare-path form.
+        _checkpoint = "https://wandb.ai/{entity}/{project}/runs/{run_id}".format(
+            **run_match.groupdict()
+        )
+    else:
+        # last.pt is a symlink to <step>.pt; resolve so the real file is visible.
+        _checkpoint = str(checkpoint_path.resolve())
     logger.info(
         "loaded checkpoint %s (config %s) on %s (frame_rate=%.3f)",
         checkpoint_path,
@@ -350,10 +365,12 @@ def _get_clips() -> list[dict]:
 @app.get("/api/health")
 def health() -> dict:
     assert _model is not None
+    assert _checkpoint is not None
     return {
         "status": "ok",
         "frame_rate": _model.config.frame_rate,
         "device": str(next(_model.parameters()).device),
+        "checkpoint": _checkpoint,
     }
 
 

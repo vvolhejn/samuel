@@ -108,11 +108,21 @@ export async function synthesizeUtterance(
   return res.json();
 }
 
-export async function backendHealthy(): Promise<boolean> {
+/** Response of GET /api/health. */
+export interface HealthResponse {
+  status: string;
+  frame_rate: number;
+  device: string;
+  /** Wandb run URL, or the resolved local .pt path. */
+  checkpoint: string;
+}
+
+/** null when the backend is unreachable or not serving a model. */
+export async function fetchHealth(): Promise<HealthResponse | null> {
   try {
     const res = await fetch("/api/health");
-    return res.ok;
+    return res.ok ? await res.json() : null;
   } catch {
-    return false;
+    return null;
   }
 }

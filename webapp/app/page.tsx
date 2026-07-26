@@ -3,10 +3,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { MicVAD } from "@ricky0123/vad-web";
 import {
-  backendHealthy,
   fetchDatasetClip,
+  fetchHealth,
   synthesizeUtterance,
   synthAudioUrl,
+  HealthResponse,
   SynthResponse,
 } from "@/lib/audio";
 import { usePinkTrombone } from "@/lib/usePinkTrombone";
@@ -97,6 +98,8 @@ function ParamPanel({
 export default function Home() {
   const [status, setStatus] = useState<Status>("idle");
   const [error, setError] = useState<string | null>(null);
+  /** null until /api/health answers (or if the backend is down). */
+  const [health, setHealth] = useState<HealthResponse | null>(null);
   /** Render-side mirror of lastResponse (refs must not be read in render). */
   const [viewResponse, setViewResponse] = useState<SynthResponse | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -129,6 +132,11 @@ export default function Home() {
       vadRef.current = null;
     };
   }, [trombone]);
+
+  // Which checkpoint the backend is serving (shown under the title).
+  useEffect(() => {
+    void fetchHealth().then(setHealth);
+  }, []);
 
   /** Resume VAD only if the user hasn't muted the mic. */
   const restoreMic = useCallback(async () => {
@@ -185,11 +193,13 @@ export default function Home() {
   const startMic = useCallback(async () => {
     setError(null);
     try {
-      if (!(await backendHealthy())) {
+      const current = await fetchHealth();
+      if (!current) {
         throw new Error(
           "Model backend unreachable — run: uv run --extra server uvicorn samuel.server:app --port 8000",
         );
       }
+      setHealth(current); // also picks up a checkpoint swap since page load
       await trombone.resume(); // we're in a user gesture
 
       if (!vadRef.current) {
@@ -329,6 +339,22 @@ export default function Home() {
         <p className="mt-1 text-sm text-neutral-500">
           Speak — the vocal tract model mimics you.
         </p>
+        {health && (
+          <p className="mt-1 font-mono text-xs break-all text-neutral-400">
+            {health.checkpoint.startsWith("https://") ? (
+              <a
+                href={health.checkpoint}
+                target="_blank"
+                rel="noreferrer"
+                className="underline decoration-dotted hover:text-fuchsia-600"
+              >
+                {health.checkpoint}
+              </a>
+            ) : (
+              health.checkpoint
+            )}
+          </p>
+        )}
       </header>
 
       <div className="flex flex-wrap items-center justify-center gap-3">
