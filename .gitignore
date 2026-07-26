@@ -5,4 +5,6 @@ __pycache__/
 
 runs/
 manifests/
-artifacts/train.log
+artifacts/
+logs/
+train.log

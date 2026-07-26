@@ -58,7 +58,6 @@ function automatedParams(
   element: PinkTromboneElement,
   constriction: PinkTromboneConstriction,
   lipConstriction: PinkTromboneConstriction,
-  masterGain: GainNode,
 ): AudioParam[] {
   return [
     element.frequency,
@@ -69,7 +68,7 @@ function automatedParams(
     constriction.index,
     constriction.diameter,
     lipConstriction.diameter,
-    masterGain.gain,
+    element.intensity,
   ];
 }
 
@@ -90,7 +89,7 @@ function curveValues(response: SynthResponse): Float32Array[] {
     params.lipDiameter
       ? Float32Array.from(params.lipDiameter)
       : new Float32Array(params.voiceness.length).fill(3),
-    Float32Array.from(response.gain),
+    Float32Array.from(params.intensity),
   ];
 }
 
@@ -164,11 +163,10 @@ export function usePinkTrombone(): PinkTromboneHandle {
     constrictionRef.current = constriction;
     lipConstrictionRef.current = lipConstriction;
 
-    // Master gain for the per-frame volume-match envelope (training only
-    // ever evaluated volume-matched audio, so the raw synth has no
-    // meaningful envelope of its own).
+    // Master gain is the click-free utterance gate (see speak()). The energy
+    // envelope itself comes from the model's per-frame intensity trajectory.
     const masterGain = ctx.createGain();
-    masterGain.gain.value = 1;
+    masterGain.gain.value = 0;
     element.connect(masterGain);
     masterGain.connect(ctx.destination);
     masterGainRef.current = masterGain;
@@ -216,24 +214,20 @@ export function usePinkTrombone(): PinkTromboneHandle {
       // inside its interval throw NotSupportedError.
       const t0 = Math.max(now + LEAD_S, scheduleEndRef.current + 0.02);
 
-      const params = automatedParams(
-        element,
-        constriction,
-        lipConstriction,
-        masterGain,
-      );
+      const params = automatedParams(element, constriction, lipConstriction);
       params.forEach((param, i) => {
         scheduleCurve(param, values[i].subarray(startFrame), now, t0, duration);
       });
 
-      // Voicing gate: element.start()/stop() switch gain instantly (clicks), so
-      // fade with the intensity param instead.
-      const intensity = element.intensity;
-      intensity.cancelScheduledValues(now);
-      intensity.setValueAtTime(intensity.value, now);
-      intensity.linearRampToValueAtTime(1, t0);
-      intensity.setValueAtTime(1, t0 + duration);
-      intensity.linearRampToValueAtTime(0, t0 + duration + FADE_OUT_S);
+      // Utterance gate: element.start()/stop() switch gain instantly (clicks),
+      // so fade the master gain instead. This used to ride on element.intensity,
+      // which the model now drives per-frame as its energy envelope.
+      const gate = masterGain.gain;
+      gate.cancelScheduledValues(now);
+      gate.setValueAtTime(gate.value, now);
+      gate.linearRampToValueAtTime(1, t0);
+      gate.setValueAtTime(1, t0 + duration);
+      gate.linearRampToValueAtTime(0, t0 + duration + FADE_OUT_S);
 
       const end = t0 + duration + FADE_OUT_S;
       scheduleEndRef.current = end;
@@ -276,16 +270,11 @@ export function usePinkTrombone(): PinkTromboneHandle {
     const masterGain = masterGainRef.current;
     if (!element || !constriction || !lipConstriction || !masterGain) return;
     const now = element.audioContext.currentTime;
-    for (const param of automatedParams(
-      element,
-      constriction,
-      lipConstriction,
-      masterGain,
-    )) {
+    for (const param of automatedParams(element, constriction, lipConstriction)) {
       cancelAndHold(param, now);
     }
-    cancelAndHold(element.intensity, now);
-    element.intensity.setTargetAtTime(0, now, SCRUB_TAU_S);
+    cancelAndHold(masterGain.gain, now);
+    masterGain.gain.setTargetAtTime(0, now, SCRUB_TAU_S);
     scheduleEndRef.current = now;
   }, []);
 
@@ -306,27 +295,24 @@ export function usePinkTrombone(): PinkTromboneHandle {
       Math.max(0, Math.round(frac * (nFrames - 1))),
     );
     const now = ctx.currentTime;
-    const params = automatedParams(
-      element,
-      constriction,
-      lipConstriction,
-      masterGain,
-    );
+    const params = automatedParams(element, constriction, lipConstriction);
     params.forEach((param, i) => {
       cancelAndHold(param, now);
       param.setTargetAtTime(values[i][frame], now, SCRUB_TAU_S);
     });
-    cancelAndHold(element.intensity, now);
-    element.intensity.setTargetAtTime(1, now, 0.03);
+    // Open the gate; the scrubbed frame's own intensity is set by the loop
+    // above, so a silent frame stays silent.
+    cancelAndHold(masterGain.gain, now);
+    masterGain.gain.setTargetAtTime(1, now, 0.03);
     scheduleEndRef.current = now;
   }, []);
 
   const endScrub = useCallback(() => {
-    const element = elementRef.current;
-    if (!element) return;
-    const now = element.audioContext.currentTime;
-    cancelAndHold(element.intensity, now);
-    element.intensity.setTargetAtTime(0, now, FADE_OUT_S);
+    const masterGain = masterGainRef.current;
+    if (!masterGain) return;
+    const now = masterGain.context.currentTime;
+    cancelAndHold(masterGain.gain, now);
+    masterGain.gain.setTargetAtTime(0, now, FADE_OUT_S);
   }, []);
 
   const ready = useCallback(() => elementRef.current !== null, []);

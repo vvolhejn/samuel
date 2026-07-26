@@ -30,6 +30,8 @@ class DataConfig(BaseModel):
     chunk_seconds: float = 4.0
     num_workers: int = 4
     pitch_cache_path: Path | None = None
+    # Every clip is RMS-normalised to this level
+    target_rms: float = 0.05
     # Fraction of the manifest reserved as the held-out validation split.
     # Files at the tail of the manifest (after the train cut) are never seen
     # during training; eval samples from them for the val_* metrics.
@@ -80,8 +82,9 @@ class LogConfig(BaseModel):
     log_every: int = 50
     eval_every: int = 1_000
     ckpt_every: int = 5_000
-    # On clean completion, upload the final checkpoint (last.pt) as a wandb
-    # artifact so runs are backed up off the training filesystem.
+    # Mirror every local checkpoint (and the final step) to a wandb artifact so
+    # runs are backed up off the training filesystem. Only the newest version is
+    # kept; older ones are deleted as they are replaced.
     ckpt_wandb_artifact: bool = True
     # The same clips are used for each eval for stable metrics
     n_eval_clips: int = 100

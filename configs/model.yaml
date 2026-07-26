@@ -21,10 +21,12 @@ model:
   gumbel_hard: false
 
   # (lo, hi, init) per trainable parameter. ``frequency`` is supplied
-  # externally from the pyin cache; ``intensity`` is frozen at 1.0 and the
-  # synth output is RMS-matched to the target post-hoc.
+  # externally from the pyin cache. ``intensity`` is trainable: the synth
+  # output is never gain-matched (see data.target_rms), so the model needs a
+  # level knob of its own.
   param_spec:
     voiceness:            [0.0, 1.0, 0.6]
+    intensity:            [0.0, 1.0, 1.0]
     tongueIndex:          [10.0, 35.0, 20.0]
     tongueDiameter:       [1.5, 3.5, 2.4]
     # Tongue-tip constriction: capped at the lip region start (39); the lips
@@ -37,7 +39,6 @@ model:
     lipDiameter:          [0.0, 3.0, 1.25]
 
   frozen_values:
-    intensity: 1.0
     vibratoWobble: 0.0
     vibratoFrequency: 6.0
     vibratoGain: 0.0

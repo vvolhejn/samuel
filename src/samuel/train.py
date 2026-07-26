@@ -20,7 +20,6 @@ from pathlib import Path
 
 import hydra
 import numpy as np
-from einops import rearrange
 import plotly.graph_objects as go
 import torch
 import torch.distributed as dist
@@ -117,6 +116,89 @@ def _make_run_dir(cfg: TrainConfig, rank: int, is_ddp: bool) -> Path:
     return Path(path_str)
 
 
+def _save_checkpoint(
+    run_dir: Path,
+    step: int,
+    module: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    cfg: TrainConfig,
+) -> Path:
+    """Write ``<step>.pt`` and point the ``last.pt`` symlink at it."""
+    ckpt_path = run_dir / "checkpoints" / f"{step:07d}.pt"
+    torch.save(
+        {
+            "step": step,
+            "model": module.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "config_json": cfg.model_dump_json(),
+        },
+        ckpt_path,
+    )
+    last_path = run_dir / "checkpoints" / "last.pt"
+    if last_path.is_symlink() or last_path.exists():
+        last_path.unlink()
+    last_path.symlink_to(ckpt_path.name)
+    return ckpt_path
+
+
+def _delete_ckpt_artifact(artifact: wandb.Artifact) -> None:
+    try:
+        # A version can only be deleted once its own upload is committed.
+        artifact.wait()
+        artifact.delete(delete_aliases=True)
+    except Exception as exc:  # noqa: BLE001 - never fail training on this
+        tqdm.write(f"[ckpt] could not delete artifact {artifact.name}: {exc}")
+
+
+def _log_ckpt_artifact(
+    run_dir: Path,
+    ckpt_path: Path,
+    step: int,
+    logged: list[wandb.Artifact],
+    prune: bool = True,
+) -> None:
+    """Upload ``ckpt_path`` as the run's model artifact, superseding earlier ones.
+
+    Every upload creates a new artifact version (wandb has no in-place
+    overwrite), so older versions are deleted as they are replaced and consumers
+    just take the ``latest`` alias. One older version is kept alive on purpose:
+    an in-flight upload dedups against its predecessor and fails with "rebase
+    required" if that base disappears. ``logged`` is the list of versions this
+    process still owns, newest last, and is updated in place. ``prune`` is off
+    for offline runs, where there is no server to delete from.
+    """
+    artifact = wandb.Artifact(
+        f"{run_dir.name}-checkpoint", type="model", metadata={"step": step}
+    )
+    # Store under a stable name so the artifact always exposes the newest
+    # checkpoint as last.pt (ckpt_path may be a symlink target like 0016000.pt).
+    artifact.add_file(str(ckpt_path), name="last.pt")
+    logged.append(wandb.log_artifact(artifact))
+
+    while prune and len(logged) > 2:
+        _delete_ckpt_artifact(logged.pop(0))
+
+
+def _prune_ckpt_artifacts(logged: list[wandb.Artifact]) -> None:
+    """Delete every logged checkpoint version but the newest.
+
+    Only safe at the end of a run: it blocks until the newest version has
+    finished uploading, so the versions it deletes can no longer be an upload's
+    dedup base.
+    """
+    if not logged:
+        return
+    newest = logged[-1]
+    try:
+        newest.wait()
+    except Exception as exc:  # noqa: BLE001
+        tqdm.write(f"[ckpt] final artifact upload did not confirm: {exc}")
+        return
+    for old in logged[:-1]:
+        _delete_ckpt_artifact(old)
+    logged[:] = [newest]
+
+
 def _warmup_lr(step: int, warmup_steps: int) -> float:
     if warmup_steps <= 0:
         return 1.0
@@ -197,15 +279,23 @@ def _controller_diagnostics(
     return out
 
 
-def _volume_match(pred: torch.Tensor, target: torch.Tensor, hop: int) -> torch.Tensor:
-    """Per-frame RMS-match ``pred`` to ``target``. Both ``[B, S]``, S a multiple of hop."""
-    T = pred.shape[-1] // hop
-    pred_f = rearrange(pred[..., : T * hop], "b (t h) -> b t h", h=hop)
-    tgt_f = rearrange(target[..., : T * hop], "b (t h) -> b t h", h=hop)
-    pred_rms = pred_f.pow(2).mean(-1).clamp_min(1e-12).sqrt()
-    tgt_rms = tgt_f.pow(2).mean(-1).clamp_min(1e-12).sqrt()
-    gain = (tgt_rms / pred_rms).unsqueeze(-1)
-    return rearrange(pred_f * gain, "b t h -> b (t h)")
+def _rms_normalize(wav: torch.Tensor, target_rms: float) -> torch.Tensor:
+    """Scale each clip to ``target_rms`` (one gain per clip). ``wav`` is ``[B, S]``.
+
+    Applied to the audio used as *both* encoder input and loss target, so the
+    dataset has a single canonical loudness. The synth output is deliberately
+    left alone: the model must produce this absolute level itself, so going
+    silent (e.g. driving ``intensity`` to 0) is penalised rather than corrected
+    for free. Within-utterance energy dynamics are untouched.
+
+    This replaced a per-frame RMS match of the synth output to the target. That
+    match copied the target's energy contour onto the prediction, so the loss
+    carried no loudness gradient at all, and with a trainable ``intensity`` it
+    opened a constant-output collapse basin (entropy and param_variation to
+    zero, WER above 1).
+    """
+    rms = wav.pow(2).mean(-1, keepdim=True).clamp_min(1e-12).sqrt()
+    return wav * (target_rms / rms)
 
 
 @dataclass
@@ -432,16 +522,15 @@ def _evaluate(
     ddp_module.eval()
 
     target = eval_setup.val_wavs.to(device)  # [N, S] float32
+    target = _rms_normalize(target, cfg.data.target_rms)  # same level as training
     f0 = eval_setup.val_f0.to(device)  # [N, T_ctrl]
-    samples_per_frame = model.samples_per_frame
     frame_rate = model.config.frame_rate
 
     params, pred_ola = _run_eval_batched(model, target, f0, cfg, frame_rate)
 
+    # Synth output used as-is: the model is scored on hitting target_rms.
     S = min(pred_ola.shape[-1], target.shape[-1])
-    pred_norm = _volume_match(
-        pred_ola[..., :S].float(), target[..., :S].float(), samples_per_frame
-    )
+    pred_norm = pred_ola[..., :S].float()
 
     S_norm = pred_norm.shape[-1]
     total, components = loss_fn.with_components(pred_norm, target[..., :S_norm].float())
@@ -649,6 +738,14 @@ def main(hydra_cfg: DictConfig) -> None:
     throughput_t0 = time.perf_counter()
     throughput_audio_s = 0.0
 
+    # Every local checkpoint is mirrored to wandb, keeping only the newest
+    # version (see _log_ckpt_artifact).
+    upload_ckpts = (
+        rank == 0 and cfg.log.ckpt_wandb_artifact and cfg.log.wandb_mode != "disabled"
+    )
+    prune_ckpts = cfg.log.wandb_mode == "online"
+    ckpt_artifacts: list[wandb.Artifact] = []
+
     if rank == 0 and eval_setup is not None:
         metrics = _evaluate(
             module,
@@ -678,6 +775,9 @@ def main(hydra_cfg: DictConfig) -> None:
 
         wav = batch["audio"].to(device, non_blocking=True)  # [B, S]
         f0 = batch["pitch"].to(device, non_blocking=True)  # [B, T_ctrl]
+        # One canonical loudness for both what the model hears and what it is
+        # scored against; the synth output is not gain-matched below.
+        wav = _rms_normalize(wav, cfg.data.target_rms)
         target = wav
         wav_in = wav.unsqueeze(1)  # [B, 1, S]
 
@@ -705,7 +805,7 @@ def main(hydra_cfg: DictConfig) -> None:
             control_rate=frame_rate,
         )
         S = min(pred.shape[-1], target.shape[-1])
-        pred_norm = _volume_match(pred[..., :S], target[..., :S], samples_per_frame)
+        pred_norm = pred[..., :S]
         S_norm = pred_norm.shape[-1]
         recon_loss, recon_components = loss_fn.with_components(
             pred_norm, target[..., :S_norm]
@@ -783,31 +883,24 @@ def main(hydra_cfg: DictConfig) -> None:
             )
 
         if rank == 0 and step % cfg.log.ckpt_every == 0:
-            ckpt_path = run_dir / "checkpoints" / f"{step:07d}.pt"
-            torch.save(
-                {
-                    "step": step,
-                    "model": module.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "config_json": cfg.model_dump_json(),
-                },
-                ckpt_path,
-            )
-            last_path = run_dir / "checkpoints" / "last.pt"
-            if last_path.is_symlink() or last_path.exists():
-                last_path.unlink()
-            last_path.symlink_to(ckpt_path.name)
+            ckpt_path = _save_checkpoint(run_dir, step, module, optimizer, cfg)
+            if upload_ckpts:
+                _log_ckpt_artifact(
+                    run_dir, ckpt_path, step, ckpt_artifacts, prune=prune_ckpts
+                )
 
     pbar.close()
     if rank == 0:
-        if cfg.log.ckpt_wandb_artifact and cfg.log.wandb_mode != "disabled":
-            last_path = run_dir / "checkpoints" / "last.pt"
-            if last_path.exists():
-                artifact = wandb.Artifact(f"{run_dir.name}-checkpoint", type="model")
-                # Resolve the symlink and store under a stable name so the
-                # artifact always exposes the final step as last.pt.
-                artifact.add_file(str(last_path.resolve()), name="last.pt")
-                wandb.log_artifact(artifact)
+        # The final step usually isn't a multiple of ckpt_every, so save and
+        # upload it too; a step that was just checkpointed is skipped.
+        if step % cfg.log.ckpt_every != 0:
+            ckpt_path = _save_checkpoint(run_dir, step, module, optimizer, cfg)
+            if upload_ckpts:
+                _log_ckpt_artifact(
+                    run_dir, ckpt_path, step, ckpt_artifacts, prune=prune_ckpts
+                )
+        if prune_ckpts:
+            _prune_ckpt_artifacts(ckpt_artifacts)
         wandb.finish()
     if is_ddp:
         dist.destroy_process_group()

@@ -4,9 +4,10 @@ The head emits a categorical distribution over ``n_buckets`` evenly spaced
 values per trainable parameter. During training a Gumbel-softmax sample
 weights the bucket centers (soft by default; one-hot straight-through with
 ``gumbel_hard``); at eval time the argmax bucket is used.
-The ``frequency`` parameter is supplied externally (precomputed pyin) and
-``intensity`` is frozen to 1.0 — volume is matched post-synth in the train
-loop.
+The ``frequency`` parameter is supplied externally (precomputed pyin).
+``intensity`` is trainable and carries the energy contour: the synth output is
+never gain-matched, so the model has to produce the level itself (see
+``data.target_rms``).
 """
 
 from __future__ import annotations
@@ -22,10 +23,13 @@ from torch import Tensor, nn
 from samuel.encoder import SEANetEncoder, SEANetEncoderConfig
 from samuel.pink_trombone import N_PARAMS, PARAM_NAMES, SAMPLE_RATE
 
-# (lo, hi, init) per trainable parameter. ``frequency`` and ``intensity`` are
-# intentionally absent — frequency comes from pyin, intensity is frozen.
+# (lo, hi, init) per trainable parameter. ``frequency`` is intentionally
+# absent — it comes from pyin.
 _DEFAULT_PARAM_SPEC: dict[str, tuple[float, float, float]] = {
     "voiceness": (0.0, 1.0, 0.6),
+    # Overall gain / voicing onset. Trainable because nothing downstream
+    # corrects the output level.
+    "intensity": (0.0, 1.0, 1.0),
     "tongueIndex": (10.0, 35.0, 20.0),
     "tongueDiameter": (1.5, 3.5, 2.4),
     # Capped at _LIP_START (39): this constriction models the tongue tip; the
@@ -48,7 +52,6 @@ _DEFAULT_PARAM_SPEC: dict[str, tuple[float, float, float]] = {
     "lipDiameter": (0.0, 3.0, 1.25),
 }
 _DEFAULT_FROZEN_VALUES: dict[str, float] = {
-    "intensity": 1.0,
     "vibratoWobble": 0.0,
     "vibratoFrequency": 6.0,
     "vibratoGain": 0.0,

@@ -43,6 +43,7 @@ const SPEEDS = [0.25, 0.5, 1] as const;
 const PANEL_PARAMS: Array<{ key: string; label: string; digits: number }> = [
   { key: "frequency", label: "frequency (Hz)", digits: 1 },
   { key: "voiceness", label: "voiceness", digits: 3 },
+  { key: "intensity", label: "intensity", digits: 3 },
   { key: "tongueIndex", label: "tongue index", digits: 2 },
   { key: "tongueDiameter", label: "tongue diameter", digits: 2 },
   { key: "constrictionIndex", label: "constriction index", digits: 2 },
@@ -84,7 +85,6 @@ function ParamPanel({
             response?.params[key] ? response.params[key][frame].toFixed(digits) : "–",
           ),
         )}
-        {row("gain", response ? response.gain[frame].toFixed(2) : "–")}
         {row(
           "voiced (pyin)",
           response ? (response.voiced[frame] ? "yes" : "no") : "–",
