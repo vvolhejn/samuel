@@ -48,9 +48,19 @@ Usage (with the dedicated venv):
         --write-manifest manifests/librilight_1000h_enhanced.jsonl
 """
 
+import os
+import sys
+
+# A conda/mamba lib dir on LD_LIBRARY_PATH shadows the libvorbis bundled with
+# the soundfile wheel (LD_LIBRARY_PATH beats the wheel's RUNPATH), and the
+# version mix segfaults libsndfile's OGG encoder. The loader only reads
+# LD_LIBRARY_PATH at process start, so re-exec with it removed.
+if os.environ.get("LD_LIBRARY_PATH"):
+    env = {k: v for k, v in os.environ.items() if k != "LD_LIBRARY_PATH"}
+    os.execve(sys.executable, [sys.executable] + sys.argv, env)
+
 import argparse
 import json
-import os
 import random
 from pathlib import Path
 
@@ -106,11 +116,38 @@ def select_files(
     return selected
 
 
+def pad_for_chunking(
+    dwav: torch.Tensor, sr: int, min_tail_s: float = 0.5
+) -> torch.Tensor:
+    """Pad with trailing silence so resemble-enhance's chunking never produces a
+    degenerate last chunk (a few-ms window crashes its mel padding). enhance()
+    splits the 44.1kHz-resampled audio into 30s windows every 29s; if the last
+    window would hold less than min_tail_s, extend it to min_tail_s."""
+    sr_out = 44100
+    hop = int(sr_out * (30.0 - 1.0))  # chunk_seconds - overlap_seconds
+    out_len = int(len(dwav) * sr_out / sr)
+    rem = out_len % hop
+    if 0 < rem < int(sr_out * min_tail_s):
+        pad_out = int(sr_out * min_tail_s) - rem
+        dwav = torch.nn.functional.pad(dwav, (0, -(-pad_out * sr // sr_out)))
+    return dwav
+
+
 def save_audio(path: Path, wav: torch.Tensor, sr: int, ext: str) -> None:
     fmt = {"ogg": ("OGG", "VORBIS"), "mp3": ("MP3", "MPEG_LAYER_III")}[ext]
     tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
+    data = wav.numpy()
     try:
-        sf.write(str(tmp), wav.numpy(), sr, format=fmt[0], subtype=fmt[1])
+        # Write in blocks: a single multi-megasample sf.write() segfaults in
+        # libsndfile's vorbis encoder.
+        with sf.SoundFile(
+            str(tmp), "w", samplerate=sr, channels=1, format=fmt[0], subtype=fmt[1]
+        ) as f:
+            for i in range(0, len(data), 65536):
+                f.write(data[i : i + 65536])
+        written = sf.info(str(tmp)).frames
+        if written != len(data):
+            raise RuntimeError(f"{path}: wrote {written} frames, expected {len(data)}")
         os.replace(tmp, path)
     except BaseException:
         tmp.unlink(missing_ok=True)
@@ -230,8 +267,9 @@ def main() -> None:
             try:
                 wav, sr = sf.read(entry["path"], dtype="float32", always_2d=True)
                 dwav = torch.from_numpy(wav).mean(dim=1)
+                orig_len = len(dwav)
                 hwav, new_sr = enhance(
-                    dwav,
+                    pad_for_chunking(dwav, sr),
                     sr,
                     args.device,
                     nfe=args.nfe,
@@ -239,6 +277,7 @@ def main() -> None:
                     lambd=args.lambd,
                     tau=args.tau,
                 )
+                hwav = hwav[: int(orig_len * new_sr / sr)]  # drop chunking pad
                 out.parent.mkdir(parents=True, exist_ok=True)
                 save_audio(out, hwav.cpu(), new_sr, args.ext)
                 done_s += entry["duration"]
