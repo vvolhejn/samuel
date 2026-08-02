@@ -215,20 +215,62 @@ def _tau_for_step(step: int, cfg: TrainConfig) -> float:
     return cfg.optim.tau_start + frac * (cfg.optim.tau_end - cfg.optim.tau_start)
 
 
+def _normalized_trainable_params(
+    params: torch.Tensor, module: PinkTromboneController
+) -> torch.Tensor:
+    """Trainable params rescaled to ``[0, 1]``; ``[B, T, n_trainable]``.
+
+    Uses the bucket-center range per parameter so no single wide-range
+    parameter dominates. Differentiable.
+    """
+    train_params = params.index_select(-1, module._trainable_idx).float()
+    lo = module.bucket_centers[:, 0].view(1, 1, -1)
+    hi = module.bucket_centers[:, -1].view(1, 1, -1)
+    return (train_params - lo) / (hi - lo).clamp_min(1e-8)
+
+
 def _normalized_trainable_diffs(
     params: torch.Tensor, module: PinkTromboneController
 ) -> torch.Tensor:
     """Per-frame absolute change of trainable params, each rescaled to [0, 1].
 
-    Uses the bucket-center range per parameter so no single wide-range
-    parameter dominates. Returns ``[B, T-1, n_trainable]``; differentiable.
+    Returns ``[B, T-1, n_trainable]``; differentiable.
     """
-    trainable_idx = module._trainable_idx
-    train_params = params.index_select(-1, trainable_idx).float()
-    lo = module.bucket_centers[:, 0].view(1, 1, -1)
-    hi = module.bucket_centers[:, -1].view(1, 1, -1)
-    p_norm = (train_params - lo) / (hi - lo).clamp_min(1e-8)
+    p_norm = _normalized_trainable_params(params, module)
     return (p_norm[:, 1:] - p_norm[:, :-1]).abs()
+
+
+def _normalized_trainable_accels(
+    params: torch.Tensor, module: PinkTromboneController
+) -> torch.Tensor:
+    """Absolute *second* difference of the trajectories; ``[B, T-2, n_t]``.
+
+    Unlike the first difference this is blind to speed: a steady ramp scores
+    zero however fast it moves, while a direction reversal scores twice the
+    step size. That is the distinction the first-difference penalty cannot
+    make -- turning ``loss.smooth`` up far enough to remove jitter also
+    freezes the genuine gestures.
+    """
+    p_norm = _normalized_trainable_params(params, module)
+    d1 = p_norm[:, 1:] - p_norm[:, :-1]
+    return (d1[:, 1:] - d1[:, :-1]).abs()
+
+
+def _weighted_param_penalty(
+    per_frame: torch.Tensor,
+    module: PinkTromboneController,
+    weights: dict[str, float],
+) -> torch.Tensor:
+    """``sum_p weights[p] * mean_{batch,time} per_frame[..., p]``.
+
+    Params absent from ``weights`` contribute 0.
+    """
+    coeffs = torch.tensor(
+        [weights.get(n, 0.0) for n in module.trainable_names_],
+        dtype=per_frame.dtype,
+        device=per_frame.device,
+    )
+    return (per_frame.mean(dim=(0, 1)) * coeffs).sum()
 
 
 def _smoothness_loss(
@@ -236,18 +278,46 @@ def _smoothness_loss(
     module: PinkTromboneController,
     weights: dict[str, float],
 ) -> torch.Tensor:
-    """L1 temporal-smoothness penalty on the control trajectories.
+    """L1 penalty on the per-frame change: ``sum_p w_p * mean |Δp_norm|``.
 
-    ``sum_p weights[p] * mean_{batch,time} |Δp_norm|`` over trainable params;
-    params absent from ``weights`` contribute 0 (see LossConfig.smooth_weights).
+    See LossConfig.smooth_weights.
     """
-    diff = _normalized_trainable_diffs(params, module)  # [B, T-1, n_t]
-    coeffs = torch.tensor(
-        [weights.get(n, 0.0) for n in module.trainable_names_],
-        dtype=diff.dtype,
-        device=diff.device,
+    return _weighted_param_penalty(
+        _normalized_trainable_diffs(params, module), module, weights
     )
-    return (diff.mean(dim=(0, 1)) * coeffs).sum()
+
+
+def _acceleration_loss(
+    params: torch.Tensor,
+    module: PinkTromboneController,
+    weights: dict[str, float],
+) -> torch.Tensor:
+    """L1 penalty on the per-frame *acceleration*: ``sum_p w_p * mean |Δ²p_norm|``.
+
+    See LossConfig.accel_weights.
+    """
+    return _weighted_param_penalty(
+        _normalized_trainable_accels(params, module), module, weights
+    )
+
+
+@torch.no_grad()
+def _reversal_rate(params: torch.Tensor, module: PinkTromboneController) -> float:
+    """Fraction of moving frames whose direction flips.
+
+    The jitter metric ``param_variation`` cannot supply: a slew-rate limiter
+    turns a square jump into a triangle ramp of the same mean ``|Δ|``, so
+    ``|Δ|`` barely registers the change while this does. A monotone glide
+    scores 0, a frame-by-frame zigzag scores 1.
+    """
+    p_norm = _normalized_trainable_params(params, module)
+    sign = torch.sign(p_norm[:, 1:] - p_norm[:, :-1])
+    moving = (sign[:, 1:] != 0) & (sign[:, :-1] != 0)
+    n_moving = moving.sum()
+    if n_moving == 0:
+        return 0.0
+    flips = (sign[:, 1:] != sign[:, :-1]) & moving
+    return float(flips.sum() / n_moving)
 
 
 @torch.no_grad()
@@ -591,6 +661,13 @@ def _evaluate(
         "eval/smooth_loss": _smoothness_loss(
             params, model, cfg.loss.smooth_weights
         ).item(),
+        "eval/accel_loss": _acceleration_loss(
+            params, model, cfg.loss.accel_weights
+        ).item(),
+        # The two jitter metrics that mean |Δ| cannot express: acceleration is
+        # blind to steady movement, reversal rate counts oscillation directly.
+        "eval/param_accel": float(_normalized_trainable_accels(params, model).mean()),
+        "eval/reversal_rate": _reversal_rate(params, model),
     }
     # Per-param variation too: the scalar mean hides which param is jittery,
     # which is exactly what the smoothing/rate-limit experiments turn on.
@@ -711,11 +788,12 @@ def main(hydra_cfg: DictConfig) -> None:
 
     # Model
     model = PinkTromboneController(cfg.model).to(device)
-    unknown_smooth = set(cfg.loss.smooth_weights) - set(model.trainable_names_)
-    if unknown_smooth:
-        raise ValueError(
-            f"loss.smooth_weights names non-trainable params: {sorted(unknown_smooth)}"
-        )
+    for field in ("smooth_weights", "accel_weights"):
+        unknown = set(getattr(cfg.loss, field)) - set(model.trainable_names_)
+        if unknown:
+            raise ValueError(
+                f"loss.{field} names non-trainable params: {sorted(unknown)}"
+            )
     frame_rate = cfg.model.frame_rate
     samples_per_frame = cfg.model.samples_per_frame
     loss_components: list[tuple[str, float, nn.Module]] = [
@@ -888,10 +966,12 @@ def main(hydra_cfg: DictConfig) -> None:
         # Always computed (it's cheap) so the raw value can be compared across
         # runs; contributes to the gradient only when weighted.
         smooth_loss = _smoothness_loss(params, module, cfg.loss.smooth_weights)
+        accel_loss = _acceleration_loss(params, module, cfg.loss.accel_weights)
         loss = (
             recon_loss
             + cfg.loss.entropy * entropy_penalty
             + cfg.loss.smooth * smooth_loss
+            + cfg.loss.accel * accel_loss
         )
 
         loss.backward()
@@ -920,6 +1000,7 @@ def main(hydra_cfg: DictConfig) -> None:
                 "train/entropy": entropy.item(),
                 "train/entropy_penalty": entropy_penalty.item(),
                 "train/smooth_loss": smooth_loss.item(),
+                "train/accel_loss": accel_loss.item(),
                 "train/lr": optimizer.param_groups[0]["lr"],
                 "train/tau": tau,
                 "train/grad_norm": float(grad_norm),

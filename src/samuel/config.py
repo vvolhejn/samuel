@@ -154,6 +154,23 @@ class LossConfig(BaseModel):
         }
     )
 
+    # Acceleration penalty: the same L1 on the *second* difference,
+    #   accel * sum_p accel_weights[p] * mean_{batch,time} |Δ²p_norm|
+    # This penalises direction changes rather than movement. A steady ramp
+    # costs nothing however fast it is, so unlike ``smooth`` the weight can be
+    # raised to remove jitter without also freezing the articulators (at
+    # smooth=1.0 every parameter stops moving entirely). Off by default.
+    accel: float = 0.0
+    accel_weights: dict[str, float] = Field(
+        default_factory=lambda: {
+            "tongueIndex": 1.0,
+            "tongueDiameter": 0.3,
+            "constrictionIndex": 1.0,
+            "constrictionDiameter": 0.1,
+            "lipDiameter": 0.1,
+        }
+    )
+
     # SSL feature-matching (perceptual) loss on a frozen speech encoder.
     # L1 distance between the encoder's hidden states for pred vs. target audio.
     ssl: float = 1.0

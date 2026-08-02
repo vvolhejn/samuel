@@ -40,9 +40,12 @@ model:
     constrictionIndex: 4.0     # 250 ms -- tongue-tip place of articulation
     constrictionDiameter: 15.0 #  67 ms -- must snap shut/open for stops
     lipDiameter: 15.0          #  67 ms -- lip closure/release
-  # "clamp" (exact box, zero grad on saturated frames) | "tanh" (same bound,
-  # smooth and everywhere-differentiable)
-  rate_limit_mode: clamp
+  # "tanh" (default): same hard bound as clamp but with a soft knee, so
+  # trajectories that push the limit get bent rather than cornered. Post-hoc on
+  # a 30k checkpoint it matched clamp's WER at a markedly lower direction-
+  # reversal rate (0.29 vs 0.34). "clamp" is the exact box, which gives a
+  # saturated frame zero gradient to its own logits.
+  rate_limit_mode: tanh
 
   # (lo, hi, init) per trainable parameter. ``frequency`` is supplied
   # externally from the pyin cache. ``intensity`` is trainable: the synth

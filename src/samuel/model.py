@@ -107,7 +107,7 @@ class PinkTromboneControllerConfig(BaseModel):
     #   "tanh": delta <- d * tanh(delta / d). Same hard bound |delta| < d,
     #     but smooth and everywhere-differentiable; near-linear for small
     #     moves, so it only distorts trajectories that were pushing the limit.
-    rate_limit_mode: Literal["clamp", "tanh"] = "clamp"
+    rate_limit_mode: Literal["clamp", "tanh"] = "tanh"
 
     @property
     def frame_rate(self) -> float:
