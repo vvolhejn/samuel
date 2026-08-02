@@ -265,6 +265,34 @@ def _param_variation(params: torch.Tensor, module: PinkTromboneController) -> fl
 
 
 @torch.no_grad()
+def _rate_limit_diagnostics(
+    params: torch.Tensor,
+    aux: dict[str, torch.Tensor],
+    module: PinkTromboneController,
+) -> dict[str, float]:
+    """How hard the slew-rate limiter is binding, per rate-limited param.
+
+    ``saturated`` is the fraction of frames whose requested step exceeded the
+    limit. Near 0 means the limiter is inert (raise nothing, it costs nothing);
+    near 1 means the model is permanently pinned against it and the trajectory
+    is a ramp rather than a control signal.
+    """
+    idx = module._rate_limit_idx
+    if idx.numel() == 0:
+        return {}
+    limited = params.index_select(-1, module._trainable_idx).index_select(-1, idx)
+    raw = aux["raw_trainable"].index_select(-1, idx).float()
+    # Step the model asked for at frame t, measured from the *limited* t-1.
+    requested = (raw[:, 1:] - limited[:, :-1]).abs()
+    over = (requested > module._rate_limit_delta).float()
+    out: dict[str, float] = {}
+    for j, name in enumerate(module.rate_limited_names_):
+        out[f"diag/rate_saturated/{name}"] = over[..., j].mean().item()
+    out["diag/rate_saturated/mean"] = over.mean().item()
+    return out
+
+
+@torch.no_grad()
 def _controller_diagnostics(
     aux: dict[str, torch.Tensor], trainable_names: list[str]
 ) -> dict[str, float | wandb.Histogram]:
@@ -564,6 +592,11 @@ def _evaluate(
             params, model, cfg.loss.smooth_weights
         ).item(),
     }
+    # Per-param variation too: the scalar mean hides which param is jittery,
+    # which is exactly what the smoothing/rate-limit experiments turn on.
+    per_param = _normalized_trainable_diffs(params, model).mean(dim=(0, 1))
+    for name, v in zip(model.trainable_names_, per_param.tolist()):
+        out[f"eval/param_variation/{name}"] = v
     for name, value in components.items():
         out[f"eval/recon/{name}"] = value.item()
 
@@ -898,6 +931,7 @@ def main(hydra_cfg: DictConfig) -> None:
                 log_payload[f"train/recon/{name}"] = value.item()
             log_payload["train/param_variation"] = _param_variation(params, module)
             log_payload.update(_controller_diagnostics(aux, model.trainable_names_))
+            log_payload.update(_rate_limit_diagnostics(params, aux, module))
             wandb.log(log_payload, step=step)
 
         if rank == 0 and eval_setup is not None and step % cfg.log.eval_every == 0:

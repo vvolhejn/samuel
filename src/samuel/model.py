@@ -8,11 +8,17 @@ The ``frequency`` parameter is supplied externally (precomputed pyin).
 ``intensity`` is trainable and carries the energy contour: the synth output is
 never gain-matched, so the model has to produce the level itself (see
 ``data.target_rms``).
+
+Trajectories can additionally be passed through a slew-rate limiter
+(``rate_limits``) that hard-bounds how fast each parameter may move. It is an
+architectural alternative to the L1 smoothness penalty in the loss: instead of
+paying for jitter, the model simply cannot emit it.
 """
 
 from __future__ import annotations
 
 import math
+from typing import Literal
 
 import torch
 import torch.nn.functional as F
@@ -78,6 +84,31 @@ class PinkTromboneControllerConfig(BaseModel):
     # bucket centers.
     gumbel_hard: bool = False
 
+    # Slew-rate limiter: maximum speed per trainable parameter, in *fractions
+    # of that parameter's range per second* (so 2.0 = may traverse the whole
+    # [lo, hi] range in 0.5 s). Applied to the emitted trajectory at both train
+    # and eval time, before the params reach the synth, so it is a genuine
+    # constraint on the model's output rather than a penalty it can pay.
+    # Params absent from the dict are unconstrained.
+    #
+    # Split scalar/dict like loss.smooth and loss.smooth_weights: the effective
+    # limit is ``rate_limit_scale * rate_limits[p]``, so a sweep over the
+    # tightness of the constraint is a single scalar override.
+    # ``rate_limit_scale: null`` (the default) disables the limiter entirely.
+    # Ordering vs. loss.smooth_weights is inverse: a *large* limit is the
+    # counterpart of a *small* smoothness weight (constrictionDiameter must
+    # snap for plosives; tongueIndex should glide).
+    rate_limit_scale: float | None = None
+    rate_limits: dict[str, float] = Field(default_factory=dict)
+    # How the per-frame increment is bounded.
+    #   "clamp": delta <- clip(delta, +-d). Exact box constraint; a saturated
+    #     frame gets zero gradient to its own logits (the gradient passes
+    #     through to the previous frame with weight 1, so nothing vanishes).
+    #   "tanh": delta <- d * tanh(delta / d). Same hard bound |delta| < d,
+    #     but smooth and everywhere-differentiable; near-linear for small
+    #     moves, so it only distorts trajectories that were pushing the limit.
+    rate_limit_mode: Literal["clamp", "tanh"] = "clamp"
+
     @property
     def frame_rate(self) -> float:
         return SAMPLE_RATE / self.samples_per_frame
@@ -107,6 +138,59 @@ class PinkTromboneControllerConfig(BaseModel):
         unknown = (trainable | frozen) - set(PARAM_NAMES)
         if unknown:
             raise ValueError(f"unknown Pink Trombone params: {unknown}")
+        unknown_limits = set(self.rate_limits) - trainable
+        if unknown_limits:
+            raise ValueError(
+                f"rate_limits names non-trainable params: {sorted(unknown_limits)}"
+            )
+        nonpositive = {n: v for n, v in self.rate_limits.items() if v <= 0.0}
+        if nonpositive:
+            raise ValueError(f"rate_limits must be positive, got: {nonpositive}")
+        if self.rate_limit_scale is not None and self.rate_limit_scale <= 0.0:
+            raise ValueError(
+                "rate_limit_scale must be positive or null (null = limiter off), "
+                f"got {self.rate_limit_scale}"
+            )
+
+    def effective_rate_limits(self) -> dict[str, float]:
+        """``rate_limits`` after applying the scale; empty when disabled."""
+        if self.rate_limit_scale is None:
+            return {}
+        return {n: self.rate_limit_scale * v for n, v in self.rate_limits.items()}
+
+
+def slew_rate_limit(
+    values: Tensor, max_delta: Tensor, mode: Literal["clamp", "tanh"] = "clamp"
+) -> Tensor:
+    """Bound the per-frame change of a trajectory to ``+-max_delta``.
+
+    Args:
+        values: ``[B, T, P]`` raw trajectory.
+        max_delta: ``[P]`` maximum absolute change per frame, in the same units
+            as ``values``. Must be strictly positive.
+        mode: ``"clamp"`` (exact box) or ``"tanh"`` (smooth, same hard bound).
+
+    Returns:
+        ``[B, T, P]`` with ``|out[:, t] - out[:, t-1]| <= max_delta``. The
+        first frame is passed through unchanged.
+
+    The recursion compares against the *limited* previous value, so the bound
+    holds on the realised trajectory rather than on the raw one. It is a
+    sequential scan over T; T is a few hundred frames, which is negligible next
+    to the sample-rate waveguide downstream.
+    """
+    T = values.shape[1]
+    prev = values[:, 0]
+    out = [prev]
+    for t in range(1, T):
+        delta = values[:, t] - prev
+        if mode == "clamp":
+            delta = torch.clamp(delta, -max_delta, max_delta)
+        else:
+            delta = max_delta * torch.tanh(delta / max_delta)
+        prev = prev + delta
+        out.append(prev)
+    return torch.stack(out, dim=1)
 
 
 class PinkTromboneController(nn.Module):
@@ -139,6 +223,26 @@ class PinkTromboneController(nn.Module):
         # [n_trainable, n_buckets]
         centers = lo.unsqueeze(1) + steps.unsqueeze(0) * (hi - lo).unsqueeze(1)
         self.register_buffer("bucket_centers", centers)
+
+        # Slew-rate limits, converted from range-fractions/second to absolute
+        # param units per control frame.
+        effective = config.effective_rate_limits()
+        limited = [n for n in trainable if n in effective]
+        self.rate_limited_names_: list[str] = limited
+        rl_idx = torch.tensor([trainable.index(n) for n in limited], dtype=torch.long)
+        rl_delta = torch.tensor(
+            [
+                effective[n]
+                * (config.param_spec[n][1] - config.param_spec[n][0])
+                / config.frame_rate
+                for n in limited
+            ],
+            dtype=torch.float32,
+        )
+        # Non-persistent: fully derived from the config, and keeping them out
+        # of the state_dict lets pre-rate-limit checkpoints load unchanged.
+        self.register_buffer("_rate_limit_idx", rl_idx, persistent=False)
+        self.register_buffer("_rate_limit_delta", rl_delta, persistent=False)
 
         self.head = nn.Linear(config.encoder.dimension, n_trainable * config.n_buckets)
         # Bias init at zero -> uniform softmax -> mean bucket value at start.
@@ -180,8 +284,10 @@ class PinkTromboneController(nn.Module):
                 sane range.
             tau: Gumbel-softmax temperature (training only).
             return_aux: if True, also return a dict with ``logits``
-                ``[B, T_ctrl, n_trainable, n_buckets]`` and ``z`` (encoder
-                output, ``[B, dim, T_ctrl]``) for diagnostics.
+                ``[B, T_ctrl, n_trainable, n_buckets]``, ``z`` (encoder
+                output, ``[B, dim, T_ctrl]``) and ``raw_trainable``
+                (``[B, T_ctrl, n_trainable]``, the trajectory before the
+                slew-rate limiter) for diagnostics.
 
         Returns:
             ``[B, T_ctrl, N_PARAMS]`` parameter tensor (and ``aux`` dict if
@@ -226,6 +332,14 @@ class PinkTromboneController(nn.Module):
 
         constrained = (weights * self.bucket_centers).sum(dim=-1)  # [B, T_ctrl, n_t]
 
+        raw = constrained
+        if self._rate_limit_idx.numel() > 0:
+            sub = constrained.index_select(2, self._rate_limit_idx)
+            sub = slew_rate_limit(
+                sub, self._rate_limit_delta, self.config.rate_limit_mode
+            )
+            constrained = constrained.index_copy(2, self._rate_limit_idx, sub)
+
         out = torch.zeros(
             B, T_ctrl, N_PARAMS, device=wav.device, dtype=constrained.dtype
         )
@@ -242,5 +356,7 @@ class PinkTromboneController(nn.Module):
         )
         out = out.scatter(2, freq_idx, f0.unsqueeze(-1).to(out.dtype))
         if return_aux:
-            return out, {"logits": logits, "z": z}
+            # ``raw`` is the pre-limiter trajectory; comparing it to the
+            # emitted one says how hard the limiter is binding.
+            return out, {"logits": logits, "z": z, "raw_trainable": raw}
         return out

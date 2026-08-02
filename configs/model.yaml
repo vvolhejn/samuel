@@ -20,6 +20,30 @@ model:
   # soft expectation over bucket centers. Eval always snaps to argmax.
   gumbel_hard: false
 
+  # Slew-rate limiter: hard cap on how fast each param may move, in fractions
+  # of its own [lo, hi] range per second (2.0 = full range in 0.5 s). Applied
+  # at train and eval time to the emitted trajectory, so unlike loss.smooth it
+  # is a constraint the model cannot buy its way out of.
+  #
+  # Effective limit = rate_limit_scale * rate_limits[p]. null scale = off,
+  # which keeps this an opt-in experiment; sweep the constraint with a single
+  # override, e.g. model.rate_limit_scale=2.0.
+  rate_limit_scale: null
+  # Base speeds, ordered inverse to loss.smooth_weights: params that must snap
+  # get large limits, params that should glide get small ones. Calibrated
+  # against a 30k-step run's measured trajectories -- at scale 1.0 these sit
+  # near the p75-p90 of its per-frame movement, so ordinary gestures pass and
+  # the jump tail is cut. Times below are how long a full-range traverse takes.
+  rate_limits:
+    tongueIndex: 4.0           # 250 ms -- tongue body, slowest articulator
+    tongueDiameter: 8.0        # 125 ms
+    constrictionIndex: 4.0     # 250 ms -- tongue-tip place of articulation
+    constrictionDiameter: 15.0 #  67 ms -- must snap shut/open for stops
+    lipDiameter: 15.0          #  67 ms -- lip closure/release
+  # "clamp" (exact box, zero grad on saturated frames) | "tanh" (same bound,
+  # smooth and everywhere-differentiable)
+  rate_limit_mode: clamp
+
   # (lo, hi, init) per trainable parameter. ``frequency`` is supplied
   # externally from the pyin cache. ``intensity`` is trainable: the synth
   # output is never gain-matched (see data.target_rms), so the model needs a

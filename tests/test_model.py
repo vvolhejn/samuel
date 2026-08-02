@@ -12,6 +12,7 @@ from samuel.model import (
     _DEFAULT_PARAM_SPEC,
     PinkTromboneController,
     PinkTromboneControllerConfig,
+    slew_rate_limit,
 )
 from samuel.pink_trombone import N_PARAMS, PARAM_NAMES, pink_trombone_ola
 
@@ -143,3 +144,93 @@ class TestController:
         )
         with pytest.raises(ValueError, match="frequency.*externally"):
             PinkTromboneController(cfg)
+
+
+class TestSlewRateLimit:
+    @pytest.mark.parametrize("mode", ["clamp", "tanh"])
+    def test_bound_is_respected(self, mode):
+        torch.manual_seed(0)
+        values = torch.randn(3, 64, 2) * 10.0
+        max_delta = torch.tensor([0.1, 1.0])
+        out = slew_rate_limit(values, max_delta, mode)
+        assert out.shape == values.shape
+        assert torch.equal(out[:, 0], values[:, 0])
+        diffs = (out[:, 1:] - out[:, :-1]).abs()
+        assert (diffs <= max_delta + 1e-5).all()
+
+    def test_slow_trajectory_passes_through(self):
+        """A trajectory already inside the limit must be left untouched."""
+        t = torch.linspace(0, 1, 32).view(1, 32, 1)
+        max_delta = torch.tensor([1.0])
+        assert torch.allclose(slew_rate_limit(t, max_delta, "clamp"), t)
+
+    def test_clamp_tracks_a_step_as_a_ramp(self):
+        step = torch.cat([torch.zeros(1, 4, 1), torch.ones(1, 4, 1)], dim=1)
+        out = slew_rate_limit(step, torch.tensor([0.25]), "clamp")
+        expected = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.25, 0.5, 0.75, 1.0])
+        assert torch.allclose(out.flatten(), expected)
+
+    def test_gradient_at_the_knee_differs_by_mode(self):
+        """tanh's reason to exist: a soft knee instead of a hard corner.
+
+        A frame asking for 1.5x the limit gets exactly zero gradient under
+        clamp, but still a usable one under tanh. Far past the limit tanh
+        saturates numerically too, so this only helps near the boundary.
+        """
+        d = torch.tensor([0.1])
+
+        def grad_on_second_frame(mode: str) -> float:
+            values = torch.tensor([[[0.0], [0.15]]], requires_grad=True)
+            slew_rate_limit(values, d, mode).sum().backward()
+            return values.grad[0, 1, 0].item()
+
+        assert grad_on_second_frame("clamp") == 0.0
+        assert grad_on_second_frame("tanh") > 0.1
+
+    def test_clamp_passes_gradient_back_through_saturated_frames(self):
+        """A saturated frame is a dead end for its own logits only.
+
+        d(out_t)/d(in_{t-1}) is 1 across a clipped link, so the loss still
+        reaches earlier frames at full strength — the model learns to start
+        moving sooner rather than losing the signal.
+        """
+        values = torch.tensor([[[0.0], [9.0], [9.0]]], requires_grad=True)
+        slew_rate_limit(values, torch.tensor([0.1]), "clamp")[:, -1].sum().backward()
+        assert values.grad.flatten().tolist() == [1.0, 0.0, 0.0]
+
+    def test_model_output_is_rate_limited(self):
+        cfg = _small_config()
+        cfg.rate_limits = {"tongueIndex": 0.5}
+        cfg.rate_limit_scale = 2.0  # effective limit 1.0 range/s
+        model = PinkTromboneController(cfg).eval()
+        S = cfg.samples_per_frame * 16
+        T_ctrl = S // cfg.samples_per_frame
+        wav = torch.randn(2, 1, S)
+        params = model(wav, _zero_f0(model, 2, T_ctrl))
+
+        lo, hi, _ = cfg.param_spec["tongueIndex"]
+        per_frame = 1.0 * (hi - lo) / cfg.frame_rate
+        traj = params[..., PARAM_NAMES.index("tongueIndex")]
+        assert ((traj[:, 1:] - traj[:, :-1]).abs() <= per_frame + 1e-4).all()
+        # Unlisted params stay free.
+        other = params[..., PARAM_NAMES.index("constrictionIndex")]
+        assert (other[:, 1:] - other[:, :-1]).abs().max() > per_frame
+
+    def test_rate_limit_on_non_trainable_param_rejected(self):
+        cfg = _small_config()
+        cfg.rate_limits = {"vibratoGain": 1.0}
+        with pytest.raises(ValueError, match="rate_limits names non-trainable"):
+            PinkTromboneController(cfg)
+
+    def test_null_scale_disables_the_limiter(self):
+        """Limits can stay in the YAML; the scalar is the on/off switch."""
+        cfg = _small_config()
+        cfg.rate_limits = {"tongueIndex": 0.001}
+        model = PinkTromboneController(cfg).eval()  # rate_limit_scale is None
+        assert model.rate_limited_names_ == []
+        S = cfg.samples_per_frame * 16
+        wav = torch.randn(2, 1, S)
+        traj = model(wav, _zero_f0(model, 2, S // cfg.samples_per_frame))[
+            ..., PARAM_NAMES.index("tongueIndex")
+        ]
+        assert (traj[:, 1:] - traj[:, :-1]).abs().max() > 0.0
