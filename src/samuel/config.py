@@ -59,9 +59,10 @@ class OptimConfig(BaseModel):
     warmup_steps: int = 1_000
     # Gumbel-softmax temperature: linear anneal from tau_start to tau_end over
     # the first tau_anneal_steps; afterwards held at tau_end. tau_anneal_steps
-    # defaults to max_steps when omitted in YAML.
+    # defaults to max_steps when omitted in YAML. Equal endpoints (the default)
+    # hold tau constant -- annealing was measured to add nothing.
     tau_start: float = 2.0
-    tau_end: float = 0.5
+    tau_end: float = 2.0
     tau_anneal_steps: int | None = None
 
 

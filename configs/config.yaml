@@ -24,15 +24,19 @@ optim:
   grad_clip: 1.0
   max_steps: 10000
   warmup_steps: 800
+  # Constant by default: a 0.5/1.0/2.0 sweep at 20k steps found intelligibility
+  # monotone in temperature (WER 0.34/0.25/0.24), and constant 2.0 matched the
+  # old 2.0 -> 0.5 anneal, so the schedule bought nothing. Set tau_end below
+  # tau_start to re-enable annealing.
   tau_start: 2.0
-  tau_end: 0.5
+  tau_end: 2.0
   tau_anneal_steps: null  # default = max_steps
 
 loss:
   mfcc: 1.0
   mel: 0.0
   stft: 0.0
-  entropy: 1.0        # weight of the hinged entropy penalty
+  entropy: 0.1        # weight of the hinged entropy penalty
   entropy_floor: 1.0  # per-position entropy floor in nats; no pressure above it
   # 4x window overlap (n_fft=2048, hop=samples_per_frame=512). Null falls
   # back to n_fft=samples_per_frame (no overlap).
