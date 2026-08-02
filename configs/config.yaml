@@ -44,7 +44,7 @@ loss:
   # Temporal smoothness: L1 on per-frame changes of range-normalised control
   # trajectories, sum_p smooth_weights[p] * mean|Δp_norm|. Params not listed
   # in smooth_weights are unpenalised. See LossConfig for details.
-  smooth: 0.0
+  smooth: 0.03
   smooth_weights:
     tongueIndex: 1.0
     tongueDiameter: 0.3

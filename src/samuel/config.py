@@ -143,14 +143,14 @@ class LossConfig(BaseModel):
     # control trajectories, computed on range-normalised params (each trainable
     # param rescaled to [0, 1]. Contribution to the training loss:
     #   smooth * sum_p smooth_weights[p] * mean_{batch,time} |Δp_norm|
-    smooth: float = 0.0
+    smooth: float = 0.03
     smooth_weights: dict[str, float] = Field(
         default_factory=lambda: {
             "tongueIndex": 1.0,
-            "tongueDiameter": 1.0,
+            "tongueDiameter": 0.3,
             "constrictionIndex": 1.0,
-            "constrictionDiameter": 0.5,
-            "lipDiameter": 0.5,
+            "constrictionDiameter": 0.1,
+            "lipDiameter": 0.1,
         }
     )
 
