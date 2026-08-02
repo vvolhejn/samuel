@@ -51,11 +51,12 @@ loss:
     constrictionIndex: 1.0
     constrictionDiameter: 0.1
     lipDiameter: 0.1
-  # SSL feature-matching (perceptual) loss
-  ssl: 0.0
+  # SSL feature-matching (perceptual) loss. On by default: it is what makes the
+  # controller intelligible, MFCC alone is not enough.
+  ssl: 1.0
   # HF id. Others tried: facebook/hubert-base-ls960,
-  # facebook/wav2vec2-base-960h, unclear which wins
-  ssl_model: microsoft/wavlm-base-plus
+  # microsoft/wavlm-base-plus, unclear which wins
+  ssl_model: facebook/wav2vec2-base-960h
   ssl_layer: 6
   ssl_distance: L1  # L1 | L2 | cosine
 
