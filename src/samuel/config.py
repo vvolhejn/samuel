@@ -143,8 +143,28 @@ class LossConfig(BaseModel):
     # control trajectories, computed on range-normalised params (each trainable
     # param rescaled to [0, 1]. Contribution to the training loss:
     #   smooth * sum_p smooth_weights[p] * mean_{batch,time} |Δp_norm|
-    smooth: float = 0.03
+    # Off in favour of ``accel``: penalising displacement cannot tell a fast
+    # gesture apart from jitter, so this either leaves the jitter in place or
+    # freezes the parameter.
+    smooth: float = 0.0
     smooth_weights: dict[str, float] = Field(
+        default_factory=lambda: {
+            "tongueIndex": 1.0,
+            "tongueDiameter": 0.3,
+            "constrictionIndex": 1.0,
+            "constrictionDiameter": 0.1,
+            "lipDiameter": 0.1,
+        }
+    )
+
+    # Acceleration penalty: the same L1 on the *second* difference,
+    #   accel * sum_p accel_weights[p] * mean_{batch,time} |Δ²p_norm|
+    # This penalises direction changes rather than movement: a steady ramp costs
+    # nothing however fast it is, which is the distinction ``smooth`` cannot
+    # express. It has a collapse regime all the same -- a constant trajectory
+    # has Δ² = 0 too -- so the weight is still bounded above, just less tightly.
+    accel: float = 0.3
+    accel_weights: dict[str, float] = Field(
         default_factory=lambda: {
             "tongueIndex": 1.0,
             "tongueDiameter": 0.3,
