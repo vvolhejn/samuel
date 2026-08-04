@@ -44,7 +44,9 @@ loss:
   # Temporal smoothness: L1 on per-frame changes of range-normalised control
   # trajectories, sum_p smooth_weights[p] * mean|Δp_norm|. Params not listed
   # in smooth_weights are unpenalised. See LossConfig for details.
-  smooth: 0.03
+  # Off in favour of loss.accel below, which dominates it: at accel=0.3 every
+  # jitter metric is better than at smooth=0.03 and WER is unchanged.
+  smooth: 0.0
   smooth_weights:
     tongueIndex: 1.0
     tongueDiameter: 0.3
@@ -53,8 +55,11 @@ loss:
     lipDiameter: 0.1
   # Same L1 on the *second* difference: penalises direction changes rather
   # than movement, so a fast steady gesture is free and only zigzag is
-  # charged. Off by default; see LossConfig.accel.
-  accel: 0.0
+  # charged. See LossConfig.accel.
+  # 0.3 is the highest weight measured to hold WER: -30% mean|Δ|, -23%
+  # direction reversals, -34% mean|Δ²| vs smooth=0.03 at equal WER. 1.0
+  # collapses the trajectory to a constant, so do not raise this blindly.
+  accel: 0.3
   accel_weights:
     tongueIndex: 1.0
     tongueDiameter: 0.3
