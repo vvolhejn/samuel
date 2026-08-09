@@ -301,6 +301,104 @@ def _acceleration_loss(
     )
 
 
+def _rest_targets_norm(
+    module: PinkTromboneController, targets: dict[str, float]
+) -> torch.Tensor:
+    """Rest targets in the same ``[0, 1]`` scale as the trajectories.
+
+    Targets are configured in raw parameter units; normalised here by the
+    bucket-center range used everywhere else. Params absent from ``targets``
+    get 0 and are masked out by the caller.
+    """
+    lo = module.bucket_centers[:, 0]
+    hi = module.bucket_centers[:, -1]
+    tgt = torch.tensor(
+        [targets.get(n, 0.0) for n in module.trainable_names_],
+        dtype=lo.dtype,
+        device=lo.device,
+    )
+    return (tgt - lo) / (hi - lo).clamp_min(1e-8)
+
+
+def _rest_pose_distance(
+    params: torch.Tensor,
+    module: PinkTromboneController,
+    targets: dict[str, float],
+) -> torch.Tensor:
+    """Per-param mean ``|p_norm - target_norm|``; ``[n_trainable]``, unweighted.
+
+    Params absent from ``targets`` get 0.
+    """
+    tgt_norm = _rest_targets_norm(module, targets)
+    mask = torch.tensor(
+        [1.0 if n in targets else 0.0 for n in module.trainable_names_],
+        dtype=tgt_norm.dtype,
+        device=tgt_norm.device,
+    )
+    p_norm = _normalized_trainable_params(params, module)
+    return (p_norm - tgt_norm.view(1, 1, -1)).abs().mean(dim=(0, 1)) * mask
+
+
+def _rest_pose_loss(
+    params: torch.Tensor,
+    module: PinkTromboneController,
+    targets: dict[str, float],
+    weights: dict[str, float],
+) -> torch.Tensor:
+    """``sum_p w_p * mean |p_norm - target_norm|`` over the params in ``targets``.
+
+    ``weights`` defaults to 1.0 per param. See LossConfig.rest.
+    """
+    dist = _rest_pose_distance(params, module, targets)
+    coeffs = torch.tensor(
+        [weights.get(n, 1.0) for n in module.trainable_names_],
+        dtype=dist.dtype,
+        device=dist.device,
+    )
+    return (dist * coeffs).sum()
+
+
+@torch.no_grad()
+def _silent_frame_rest_metrics(
+    params: torch.Tensor,
+    module: PinkTromboneController,
+    target: torch.Tensor,
+    cfg: TrainConfig,
+    silence_db: float = -20.0,
+) -> dict[str, float]:
+    """Rest-pose distance restricted to frames where the target is silent.
+
+    ``silence_db`` is relative to the clip loudness (``data.target_rms``), so
+    -20 dB means "a hundredth of the clip's energy". These are the frames the
+    reconstruction loss leaves unconstrained, so they are where a rest-pose
+    prior is supposed to show up; the all-frame ``eval/rest_loss`` mixes them
+    with speech frames where being off-target is correct.
+    """
+    spf = module.samples_per_frame
+    T = params.shape[1]
+    S = T * spf
+    tgt = F.pad(target, (0, max(0, S - target.shape[-1])))[:, :S]
+    frame_rms = tgt.view(tgt.shape[0], T, spf).pow(2).mean(-1).sqrt()  # [N, T]
+    silent = frame_rms < cfg.data.target_rms * 10 ** (silence_db / 20.0)
+    out = {"eval/silent_frac": float(silent.float().mean())}
+    if not bool(silent.any()):
+        return out
+
+    names = module.trainable_names_
+    targets = cfg.loss.rest_targets
+    tgt_norm = _rest_targets_norm(module, targets)
+    p_norm = _normalized_trainable_params(params, module)
+    dist = (p_norm - tgt_norm.view(1, 1, -1)).abs()[silent]  # [n_silent, n_t]
+    per_param = dist.mean(dim=0)
+    total = 0.0
+    for name, v in zip(names, per_param.tolist()):
+        if name in targets:
+            out[f"eval/rest_dist_silent/{name}"] = v
+            total += v
+    out["eval/rest_loss_silent"] = total
+    return out
+
+
 @torch.no_grad()
 def _reversal_rate(params: torch.Tensor, module: PinkTromboneController) -> float:
     """Fraction of moving frames whose direction flips.
@@ -641,6 +739,19 @@ def _evaluate(
         "eval/param_accel": float(_normalized_trainable_accels(params, model).mean()),
         "eval/reversal_rate": _reversal_rate(params, model),
     }
+    if cfg.loss.rest_targets:
+        rest_dist = _rest_pose_distance(params, model, cfg.loss.rest_targets)
+        out["eval/rest_loss"] = _rest_pose_loss(
+            params, model, cfg.loss.rest_targets, cfg.loss.rest_weights
+        ).item()
+        for name, v in zip(model.trainable_names_, rest_dist.tolist()):
+            if name in cfg.loss.rest_targets:
+                out[f"eval/rest_dist/{name}"] = v
+        # The metric the prior is actually for: how close the articulators sit
+        # to the rest pose on the frames where the target is silent and the
+        # recon loss therefore has no opinion about them.
+        out.update(_silent_frame_rest_metrics(params, model, target, cfg))
+
     # Per-param variation too: the scalar mean hides which param is jittery,
     # which is exactly what the smoothing/rate-limit experiments turn on.
     per_param = _normalized_trainable_diffs(params, model).mean(dim=(0, 1))
@@ -760,11 +871,17 @@ def main(hydra_cfg: DictConfig) -> None:
 
     # Model
     model = PinkTromboneController(cfg.model).to(device)
-    for field in ("smooth_weights", "accel_weights"):
+    for field in ("smooth_weights", "accel_weights", "rest_targets", "rest_weights"):
         unknown = set(getattr(cfg.loss, field)) - set(model.trainable_names_)
         if unknown:
             raise ValueError(
                 f"loss.{field} names non-trainable params: {sorted(unknown)}"
+            )
+    for name, value in cfg.loss.rest_targets.items():
+        lo, hi = cfg.model.param_spec[name][:2]
+        if not lo <= value <= hi:
+            raise ValueError(
+                f"loss.rest_targets[{name}]={value} outside param range [{lo}, {hi}]"
             )
     frame_rate = cfg.model.frame_rate
     samples_per_frame = cfg.model.samples_per_frame
@@ -939,11 +1056,15 @@ def main(hydra_cfg: DictConfig) -> None:
         # runs; contributes to the gradient only when weighted.
         smooth_loss = _smoothness_loss(params, module, cfg.loss.smooth_weights)
         accel_loss = _acceleration_loss(params, module, cfg.loss.accel_weights)
+        rest_loss = _rest_pose_loss(
+            params, module, cfg.loss.rest_targets, cfg.loss.rest_weights
+        )
         loss = (
             recon_loss
             + cfg.loss.entropy * entropy_penalty
             + cfg.loss.smooth * smooth_loss
             + cfg.loss.accel * accel_loss
+            + cfg.loss.rest * rest_loss
         )
 
         loss.backward()
@@ -973,6 +1094,7 @@ def main(hydra_cfg: DictConfig) -> None:
                 "train/entropy_penalty": entropy_penalty.item(),
                 "train/smooth_loss": smooth_loss.item(),
                 "train/accel_loss": accel_loss.item(),
+                "train/rest_loss": rest_loss.item(),
                 "train/lr": optimizer.param_groups[0]["lr"],
                 "train/tau": tau,
                 "train/grad_norm": float(grad_norm),

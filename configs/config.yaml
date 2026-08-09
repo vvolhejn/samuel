@@ -44,14 +44,15 @@ loss:
   # Temporal smoothness: L1 on per-frame changes of range-normalised control
   # trajectories, sum_p smooth_weights[p] * mean|Δp_norm|. Params not listed
   # in smooth_weights are unpenalised. See LossConfig for details.
-  # Off in favour of loss.accel below.
-  smooth: 0.0
+  # Baseline for the rest-pose experiment is run 2kzb65qc (s6-wdiam0.3):
+  # smooth and accel both on at 0.3 with the wider diameter weights.
+  smooth: 0.3
   smooth_weights:
     tongueIndex: 1.0
     tongueDiameter: 0.3
     constrictionIndex: 1.0
-    constrictionDiameter: 0.1
-    lipDiameter: 0.1
+    constrictionDiameter: 0.3
+    lipDiameter: 0.3
   # Same L1 on the *second* difference: penalises direction changes rather
   # than movement, so a fast steady gesture is free and only zigzag is
   # charged. See LossConfig.accel.
@@ -60,8 +61,25 @@ loss:
     tongueIndex: 1.0
     tongueDiameter: 0.3
     constrictionIndex: 1.0
-    constrictionDiameter: 0.1
-    lipDiameter: 0.1
+    constrictionDiameter: 0.3
+    lipDiameter: 0.3
+  # Rest posture: lips almost closed, tongue body down, tongue tip down.
+  # A constant (L1) pull toward this pose, sized at ~15 % of each param's
+  # median speech-frame recon gradient measured on the baseline run — see
+  # LossConfig.rest and scripts/calibrate_rest_prior.py. It is meant to decide
+  # only the frames the recon loss is indifferent about (silence), not to
+  # reshape articulation during speech. Note the L1 *value* is large (~1.5)
+  # even though its gradient is small, so train/loss is not comparable to a
+  # run without it — compare train/recon_loss and eval/wer instead.
+  rest: 0.15
+  rest_targets:
+    lipDiameter: 0.3          # top of the [0, 0.3] closure band: almost closed
+    tongueDiameter: 3.5       # max of [1.5, 3.5]: tongue body down
+    constrictionDiameter: 3.0 # max of [-2, 3]: no tongue-tip constriction
+  rest_weights:
+    lipDiameter: 0.3
+    tongueDiameter: 1.0
+    constrictionDiameter: 1.5
   # SSL feature-matching (perceptual) loss. On by default: it is what makes the
   # controller intelligible, MFCC alone is not enough.
   ssl: 1.0

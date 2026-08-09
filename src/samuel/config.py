@@ -174,6 +174,37 @@ class LossConfig(BaseModel):
         }
     )
 
+    # Rest-posture prior: a small constant L1 pull of each control trajectory
+    # toward a fixed "closed mouth" posture,
+    #   rest * sum_p rest_weights[p] * mean_{batch,time} |p_norm - target_p|
+    # on the same range-normalised params as ``smooth``/``accel``. Params
+    # absent from ``rest_targets`` are unpenalised.
+    #
+    # The point is the frames where the reconstruction loss has no opinion:
+    # during silence nothing pins the tongue, so it parks wherever it happens
+    # to be. L1 makes the pull a constant force regardless of distance, so it
+    # is a fixed small offset to the recon gradient -- negligible where that
+    # gradient is strong (speech), decisive where it is weak or just noise
+    # (silence). Keep it small: it is a tie breaker, not an objective.
+    #
+    # Scale, measured on run 2kzb65qc at step 20k
+    # (scripts/calibrate_rest_prior.py): the per-frame recon gradient reaching
+    # these trajectories has median |dL/dp_norm| * B*T of 0.99 / 1.67 / 0.32
+    # for tongueDiameter / constrictionDiameter / lipDiameter on speech frames
+    # and 0.31 / 0.89 / 0.25 on silent ones. The rest term applies exactly
+    # ``rest * rest_weights[p]`` in those units, so the weights below are set
+    # to ~15 % of each param's speech-frame median -- which lands at 20-50 %
+    # in silence, where the remaining recon gradient is largely noise that
+    # averages out while this bias does not.
+    rest: float = 0.0
+    # Target values in *raw* parameter units (same scale as model.param_spec),
+    # normalised internally by the same [lo, hi] range.
+    rest_targets: dict[str, float] = Field(default_factory=dict)
+    # Per-param multipliers; params absent here default to 1.0. Needed because
+    # the recon gradient differs ~5x across these params, so a flat weight
+    # would bias the lips far harder than the tongue.
+    rest_weights: dict[str, float] = Field(default_factory=dict)
+
     # SSL feature-matching (perceptual) loss on a frozen speech encoder.
     # L1 distance between the encoder's hidden states for pred vs. target audio.
     ssl: float = 1.0
