@@ -286,6 +286,16 @@ export default function Home() {
     }
   }, [isPlaying, scrubFrac, trombone, playResponse, restoreMic]);
 
+  /** Speed applies to the next play, and to one already in flight. */
+  const changeSpeed = useCallback(
+    (s: number) => {
+      speedRef.current = s;
+      setSpeed(s);
+      trombone.setPlaybackSpeed(s);
+    },
+    [trombone],
+  );
+
   const onScrub = useCallback(
     (frac: number) => {
       const response = lastResponse.current;
@@ -399,6 +409,23 @@ export default function Home() {
       </div>
 
       <div className="flex w-full max-w-3xl items-center gap-3">
+        <div className="flex overflow-hidden rounded-full border border-neutral-300 text-xs">
+          {SPEEDS.map((s) => (
+            <button
+              key={s}
+              onClick={() => changeSpeed(s)}
+              title="Playback speed"
+              className={`px-2.5 py-1 font-medium ${
+                s === speed
+                  ? "bg-fuchsia-600 text-white"
+                  : "text-neutral-600 hover:bg-fuchsia-50 hover:text-fuchsia-700"
+              }`}
+            >
+              {s}×
+            </button>
+          ))}
+        </div>
+
         <button
           onClick={togglePlay}
           disabled={!canReplay && !isPlaying}
@@ -428,26 +455,6 @@ export default function Home() {
             ? `${(scrubFrac * viewResponse.duration_s).toFixed(1)}s`
             : "–"}
         </span>
-
-        <div className="flex overflow-hidden rounded-full border border-neutral-300 text-xs">
-          {SPEEDS.map((s) => (
-            <button
-              key={s}
-              onClick={() => {
-                speedRef.current = s;
-                setSpeed(s);
-              }}
-              title="Playback speed (applies to the next play)"
-              className={`px-2.5 py-1 font-medium ${
-                s === speed
-                  ? "bg-fuchsia-600 text-white"
-                  : "text-neutral-600 hover:bg-fuchsia-50 hover:text-fuchsia-700"
-              }`}
-            >
-              {s}×
-            </button>
-          ))}
-        </div>
       </div>
 
       {error && (
