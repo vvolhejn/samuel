@@ -4,14 +4,22 @@ A modularized, programmable version of Neil Thapen's [Pink Trombone](https://doo
 
 ## Build
 
+Use pnpm here, never npm/npx.
+
 ```bash
-npm install
-npm run build
+pnpm install
+pnpm run build
 ```
 
-Produces two Rollup bundles:
+Produces two Rollup bundles, both gitignored (despite the `.min.` in the names
+upstream chose, they are not minified — just concatenated ESM):
 - `pink-trombone.min.js` — main module (entry: `script/component.js`)
 - `pink-trombone-worklet-processor.min.js` — AudioWorklet processor
+
+`index.html` / `index-debug.html` load `pink-trombone.min.js` directly, so build
+before opening them from a fresh clone. The webapp does not need this step by
+hand: `webapp/scripts/vendor-pink-trombone.sh` (its `prebuild`) runs the build
+and copies the result into `webapp/public/pink-trombone/`.
 
 ## Architecture
 

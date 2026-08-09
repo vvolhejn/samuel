@@ -3,3 +3,10 @@ TODO
 .DS_Store
 TODO.txt
 yarn.lock
+package-lock.json
+
+# Rollup output ("min" is upstream's misnomer — these are unminified bundles).
+# Built by `pnpm run build`; webapp's prebuild does that before vendoring them,
+# so a committed copy could only ever go stale against script/.
+pink-trombone.min.js
+pink-trombone-worklet-processor.min.js

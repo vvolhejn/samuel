@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Vendors browser assets into public/:
-#   - Pink Trombone ESM bundle + AudioWorklet processor (from ../Pink-Trombone),
-#     patching the hardcoded worklet URL (it resolves relative to the *page*
-#     URL, so the unpatched bundle only works when the page serves the whole
-#     script/ tree at the root).
+#   - Pink Trombone ESM bundle + AudioWorklet processor: built from
+#     ../Pink-Trombone/script/, then copied here with the hardcoded worklet URL
+#     patched (it resolves relative to the *page* URL, so the unpatched bundle
+#     only works when the page serves the whole script/ tree at the root).
 #   - Silero VAD model/worklet (@ricky0123/vad-web) and the onnxruntime-web
 #     wasm runtime it needs, so nothing is fetched from a CDN.
-# Runs automatically as package.json's "prebuild" (public/pink-trombone is
-# gitignored, so a Pink-Trombone rebuild would otherwise leave a stale copy
-# here and in out/). Run it by hand only to refresh assets without a build.
+# Runs automatically as package.json's "prebuild", so an edit under
+# Pink-Trombone/script/ can never ship stale: neither the bundles nor
+# public/pink-trombone are committed, and both are regenerated here.
+# Run it by hand only to refresh assets without a build.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -17,6 +18,10 @@ PT_OUT=public/pink-trombone
 VAD_OUT=public/vad
 
 mkdir -p "$PT_OUT" "$VAD_OUT"
+
+# Separate pnpm project (its only dependency is rollup), not a workspace member.
+pnpm --dir "$PT_SRC" install --frozen-lockfile
+pnpm --dir "$PT_SRC" run build
 
 cp "$PT_SRC/pink-trombone.min.js" "$PT_OUT/"
 cp "$PT_SRC/pink-trombone-worklet-processor.min.js" "$PT_OUT/"
