@@ -192,10 +192,14 @@ class LossConfig(BaseModel):
     # these trajectories has median |dL/dp_norm| * B*T of 0.99 / 1.67 / 0.32
     # for tongueDiameter / constrictionDiameter / lipDiameter on speech frames
     # and 0.31 / 0.89 / 0.25 on silent ones. The rest term applies exactly
-    # ``rest * rest_weights[p]`` in those units, so the weights below are set
-    # to ~15 % of each param's speech-frame median -- which lands at 20-50 %
-    # in silence, where the remaining recon gradient is largely noise that
-    # averages out while this bias does not.
+    # ``rest * rest_weights[p]`` in those units.
+    #
+    # Size it at a few percent of the speech-frame median, not a sixth of it:
+    # those gradients are heavy-tailed, large only in the frames where the
+    # articulator does its work and near zero elsewhere, so a force at 15 % of
+    # the median wins in the low-gradient majority of frames and the parameter
+    # stops being used at all. Run irdqz9gv did exactly that to the tongue-tip
+    # constriction (param_variation 3e-5, i.e. frozen) at rest=0.15.
     rest: float = 0.0
     # Target values in *raw* parameter units (same scale as model.param_spec),
     # normalised internally by the same [lo, hi] range.

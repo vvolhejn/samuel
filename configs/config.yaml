@@ -64,14 +64,23 @@ loss:
     constrictionDiameter: 0.3
     lipDiameter: 0.3
   # Rest posture: lips almost closed, tongue body down, tongue tip down.
-  # A constant (L1) pull toward this pose, sized at ~15 % of each param's
-  # median speech-frame recon gradient measured on the baseline run — see
-  # LossConfig.rest and scripts/calibrate_rest_prior.py. It is meant to decide
-  # only the frames the recon loss is indifferent about (silence), not to
-  # reshape articulation during speech. Note the L1 *value* is large (~1.5)
-  # even though its gradient is small, so train/loss is not comparable to a
-  # run without it — compare train/recon_loss and eval/wer instead.
-  rest: 0.15
+  # A constant (L1) pull toward this pose — see LossConfig.rest and
+  # scripts/calibrate_rest_prior.py. It is meant to decide only the frames the
+  # recon loss is indifferent about (silence), not to reshape articulation
+  # during speech. Note the L1 *value* is large (~1.2) even though its
+  # gradient is small, so train/loss is not comparable to a run without it —
+  # compare train/recon_loss and eval/wer instead.
+  #
+  # 0.04, i.e. ~4 % of each param's median speech-frame recon gradient. The
+  # first attempt used ~15 % (rest=0.15, constrictionDiameter weighted 1.5)
+  # and froze the tongue-tip constriction dead at its target
+  # (eval/param_variation/constrictionDiameter 3e-5 vs. 1.4e-2 for the
+  # baseline) — WER 0.59 vs. the baseline's 0.31 at step 10k, run irdqz9gv.
+  # The median is the wrong statistic to size against: these gradients are
+  # heavy-tailed, large only in the frames where that articulator does the
+  # work, so a constant force at 15 % of the median overrides the low-gradient
+  # majority and the param is never used at all.
+  rest: 0.04
   rest_targets:
     lipDiameter: 0.3          # top of the [0, 0.3] closure band: almost closed
     tongueDiameter: 3.5       # max of [1.5, 3.5]: tongue body down
@@ -79,7 +88,7 @@ loss:
   rest_weights:
     lipDiameter: 0.3
     tongueDiameter: 1.0
-    constrictionDiameter: 1.5
+    constrictionDiameter: 1.0
   # SSL feature-matching (perceptual) loss. On by default: it is what makes the
   # controller intelligible, MFCC alone is not enough.
   ssl: 1.0
