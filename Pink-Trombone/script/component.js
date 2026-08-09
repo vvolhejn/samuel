@@ -174,6 +174,7 @@ class PinkTromboneElement extends HTMLElement {
       this.appendChild(this.UI.node);
     }
 
+    this.UI.inactive = Boolean(this._inactive);
     this.UI.show();
   }
   disableUI() {
@@ -197,7 +198,7 @@ class PinkTromboneElement extends HTMLElement {
 
   // getAttribute getter?
   static get observedAttributes() {
-    return ["UI"];
+    return ["UI", "inactive"];
   }
 
   attributeChangedCallback(name, oldValue, newValue) {
@@ -205,6 +206,12 @@ class PinkTromboneElement extends HTMLElement {
       case "UI":
         if (newValue !== null) this.enableUI();
         else this.disableUI();
+        break;
+      // Greys the tract out. Can be set before the UI exists, so the value is
+      // kept here and replayed by enableUI().
+      case "inactive":
+        this._inactive = newValue !== null && newValue !== "false";
+        if (this.UI !== undefined) this.UI.inactive = this._inactive;
         break;
       default:
         break;

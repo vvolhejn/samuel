@@ -4,6 +4,9 @@
                   phoneme labels (the original leaves drawPositions disabled)
                   and draw the anatomical background layer instead; use the
                   webapp's Helvetica Neue stack rather than Arial
+      2026-08-09  recolour the tract onto the webapp's Tailwind fuchsia ramp
+                  (was pink/palePink/orchid/#C070C6), plus a grey "inactive"
+                  scheme for when the page has no audio input selected
 
     TODO
         throttle value setter
@@ -11,6 +14,27 @@
 
 // Matches the webapp's --font-sans stack (webapp/app/globals.css).
 const FONT_FAMILY = '"Helvetica Neue", Helvetica, Arial, Roboto, "Noto Sans", sans-serif';
+
+// Tailwind v4 ramps, so the tract matches the webapp's palette. (sRGB hex of
+// the oklch() values in tailwindcss/theme.css.) The active scheme replaces the
+// original pink/palePink/orchid/#C070C6; the inactive one greys the whole tract
+// out while there is no audio input selected.
+const COLOR_SCHEMES = {
+  active: {
+    tongueControl: "#fae8ff", // fuchsia-100 — the tongue-control pad
+    tract: "#f4a8ff", // fuchsia-300 — tract/nose fill
+    wall: "#c800de", // fuchsia-600 — tract outline
+    accent: "#e12afb", // fuchsia-500 — labels, markers, amplitudes
+    innerLabel: "#ffffff", // labels drawn inside the tract
+  },
+  inactive: {
+    tongueControl: "#f5f5f5", // neutral-100
+    tract: "#e5e5e5", // neutral-200
+    wall: "#a1a1a1", // neutral-400
+    accent: "#a1a1a1", // neutral-400
+    innerLabel: "#737373", // neutral-500 — white would vanish on the grey fill
+  },
+};
 
 class TractUI {
   constructor() {
@@ -60,6 +84,9 @@ class TractUI {
     };
     this._processor = null;
     this._parameters = {};
+
+    this._inactive = false;
+    this._colors = COLOR_SCHEMES.active;
 
     this._touchConstrictionIndices = [];
 
@@ -152,6 +179,21 @@ class TractUI {
     return this._container;
   }
 
+  // Greys the tract out (no audio input selected yet). The background canvas is
+  // drawn once, so it has to be invalidated for its labels to be recoloured.
+  get inactive() {
+    return this._inactive;
+  }
+  set inactive(inactive) {
+    inactive = Boolean(inactive);
+    if (inactive === this._inactive) return;
+
+    this._inactive = inactive;
+    this._colors = inactive ? COLOR_SCHEMES.inactive : COLOR_SCHEMES.active;
+    this._didDrawBackground = false;
+    if (this._processor) this._drawTract();
+  }
+
   get width() {
     return this._container.offsetWidth;
   }
@@ -190,7 +232,7 @@ class TractUI {
 
     this._context.beginPath();
     this._context.lineWidth = 2;
-    this._context.strokeStyle = this._context.fillStyle = "pink";
+    this._context.strokeStyle = this._context.fillStyle = this._colors.tract;
     this._moveTo(1, 0);
 
     for (let index = 1; index < this._processor.tract.length; index++)
@@ -208,7 +250,7 @@ class TractUI {
 
     this._context.beginPath();
     this._context.lineWidth = 2;
-    this._context.strokeStyle = this._context.fillStyle = "pink";
+    this._context.strokeStyle = this._context.fillStyle = this._colors.tract;
     this._moveTo(this._processor.tract.nose.start, -this._processor.tract.nose.offset);
 
     for (let index = 1; index < this._processor.tract.nose.length; index++)
@@ -225,7 +267,7 @@ class TractUI {
 
     this._context.beginPath();
     this._context.lineWidth = 2;
-    this._context.strokeStyle = this._context.fillStyle = "pink";
+    this._context.strokeStyle = this._context.fillStyle = this._colors.tract;
     this._moveTo(this._processor.tract.nose.start - 2, 0);
     this._lineTo(this._processor.tract.nose.start, -this._processor.tract.nose.offset);
     this._lineTo(this._processor.tract.nose.start + velumAngle, -this._processor.tract.nose.offset);
@@ -234,7 +276,7 @@ class TractUI {
     this._context.stroke();
     this._context.fill();
 
-    this._context.fillStyle = "white";
+    this._context.fillStyle = this._colors.innerLabel;
     this._context.font = `20px ${FONT_FAMILY}`;
     this._context.textAlign = "center";
     this._context.globalAlpha = 1;
@@ -251,7 +293,7 @@ class TractUI {
 
     this._context.beginPath();
     this._context.lineWidth = 5;
-    this._context.strokeStyle = "#C070C6";
+    this._context.strokeStyle = this._colors.wall;
     this._context.lineJoin = this._context.lineCap = "round";
     this._moveTo(1, this._processor.tract.diameter[0]);
     for (let index = 2; index < this._processor.tract.length; index++)
@@ -272,7 +314,7 @@ class TractUI {
 
     this._context.beginPath();
     this._context.lineWidth = 5;
-    this._context.strokeStyle = "#C070C6";
+    this._context.strokeStyle = this._colors.wall;
     this._context.lineJoin = "round";
 
     this._moveTo(this._processor.tract.nose.start, -this._processor.tract.nose.offset);
@@ -296,7 +338,7 @@ class TractUI {
     this._lineTo(this._processor.tract.nose.start + velumAngle - 2, 0);
     this._context.stroke();
 
-    this._context.fillStyle = "orchid";
+    this._context.fillStyle = this._colors.accent;
     this._context.font = `20px ${FONT_FAMILY}`;
     this._context.textAlign = "center";
     this._context.globalAlpha = 0.7;
@@ -319,10 +361,12 @@ class TractUI {
   // Mirrors drawBackground() in the original Pink Trombone.
   _drawBackground() {
     this._context = this._contexts.background;
+    // Cleared because the scheme can change after the first draw.
+    this._context.clearRect(0, 0, this._canvases.background.width, this._canvases.background.height);
 
     const length = this._processor.tract.length;
 
-    this._context.fillStyle = "orchid";
+    this._context.fillStyle = this._colors.accent;
     this._context.font = `20px ${FONT_FAMILY}`;
     this._context.textAlign = "center";
     this._context.globalAlpha = 0.7;
@@ -341,7 +385,7 @@ class TractUI {
     this._drawText(length * 1.03, -0.28, "stops", false, false);
     this._drawText(length * 1.03, 0.51, "fricatives", false, false);
 
-    this._context.strokeStyle = "orchid";
+    this._context.strokeStyle = this._colors.accent;
     this._context.lineWidth = 2;
     this._context.beginPath();
     this._strokeTo(length * 1.03, 0, true);
@@ -375,7 +419,7 @@ class TractUI {
   }
   _drawTongueControl() {
     this._context.lineCap = this._context.lineJoin = "round";
-    this._context.strokeStyle = this._context.fillStyle = "#FFEEF5"; // palePink
+    this._context.strokeStyle = this._context.fillStyle = this._colors.tongueControl;
     this._context.globalAlpha = 1.0;
     this._context.beginPath();
     this._context.lineWidth = 45;
@@ -393,7 +437,7 @@ class TractUI {
     this._context.stroke();
     this._context.fill();
 
-    this._context.fillStyle = "orchid";
+    this._context.fillStyle = this._colors.accent;
     this._context.globalAlpha = 0.3;
 
     [0, -4.25, -8.5, 4.25, 8.5, -6.1, 6.1, 0, 0].forEach((indexOffset, _index) => {
@@ -413,7 +457,7 @@ class TractUI {
     const tongueRadius = this._getRadius(this._processor.tract.tongue.index, this._processor.tract.tongue.diameter);
 
     this._context.lineWidth = 4;
-    this._context.strokeStyle = "orchid";
+    this._context.strokeStyle = this._colors.accent;
     this._context.globalAlpha = 0.7;
     this._context.beginPath();
     this._context.arc(this._getX(tongueAngle, tongueRadius), this._getY(tongueAngle, tongueRadius), 18, 0, 2 * Math.PI);
@@ -421,10 +465,10 @@ class TractUI {
     this._context.globalAlpha = 0.15;
     this._context.fill();
     this._context.globalAlpha = 1;
-    this._context.fillStyle = "orchid";
+    this._context.fillStyle = this._colors.accent;
   }
   _drawAmplitudes() {
-    this._context.strokeStyle = "orchid";
+    this._context.strokeStyle = this._colors.accent;
     this._context.lineCap = "butt";
     this._context.globalAlpha = 0.3;
 

@@ -54,6 +54,14 @@ class PinkTromboneUI {
         return this._container;
     }
 
+    // Greys the tract out; see TractUI.
+    get inactive() {
+        return this._tractUI.inactive;
+    }
+    set inactive(inactive) {
+        this._tractUI.inactive = inactive;
+    }
+
     show() {
         this.node.style.display = "grid";
     }

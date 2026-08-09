@@ -21,24 +21,16 @@ type Status =
   | "speaking"
   | "muted";
 
-/** Shown next to the transport controls. `null` states say nothing: the Record
- * button already reads as "the mic is off". */
+/** Shown next to the transport controls, each followed by an animated ellipsis
+ * (so no trailing "…" here). `null` states say nothing: the Record button
+ * already reads as "the mic is off". */
 const STATUS_LABEL: Record<Status, string | null> = {
   idle: null,
   muted: null,
-  listening: "Listening — say something",
-  recording: "Hearing you…",
-  processing: "Thinking…",
+  listening: "Listening",
+  recording: "Hearing you",
+  processing: "Thinking",
   speaking: "Speaking back",
-};
-
-const STATUS_DOT: Record<Status, string> = {
-  idle: "bg-neutral-400",
-  listening: "bg-emerald-500",
-  recording: "bg-emerald-500 animate-pulse",
-  processing: "bg-amber-500 animate-pulse",
-  speaking: "bg-fuchsia-400 animate-pulse",
-  muted: "bg-neutral-400",
 };
 
 const SPEEDS = [0.25, 0.5, 1] as const;
@@ -123,6 +115,18 @@ function ModelOutput({
   );
 }
 
+/** ".", "..", "..." on a loop. The dots are always laid out and only fade in and
+ * out, so the label after them never shifts. */
+function Ellipsis() {
+  return (
+    <span aria-hidden className="ellipsis">
+      <span>.</span>
+      <span>.</span>
+      <span>.</span>
+    </span>
+  );
+}
+
 function SectionTitle({ children }: { children: React.ReactNode }) {
   return (
     <span className="font-semibold tracking-wide text-neutral-600 uppercase">
@@ -156,14 +160,14 @@ function DebugPanel({
       <button
         onClick={onToggle}
         title="Show the debug panel"
-        className="self-start rounded-lg border border-neutral-200 bg-neutral-50 px-1.5 py-3 text-xs font-semibold tracking-wide text-neutral-500 uppercase [writing-mode:vertical-rl] hover:border-fuchsia-300 hover:text-fuchsia-600"
+        className="rounded-full border border-neutral-300 px-4 py-1.5 text-sm font-medium text-neutral-600 hover:bg-neutral-50"
       >
         Debug
       </button>
     );
   }
   return (
-    <aside className="w-64 shrink-0 self-start space-y-4 rounded-lg border border-neutral-200 bg-neutral-50 p-3 text-xs">
+    <aside className="w-full max-w-md space-y-4 rounded-lg border border-neutral-200 bg-neutral-50 p-3 text-xs">
       <div className="flex items-baseline justify-between">
         <SectionTitle>debug</SectionTitle>
         <button
@@ -556,117 +560,131 @@ export default function Home() {
   const canReplay = viewResponse !== null && notBusy;
   const canPlayOriginal = hasOriginal && notBusy;
   const canScrub = viewResponse !== null && status !== "processing";
+  // The tract is drawn grey until an audio input is picked: the mic is on, or a
+  // pre-recorded clip has come back from the model.
+  const tractActive = micOn || viewResponse !== null;
 
   return (
-    <main className="flex flex-1 flex-col items-start gap-6 p-8">
-      <header>
-        <h1 className="text-5xl font-bold text-fuchsia-600">Samuel</h1>
-      </header>
-      <div className="flex flex-wrap items-center gap-3">
-        <div className="font-bold text-fuchsia-600">Audio input</div>
+    <main className="flex flex-1 flex-wrap items-start gap-8 p-8">
+      {/* Left: everything you operate. Right: the thing you look at. */}
+      <div className="flex min-w-md max-w-md flex-1 flex-col items-start gap-6">
+        <header>
+          <h1 className="text-5xl font-bold text-fuchsia-600">Samuel</h1>
+        </header>
+        {/* <div className="text-neutral-500">
+          TODO write description
+        </div> */}
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="font-bold text-neutral-500">Audio input</div>
 
-        <button
-          onClick={() => void (micOn ? stopMic() : startMic())}
-          title={
-            micOn
-              ? "Stop listening"
-              : "Listen continuously and mimic every utterance"
-          }
-          className={
-            micOn
-              ? "rounded-full border border-fuchsia-300 px-4 py-1.5 text-sm font-medium text-fuchsia-700 hover:bg-fuchsia-50"
-              : "rounded-full bg-fuchsia-600 px-4 py-1.5 text-sm font-semibold text-white hover:bg-fuchsia-700"
-          }
-        >
-          {micOn ? "Stop" : "Microphone"}
-        </button>
-
-        <button
-          onClick={playDatasetClip}
-          disabled={!notBusy}
-          title="Mimic a random 10s clip from the training dataset"
-          className="rounded-full border border-sky-300 px-4 py-1.5 text-sm font-medium text-sky-700 hover:bg-sky-50 disabled:opacity-40 disabled:hover:bg-transparent"
-        >
-          Pre-recorded
-        </button>
-
-        {STATUS_LABEL[status] && (
-          <span className="inline-flex items-center gap-2 text-sm text-neutral-500">
-            <span className={`h-2 w-2 rounded-full ${STATUS_DOT[status]}`} />
-            {STATUS_LABEL[status]}
-          </span>
-        )}
-      </div>
-
-      <div className="flex w-full max-w-3xl items-center gap-3">
-        <select
-          value={speed}
-          onChange={(e) => changeSpeed(Number(e.currentTarget.value))}
-          title="Playback speed"
-          className="rounded-full border border-neutral-300 py-1 pr-6 pl-2.5 text-xs font-medium text-neutral-600 hover:border-fuchsia-300 hover:text-fuchsia-700"
-        >
-          {SPEEDS.map((s) => (
-            <option key={s} value={s}>
-              {s}× speed
-            </option>
-          ))}
-        </select>
-
-        {/* One pill, two sources: the model's imitation and the audio it was
-            made from. Whichever is playing offers Pause; the other is out of
-            reach until it stops, since they'd fight over the mic and busy
-            flag. */}
-        <div className="flex shrink-0 overflow-hidden rounded-full border border-fuchsia-300 text-sm">
           <button
-            onClick={togglePlay}
-            disabled={!canReplay && !isPlaying}
-            title="Play the model's imitation from the scrub position"
-            className="w-24 bg-fuchsia-600 py-1.5 font-semibold text-white hover:bg-fuchsia-700 disabled:opacity-40 disabled:hover:bg-fuchsia-600"
+            onClick={() => void (micOn ? stopMic() : startMic())}
+            title={
+              micOn
+                ? "Stop listening"
+                : "Listen continuously and mimic every utterance"
+            }
+            className={
+              micOn
+                ? "rounded-full border border-fuchsia-300 px-4 py-1.5 text-sm font-medium text-fuchsia-700 hover:bg-fuchsia-50"
+                : "rounded-full bg-fuchsia-600 px-4 py-1.5 text-sm font-semibold text-white hover:bg-fuchsia-700"
+            }
           >
-            {isPlaying ? "Pause" : "Play"}
+            {micOn ? "Stop" : "Microphone"}
           </button>
+
           <button
-            onClick={() => void toggleOriginal()}
-            disabled={!canPlayOriginal && !playingOriginal}
-            title="Play the audio the model heard, at its recorded level"
-            className="w-24 border-l border-fuchsia-300 py-1.5 font-medium text-fuchsia-700 hover:bg-fuchsia-50 disabled:opacity-40 disabled:hover:bg-transparent"
+            onClick={playDatasetClip}
+            disabled={!notBusy}
+            title="Mimic a random 10s clip from the training dataset"
+            className="rounded-full border border-sky-300 px-4 py-1.5 text-sm font-medium text-sky-700 hover:bg-sky-50 disabled:opacity-40 disabled:hover:bg-transparent"
           >
-            {playingOriginal ? "Pause" : "Original"}
+            Pre-recorded
           </button>
+
+          {STATUS_LABEL[status] && (
+            <span className="text-sm text-neutral-500">
+              {STATUS_LABEL[status]}
+              <Ellipsis />
+            </span>
+          )}
         </div>
 
-        <input
-          type="range"
-          min={0}
-          max={1000}
-          value={Math.round(scrubFrac * 1000)}
-          disabled={!canScrub}
-          aria-label="Scrub through the last response"
-          onPointerDown={() => onScrub(scrubFrac)}
-          onChange={(e) => onScrub(Number(e.currentTarget.value) / 1000)}
-          onPointerUp={() => void onScrubEnd()}
-          onKeyUp={() => void onScrubEnd()}
-          onBlur={() => void onScrubEnd()}
-          className="flex-1 accent-fuchsia-600 disabled:opacity-40"
-        />
+        <div className="flex w-full flex-col gap-3">
+          <div className="flex items-center gap-3">
+            {/* Own chevron: the native one is glued to the border box, so padding
+                can't give it any room inside the pill. */}
+            <div className="relative shrink-0">
+              <select
+                value={speed}
+                onChange={(e) => changeSpeed(Number(e.currentTarget.value))}
+                title="Playback speed"
+                className="appearance-none rounded-full border border-neutral-300 py-1 pr-7 pl-2.5 text-xs font-medium text-neutral-600 hover:border-fuchsia-300 hover:text-fuchsia-700"
+              >
+                {SPEEDS.map((s) => (
+                  <option key={s} value={s}>
+                    {s}× speed
+                  </option>
+                ))}
+              </select>
+              <span
+                aria-hidden
+                className="pointer-events-none absolute inset-y-0 right-2.5 flex items-center text-[0.5rem] text-neutral-500"
+              >
+                ▼
+              </span>
+            </div>
 
-        <span className="w-12 text-right text-xs tabular-nums text-neutral-500">
-          {viewResponse
-            ? `${(scrubFrac * viewResponse.duration_s).toFixed(1)}s`
-            : "–"}
-        </span>
-      </div>
+            {/* One pill, two sources: the model's imitation and the audio it was
+                made from. Whichever is playing offers Pause; the other is out of
+                reach until it stops, since they'd fight over the mic and busy
+                flag. */}
+            <div className="flex shrink-0 overflow-hidden rounded-full border border-fuchsia-300 text-sm">
+              <button
+                onClick={togglePlay}
+                disabled={!canReplay && !isPlaying}
+                title="Play the model's imitation from the scrub position"
+                className="w-24 bg-fuchsia-600 py-1.5 font-semibold text-white hover:bg-fuchsia-700 disabled:opacity-40 disabled:hover:bg-fuchsia-600"
+              >
+                {isPlaying ? "Pause" : "Play"}
+              </button>
+              <button
+                onClick={() => void toggleOriginal()}
+                disabled={!canPlayOriginal && !playingOriginal}
+                title="Play the audio the model heard, at its recorded level"
+                className="w-24 border-l border-fuchsia-300 py-1.5 font-medium text-fuchsia-700 hover:bg-fuchsia-50 disabled:opacity-40 disabled:hover:bg-transparent"
+              >
+                {playingOriginal ? "Pause" : "Original"}
+              </button>
+            </div>
+          </div>
 
-      {error && (
-        <p className="max-w-xl text-sm text-red-600">{error}</p>
-      )}
+          <div className="flex items-center gap-3">
+            <input
+              type="range"
+              min={0}
+              max={1000}
+              value={Math.round(scrubFrac * 1000)}
+              disabled={!canScrub}
+              aria-label="Scrub through the last response"
+              onPointerDown={() => onScrub(scrubFrac)}
+              onChange={(e) => onScrub(Number(e.currentTarget.value) / 1000)}
+              onPointerUp={() => void onScrubEnd()}
+              onKeyUp={() => void onScrubEnd()}
+              onBlur={() => void onScrubEnd()}
+              className="flex-1 accent-fuchsia-600 disabled:opacity-40"
+            />
 
-      <div className="flex w-full max-w-5xl items-stretch gap-4">
-        {/* The element's canvases are a fixed 600×500 anchored top-left, so
-            size the host to match rather than letting it stretch. */}
-        <div className="flex min-w-0 flex-1">
-          <pink-trombone className="block h-[500px] w-[600px] shrink-0" />
+            <span className="w-12 text-right text-xs tabular-nums text-neutral-500">
+              {viewResponse
+                ? `${(scrubFrac * viewResponse.duration_s).toFixed(1)}s`
+                : "–"}
+            </span>
+          </div>
         </div>
+
+        {error && <p className="text-sm text-red-600">{error}</p>}
+
         <DebugPanel
           open={debugOpen}
           onToggle={() => setDebugOpen((v) => !v)}
@@ -676,10 +694,17 @@ export default function Home() {
           micProcessing={micProcessing}
           onToggleMicProcessing={(key) => void toggleMicProcessing(key)}
         />
+
+        {/* Placeholder — prose about the project goes here. */}
+        <div className="w-full" />
       </div>
 
-      {/* Placeholder — prose about the project goes here. */}
-      <div className="w-full max-w-3xl" />
+      {/* The element's canvases are a fixed 600×500 anchored top-left, so
+          size the host to match rather than letting it stretch. */}
+      <pink-trombone
+        className="block h-[500px] w-[600px] shrink-0"
+        inactive={tractActive ? undefined : "true"}
+      />
     </main>
   );
 }

@@ -34,7 +34,10 @@ declare global {
         "pink-trombone": React.DetailedHTMLProps<
           React.HTMLAttributes<HTMLElement>,
           HTMLElement
-        >;
+        > & {
+          /** Present (and not "false") ⇒ the tract is drawn greyed out. */
+          inactive?: string;
+        };
       }
     }
   }
