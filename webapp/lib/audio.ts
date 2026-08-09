@@ -21,14 +21,15 @@ export interface DatasetClipResponse extends SynthResponse {
   clip_audio_b64: string;
 }
 
-function wavBlobUrl(b64: string): string {
+/** Decode one of the base64 WAV fields into a blob. */
+export function wavBlob(b64: string): Blob {
   const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
-  return URL.createObjectURL(new Blob([bytes], { type: "audio/wav" }));
+  return new Blob([bytes], { type: "audio/wav" });
 }
 
 /** Object URL for the original dataset clip. */
 export function clipAudioUrl(response: DatasetClipResponse): string {
-  return wavBlobUrl(response.clip_audio_b64);
+  return URL.createObjectURL(wavBlob(response.clip_audio_b64));
 }
 
 /** Ask the backend for a random dataset clip run through the model. */
@@ -91,6 +92,8 @@ export interface UtteranceResult {
   /** Object URL for the WAV we actually sent — the trimmed recording, i.e.
    * exactly what the model heard. The caller owns it (revoke when replacing). */
   inputUrl: string;
+  /** The same WAV as a blob, for the session download. */
+  inputBlob: Blob;
 }
 
 /** Send one VAD utterance (Float32Array at 16 kHz) to the model backend. */
@@ -112,6 +115,7 @@ export async function synthesizeUtterance(
   return {
     response: (await res.json()) as SynthResponse,
     inputUrl: URL.createObjectURL(blob),
+    inputBlob: blob,
   };
 }
 

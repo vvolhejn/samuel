@@ -7,9 +7,11 @@ import {
   fetchDatasetClip,
   fetchHealth,
   synthesizeUtterance,
+  wavBlob,
   HealthResponse,
   SynthResponse,
 } from "@/lib/audio";
+import { downloadBlob, makeZip } from "@/lib/zip";
 import { usePinkTrombone } from "@/lib/usePinkTrombone";
 import type { PinkTromboneElement } from "@/types/pink-trombone";
 
@@ -34,6 +36,19 @@ const STATUS_LABEL: Record<Status, string | null> = {
 };
 
 const SPEEDS = [0.25, 0.5, 1] as const;
+
+/** One round trip: what the model heard, and what it said back. Held in memory
+ * for the whole session, so cap it — a few seconds of 16 kHz float WAV is
+ * ~250 kB per side, and nothing else evicts them. */
+const MAX_HISTORY = 50;
+
+interface Recording {
+  kind: "mic" | "dataset";
+  /** WAV the model was given. */
+  input: Blob;
+  /** WAV of the model's output, rendered by the Python synth. */
+  output: Blob;
+}
 
 /** Browser mic processing, toggleable so we can A/B it against training audio,
  * which has none of it. vad-web hardcodes all three on; we pass our own
@@ -146,6 +161,8 @@ function DebugPanel({
   frac,
   micProcessing,
   onToggleMicProcessing,
+  historyCount,
+  onDownloadHistory,
 }: {
   open: boolean;
   onToggle: () => void;
@@ -154,6 +171,8 @@ function DebugPanel({
   frac: number;
   micProcessing: MicProcessing;
   onToggleMicProcessing: (key: keyof MicProcessing) => void;
+  historyCount: number;
+  onDownloadHistory: () => void;
 }) {
   if (!open) {
     return (
@@ -223,6 +242,22 @@ function DebugPanel({
           ))}
         </div>
       </section>
+
+      <section>
+        <div className="mb-1">
+          <SectionTitle>session audio</SectionTitle>
+        </div>
+        <button
+          onClick={onDownloadHistory}
+          disabled={historyCount === 0}
+          title="Zip of every utterance this session: what the model heard and what it said back"
+          className="rounded-full border border-neutral-300 px-3 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 disabled:opacity-40 disabled:hover:bg-transparent"
+        >
+          {historyCount === 0
+            ? "nothing recorded yet"
+            : `download ${historyCount} utterance${historyCount === 1 ? "" : "s"}`}
+        </button>
+      </section>
     </aside>
   );
 }
@@ -254,6 +289,9 @@ export default function Home() {
   const vadRef = useRef<MicVAD | null>(null);
   const lastResponse = useRef<SynthResponse | null>(null);
   const originalUrlRef = useRef<string | null>(null); // audio the model heard
+  /** Every utterance this session, for the debug panel's download. */
+  const historyRef = useRef<Recording[]>([]);
+  const [historyCount, setHistoryCount] = useState(0);
   const debugAudioRef = useRef<HTMLAudioElement | null>(null);
   const busyRef = useRef(false); // ignore VAD events while processing/speaking
   const micOnRef = useRef(false); // user-intended mic state (start/mute toggle)
@@ -321,15 +359,46 @@ export default function Home() {
     setHasOriginal(true);
   }, []);
 
+  const remember = useCallback((recording: Recording) => {
+    const history = historyRef.current;
+    history.push(recording);
+    if (history.length > MAX_HISTORY) history.splice(0, history.length - MAX_HISTORY);
+    setHistoryCount(history.length);
+  }, []);
+
+  /** One zip of every input/output pair this session. */
+  const downloadHistory = useCallback(async () => {
+    const entries = await Promise.all(
+      historyRef.current.flatMap((recording, i) => {
+        const stem = `${String(i + 1).padStart(2, "0")}-${recording.kind}`;
+        return [
+          recording.input
+            .arrayBuffer()
+            .then((b) => ({ name: `${stem}-input.wav`, bytes: new Uint8Array(b) })),
+          recording.output
+            .arrayBuffer()
+            .then((b) => ({ name: `${stem}-output.wav`, bytes: new Uint8Array(b) })),
+        ];
+      }),
+    );
+    downloadBlob(makeZip(entries), "samuel-session.zip");
+  }, []);
+
   const onUtterance = useCallback(
     async (audio: Float32Array) => {
       if (busyRef.current) return;
       busyRef.current = true;
       setStatus("processing");
       try {
-        const { response, inputUrl } = await synthesizeUtterance(audio);
+        const { response, inputUrl, inputBlob } =
+          await synthesizeUtterance(audio);
         lastResponse.current = response;
         setOriginal(inputUrl);
+        remember({
+          kind: "mic",
+          input: inputBlob,
+          output: wavBlob(response.synth_audio_b64),
+        });
         setViewResponse(response);
         await playResponse(response);
       } catch (e) {
@@ -338,7 +407,7 @@ export default function Home() {
         await restoreMic();
       }
     },
-    [playResponse, restoreMic, setOriginal],
+    [playResponse, restoreMic, setOriginal, remember],
   );
 
   const startMic = useCallback(async () => {
@@ -464,6 +533,11 @@ export default function Home() {
       const response = await fetchDatasetClip();
       lastResponse.current = response;
       setOriginal(clipAudioUrl(response));
+      remember({
+        kind: "dataset",
+        input: wavBlob(response.clip_audio_b64),
+        output: wavBlob(response.synth_audio_b64),
+      });
       setViewResponse(response);
       await playResponse(response);
     } catch (e) {
@@ -471,7 +545,7 @@ export default function Home() {
       setError(e instanceof Error ? e.message : String(e));
       await restoreMic();
     }
-  }, [trombone, playResponse, restoreMic, setOriginal]);
+  }, [trombone, playResponse, restoreMic, setOriginal, remember]);
 
   /** Play from the scrub position (or the start, if at the end); pause if
    * already playing. */
@@ -693,6 +767,8 @@ export default function Home() {
           frac={scrubFrac}
           micProcessing={micProcessing}
           onToggleMicProcessing={(key) => void toggleMicProcessing(key)}
+          historyCount={historyCount}
+          onDownloadHistory={() => void downloadHistory()}
         />
 
         {/* Placeholder — prose about the project goes here. */}
