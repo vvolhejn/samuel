@@ -10,6 +10,9 @@ const LEAD_S = 0.15;
 const FADE_OUT_S = 0.05;
 /** Smoothing for direct (scrub/stop) parameter jumps. */
 const SCRUB_TAU_S = 0.02;
+/** Headroom when re-scheduling mid-utterance (setPlaybackSpeed). Short enough
+ * to feel instant, long enough that the audio thread hasn't rendered past it. */
+const RESCHEDULE_LEAD_S = 0.05;
 
 export interface SpeakOptions {
   /** Playback speed (1 = real time, 0.5 = half speed; pitch is unaffected —
@@ -30,6 +33,9 @@ export interface PinkTromboneHandle {
   /** Schedule a model response onto the synth. Resolves when playback ends
    * or when stop()/scrub() interrupts it. */
   speak: (response: SynthResponse, options?: SpeakOptions) => Promise<void>;
+  /** Change the speed of the utterance in progress, taking effect right away.
+   * No-op when nothing is playing (the next speak() takes its own speed). */
+  setPlaybackSpeed: (speed: number) => void;
   /** Truncate the current utterance's automation and fade the voicing. */
   stop: () => void;
   /** Hold the synth at one frame of a response: params jump there and the
@@ -51,6 +57,10 @@ function cancelAndHold(param: AudioParam, t: number) {
   };
   if (p.cancelAndHoldAtTime) p.cancelAndHoldAtTime(t);
   else param.cancelScheduledValues(t);
+}
+
+function canCancelAndHold(param: AudioParam) {
+  return "cancelAndHoldAtTime" in param;
 }
 
 /** The AudioParams speak() automates, in curveValues() order. */
@@ -93,20 +103,33 @@ function curveValues(response: SynthResponse): Float32Array[] {
   ];
 }
 
+/** Schedule one param's trajectory. The caller must first clear any events in
+ * [t0, t0 + duration] — setValueCurveAtTime throws on an overlap. */
 function scheduleCurve(
   param: AudioParam,
   values: Float32Array,
-  now: number,
   t0: number,
   duration: number,
 ) {
-  // setValueCurveAtTime throws if any event overlaps the curve interval, so
-  // clear leftovers from a previous utterance first. cancelScheduledValues
-  // does NOT remove a curve that is already in progress (start < now), which
-  // is why t0 must lie beyond the previous utterance's end (see speak()).
-  param.cancelScheduledValues(now);
   param.setValueAtTime(values[0], t0 - 0.01);
   param.setValueCurveAtTime(values, t0, duration);
+}
+
+/** The utterance currently scheduled, mutated in place by setPlaybackSpeed so
+ * that speak()'s progress polling follows a mid-flight re-schedule. */
+interface Playback {
+  values: Float32Array[];
+  nFrames: number;
+  frameRate: number;
+  /** Frame the curves start from, and the audio-clock time they start at. */
+  startFrame: number;
+  t0: number;
+  duration: number;
+  speed: number;
+  /** Audio-clock time the fade-out completes. */
+  end: number;
+  /** Wall-clock cap, so a suspended context can't hang the poll forever. */
+  wallDeadline: number;
 }
 
 export function usePinkTrombone(): PinkTromboneHandle {
@@ -118,6 +141,8 @@ export function usePinkTrombone(): PinkTromboneHandle {
   const scheduleEndRef = useRef(0);
   /** Bumped by stop()/scrub()/speak() to settle any in-flight speak(). */
   const playTokenRef = useRef(0);
+  /** Non-null only while an utterance is scheduled and unfinished. */
+  const playbackRef = useRef<Playback | null>(null);
 
   const init = useCallback(async (element: PinkTromboneElement) => {
     if (elementRef.current) return;
@@ -216,7 +241,11 @@ export function usePinkTrombone(): PinkTromboneHandle {
 
       const params = automatedParams(element, constriction, lipConstriction);
       params.forEach((param, i) => {
-        scheduleCurve(param, values[i].subarray(startFrame), now, t0, duration);
+        // Clear leftovers from a previous utterance. cancelScheduledValues does
+        // NOT remove a curve that is already in progress (start < now), which is
+        // why t0 must lie beyond the previous utterance's end (above).
+        param.cancelScheduledValues(now);
+        scheduleCurve(param, values[i].subarray(startFrame), t0, duration);
       });
 
       // Utterance gate: element.start()/stop() switch gain instantly (clicks),
@@ -233,24 +262,41 @@ export function usePinkTrombone(): PinkTromboneHandle {
       scheduleEndRef.current = end;
 
       // Wait for the *audio clock* to pass the end of the utterance — a plain
-      // wall-clock timeout can fire while audio is still playing. Wall-clock
-      // cap so a suspended context can't hang us forever.
-      const wallDeadline = performance.now() + (end - now + 5) * 1000;
+      // wall-clock timeout can fire while audio is still playing.
+      const playback: Playback = {
+        values,
+        nFrames,
+        frameRate,
+        startFrame,
+        t0,
+        duration,
+        speed,
+        end,
+        wallDeadline: performance.now() + (end - now + 5) * 1000,
+      };
+      playbackRef.current = playback;
       await new Promise<void>((resolve) => {
         const poll = () => {
           if (playTokenRef.current !== token) {
             resolve(); // interrupted by stop()/scrub()/another speak()
             return;
           }
+          // Read through the object: setPlaybackSpeed rewrites these mid-flight.
           const t = ctx.currentTime;
           onProgress?.(
             Math.min(
               1,
-              (startFrame + Math.max(0, t - t0) * speed * frameRate) / nFrames,
+              (playback.startFrame +
+                Math.max(0, t - playback.t0) * playback.speed * frameRate) /
+                nFrames,
             ),
           );
-          if (t >= end + 0.05 || performance.now() > wallDeadline) {
+          if (
+            t >= playback.end + 0.05 ||
+            performance.now() > playback.wallDeadline
+          ) {
             onProgress?.(1);
+            if (playbackRef.current === playback) playbackRef.current = null;
             resolve();
           } else {
             setTimeout(poll, 50);
@@ -262,8 +308,62 @@ export function usePinkTrombone(): PinkTromboneHandle {
     [],
   );
 
+  const setPlaybackSpeed = useCallback((speed: number) => {
+    const playback = playbackRef.current;
+    const element = elementRef.current;
+    const constriction = constrictionRef.current;
+    const lipConstriction = lipConstrictionRef.current;
+    const masterGain = masterGainRef.current;
+    if (!playback || !element || !constriction || !lipConstriction || !masterGain)
+      return;
+    if (speed === playback.speed) return;
+    // Without cancelAndHoldAtTime the running curve cannot be truncated, and
+    // setValueCurveAtTime throws when it overlaps one. Let the new speed take
+    // effect at the next play there instead.
+    if (!canCancelAndHold(masterGain.gain)) return;
+    const { values, nFrames, frameRate } = playback;
+    const ctx = element.audioContext;
+    const now = ctx.currentTime;
+
+    // Where the old curves have got to; still in the lead-in => the start frame.
+    const played = Math.max(0, now - playback.t0) * playback.speed * frameRate;
+    const frame = Math.floor(playback.startFrame + played);
+    // setValueCurveAtTime needs >= 2 values; that close to the end, let the
+    // utterance run out at its current speed rather than re-scheduling.
+    if (frame > nFrames - 3) return;
+
+    // Params hold for RESCHEDULE_LEAD_S and then resume from `frame`, so the
+    // seam is a freeze of a few tens of ms rather than a jump.
+    const t0 = now + RESCHEDULE_LEAD_S;
+    const duration = (nFrames - frame) / frameRate / speed;
+    const params = automatedParams(element, constriction, lipConstriction);
+    params.forEach((param, i) => {
+      // Truncate the running curve; cancelScheduledValues cannot (see
+      // cancelAndHold), so on Firefox the old curve plays on underneath.
+      cancelAndHold(param, now);
+      scheduleCurve(param, values[i].subarray(frame), t0, duration);
+    });
+
+    const end = t0 + duration + FADE_OUT_S;
+    const gate = masterGain.gain;
+    cancelAndHold(gate, now);
+    // Already open mid-utterance; a ramp only matters if we cut into the fade-in.
+    gate.linearRampToValueAtTime(1, t0);
+    gate.setValueAtTime(1, t0 + duration);
+    gate.linearRampToValueAtTime(0, end);
+
+    playback.startFrame = frame;
+    playback.t0 = t0;
+    playback.duration = duration;
+    playback.speed = speed;
+    playback.end = end;
+    playback.wallDeadline = performance.now() + (end - now + 5) * 1000;
+    scheduleEndRef.current = end;
+  }, []);
+
   const stop = useCallback(() => {
     playTokenRef.current++;
+    playbackRef.current = null;
     const element = elementRef.current;
     const constriction = constrictionRef.current;
     const lipConstriction = lipConstrictionRef.current;
@@ -280,6 +380,7 @@ export function usePinkTrombone(): PinkTromboneHandle {
 
   const scrub = useCallback((response: SynthResponse, frac: number) => {
     playTokenRef.current++;
+    playbackRef.current = null;
     const element = elementRef.current;
     const constriction = constrictionRef.current;
     const lipConstriction = lipConstrictionRef.current;
@@ -319,7 +420,16 @@ export function usePinkTrombone(): PinkTromboneHandle {
 
   // Stable handle: effects depending on it must not re-run on re-render.
   return useMemo(
-    () => ({ init, resume, speak, stop, scrub, endScrub, ready }),
-    [init, resume, speak, stop, scrub, endScrub, ready],
+    () => ({
+      init,
+      resume,
+      speak,
+      setPlaybackSpeed,
+      stop,
+      scrub,
+      endScrub,
+      ready,
+    }),
+    [init, resume, speak, setPlaybackSpeed, stop, scrub, endScrub, ready],
   );
 }
