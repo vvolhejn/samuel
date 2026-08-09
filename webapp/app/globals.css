@@ -12,7 +12,6 @@
   --color-foreground: var(--foreground);
   --font-sans: "Helvetica Neue", Helvetica, Arial, Roboto, "Noto Sans",
     sans-serif;
-  --font-display: var(--font-montreuil-play);
 }
 
 body {
@@ -20,10 +19,6 @@ body {
   color: var(--foreground);
   font-family: "Helvetica Neue", Helvetica, Arial, Roboto, "Noto Sans",
     sans-serif;
-}
-
-.font-display {
-  font-family: var(--font-montreuil-play), system-ui, sans-serif;
 }
 
 /* Pink Trombone: show only the animated tract, not the manual glottis pad

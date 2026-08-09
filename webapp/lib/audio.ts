@@ -26,11 +26,6 @@ function wavBlobUrl(b64: string): string {
   return URL.createObjectURL(new Blob([bytes], { type: "audio/wav" }));
 }
 
-/** Object URL for the backend's Python-synth reference audio. */
-export function synthAudioUrl(response: SynthResponse): string {
-  return wavBlobUrl(response.synth_audio_b64);
-}
-
 /** Object URL for the original dataset clip. */
 export function clipAudioUrl(response: DatasetClipResponse): string {
   return wavBlobUrl(response.clip_audio_b64);
@@ -91,21 +86,33 @@ export function trimTrailingSilence(
   return audio.subarray(0, cut);
 }
 
+export interface UtteranceResult {
+  response: SynthResponse;
+  /** Object URL for the WAV we actually sent — the trimmed recording, i.e.
+   * exactly what the model heard. The caller owns it (revoke when replacing). */
+  inputUrl: string;
+}
+
 /** Send one VAD utterance (Float32Array at 16 kHz) to the model backend. */
 export async function synthesizeUtterance(
   audio: Float32Array,
-): Promise<SynthResponse> {
+): Promise<UtteranceResult> {
   // defaults: 32-bit float WAV, 16 kHz mono — matches what MicVAD emits
   const wav = utils.encodeWAV(trimTrailingSilence(audio));
+  const blob = new Blob([wav], { type: "audio/wav" });
   const res = await fetch("/api/synthesize", {
     method: "POST",
     headers: { "Content-Type": "audio/wav" },
-    body: new Blob([wav], { type: "audio/wav" }),
+    body: blob,
   });
   if (!res.ok) {
     throw new Error(`backend error ${res.status}: ${await res.text()}`);
   }
-  return res.json();
+  // URL only on success, so a failed request leaves nothing to revoke.
+  return {
+    response: (await res.json()) as SynthResponse,
+    inputUrl: URL.createObjectURL(blob),
+  };
 }
 
 /** Response of GET /api/health. */

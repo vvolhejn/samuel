@@ -3,10 +3,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { MicVAD } from "@ricky0123/vad-web";
 import {
+  clipAudioUrl,
   fetchDatasetClip,
   fetchHealth,
   synthesizeUtterance,
-  synthAudioUrl,
   HealthResponse,
   SynthResponse,
 } from "@/lib/audio";
@@ -21,13 +21,15 @@ type Status =
   | "speaking"
   | "muted";
 
-const STATUS_LABEL: Record<Status, string> = {
-  idle: "Mic off — click start and allow the microphone",
+/** Shown next to the transport controls. `null` states say nothing: the Record
+ * button already reads as "the mic is off". */
+const STATUS_LABEL: Record<Status, string | null> = {
+  idle: null,
+  muted: null,
   listening: "Listening — say something",
   recording: "Hearing you…",
   processing: "Thinking…",
   speaking: "Speaking back",
-  muted: "Mic muted",
 };
 
 const STATUS_DOT: Record<Status, string> = {
@@ -41,6 +43,30 @@ const STATUS_DOT: Record<Status, string> = {
 
 const SPEEDS = [0.25, 0.5, 1] as const;
 
+/** Browser mic processing, toggleable so we can A/B it against training audio,
+ * which has none of it. vad-web hardcodes all three on; we pass our own
+ * getStream/resumeStream instead (see startMic). */
+type MicProcessing = {
+  echoCancellation: boolean;
+  autoGainControl: boolean;
+  noiseSuppression: boolean;
+};
+
+const MIC_PROCESSING_DEFAULTS: MicProcessing = {
+  echoCancellation: true,
+  autoGainControl: true,
+  noiseSuppression: true,
+};
+
+const MIC_PROCESSING_LABELS: Array<{
+  key: keyof MicProcessing;
+  label: string;
+}> = [
+  { key: "echoCancellation", label: "echo cancellation" },
+  { key: "autoGainControl", label: "auto gain control" },
+  { key: "noiseSuppression", label: "noise suppression" },
+];
+
 const PANEL_PARAMS: Array<{ key: string; label: string; digits: number }> = [
   { key: "frequency", label: "frequency (Hz)", digits: 1 },
   { key: "voiceness", label: "voiceness", digits: 3 },
@@ -53,7 +79,7 @@ const PANEL_PARAMS: Array<{ key: string; label: string; digits: number }> = [
 ];
 
 /** Exact model-output values at the current playback/scrub position. */
-function ParamPanel({
+function ModelOutput({
   response,
   frac,
 }: {
@@ -71,9 +97,9 @@ function ParamPanel({
     </div>
   );
   return (
-    <aside className="w-56 shrink-0 self-start rounded-lg border border-neutral-200 bg-neutral-50 p-3 text-xs">
+    <section>
       <div className="mb-2 flex items-baseline justify-between">
-        <span className="font-semibold text-neutral-700">Model output</span>
+        <SectionTitle>model output</SectionTitle>
         <span className="tabular-nums text-neutral-400">
           {response ? `frame ${frame + 1}/${nFrames}` : "no clip"}
         </span>
@@ -83,7 +109,9 @@ function ParamPanel({
           // Older checkpoints predate some params (e.g. lipDiameter).
           row(
             label,
-            response?.params[key] ? response.params[key][frame].toFixed(digits) : "–",
+            response?.params[key]
+              ? response.params[key][frame].toFixed(digits)
+              : "–",
           ),
         )}
         {row(
@@ -91,6 +119,106 @@ function ParamPanel({
           response ? (response.voiced[frame] ? "yes" : "no") : "–",
         )}
       </dl>
+    </section>
+  );
+}
+
+function SectionTitle({ children }: { children: React.ReactNode }) {
+  return (
+    <span className="font-semibold tracking-wide text-neutral-600 uppercase">
+      {children}
+    </span>
+  );
+}
+
+/** Everything that is useful while developing but noise while using the thing:
+ * which checkpoint is loaded, the live parameter trajectories, and the mic
+ * capture settings. Collapsed to a tab on the right by default. */
+function DebugPanel({
+  open,
+  onToggle,
+  health,
+  response,
+  frac,
+  micProcessing,
+  onToggleMicProcessing,
+}: {
+  open: boolean;
+  onToggle: () => void;
+  health: HealthResponse | null;
+  response: SynthResponse | null;
+  frac: number;
+  micProcessing: MicProcessing;
+  onToggleMicProcessing: (key: keyof MicProcessing) => void;
+}) {
+  if (!open) {
+    return (
+      <button
+        onClick={onToggle}
+        title="Show the debug panel"
+        className="self-start rounded-lg border border-neutral-200 bg-neutral-50 px-1.5 py-3 text-xs font-semibold tracking-wide text-neutral-500 uppercase [writing-mode:vertical-rl] hover:border-fuchsia-300 hover:text-fuchsia-600"
+      >
+        Debug
+      </button>
+    );
+  }
+  return (
+    <aside className="w-64 shrink-0 self-start space-y-4 rounded-lg border border-neutral-200 bg-neutral-50 p-3 text-xs">
+      <div className="flex items-baseline justify-between">
+        <SectionTitle>debug</SectionTitle>
+        <button
+          onClick={onToggle}
+          title="Hide the debug panel"
+          className="text-neutral-400 hover:text-fuchsia-600"
+        >
+          hide
+        </button>
+      </div>
+
+      <section>
+        <div className="mb-1">
+          <SectionTitle>checkpoint</SectionTitle>
+        </div>
+        {health ? (
+          <p className="font-mono break-all text-neutral-500">
+            {health.checkpoint.startsWith("https://") ? (
+              <a
+                href={health.checkpoint}
+                target="_blank"
+                rel="noreferrer"
+                className="underline decoration-dotted hover:text-fuchsia-600"
+              >
+                {health.checkpoint}
+              </a>
+            ) : (
+              health.checkpoint
+            )}
+          </p>
+        ) : (
+          <p className="text-neutral-400">backend unreachable</p>
+        )}
+      </section>
+
+      <ModelOutput response={response} frac={frac} />
+
+      <section title="Browser mic processing. Training audio has none of it; the server RMS-normalises either way, so these change the shape of the input, not its level.">
+        <div className="mb-1">
+          <SectionTitle>mic processing</SectionTitle>
+        </div>
+        <div className="space-y-1 text-neutral-600">
+          {MIC_PROCESSING_LABELS.map(({ key, label }) => (
+            <label key={key} className="flex items-center gap-1.5">
+              <input
+                type="checkbox"
+                checked={micProcessing[key]}
+                onChange={() => onToggleMicProcessing(key)}
+                className="accent-fuchsia-600"
+              />
+              {label}
+            </label>
+          ))}
+        </div>
+      </section>
     </aside>
   );
 }
@@ -106,16 +234,29 @@ export default function Home() {
   const [speed, setSpeed] = useState<number>(1);
   /** Playback/scrub position within the last response, in [0, 1]. */
   const [scrubFrac, setScrubFrac] = useState(0);
+  const [micProcessing, setMicProcessing] = useState<MicProcessing>(
+    MIC_PROCESSING_DEFAULTS,
+  );
+  /** Is there audio the model heard, i.e. can "Original" play anything? */
+  const [hasOriginal, setHasOriginal] = useState(false);
+  /** The original is playing, so its segment of the pill offers Pause. */
+  const [playingOriginal, setPlayingOriginal] = useState(false);
+  /** User-intended mic state — the Record/Stop toggle. Mirrors micOnRef; the
+   * status alone can't stand in for it (a dataset clip is "speaking" too). */
+  const [micOn, setMicOn] = useState(false);
+  const [debugOpen, setDebugOpen] = useState(false);
 
   const trombone = usePinkTrombone();
   const vadRef = useRef<MicVAD | null>(null);
   const lastResponse = useRef<SynthResponse | null>(null);
-  const synthUrlRef = useRef<string | null>(null);
+  const originalUrlRef = useRef<string | null>(null); // audio the model heard
   const debugAudioRef = useRef<HTMLAudioElement | null>(null);
   const busyRef = useRef(false); // ignore VAD events while processing/speaking
   const micOnRef = useRef(false); // user-intended mic state (start/mute toggle)
   const speedRef = useRef(1); // playResponse is a stable callback; read via ref
   const scrubbingRef = useRef(false); // pointer is down on the scrub bar
+  // Read by getStream/resumeStream, which vad-web calls on every start().
+  const micProcessingRef = useRef<MicProcessing>(MIC_PROCESSING_DEFAULTS);
 
   // Bring up the synth + tract visualization immediately; the AudioContext
   // stays suspended until the first user gesture (Start).
@@ -169,16 +310,22 @@ export default function Home() {
     [trombone, restoreMic],
   );
 
+  /** Remember the audio a response was made from, so it can be replayed. */
+  const setOriginal = useCallback((url: string) => {
+    if (originalUrlRef.current) URL.revokeObjectURL(originalUrlRef.current);
+    originalUrlRef.current = url;
+    setHasOriginal(true);
+  }, []);
+
   const onUtterance = useCallback(
     async (audio: Float32Array) => {
       if (busyRef.current) return;
       busyRef.current = true;
       setStatus("processing");
       try {
-        const response = await synthesizeUtterance(audio);
+        const { response, inputUrl } = await synthesizeUtterance(audio);
         lastResponse.current = response;
-        if (synthUrlRef.current) URL.revokeObjectURL(synthUrlRef.current);
-        synthUrlRef.current = synthAudioUrl(response);
+        setOriginal(inputUrl);
         setViewResponse(response);
         await playResponse(response);
       } catch (e) {
@@ -187,7 +334,7 @@ export default function Home() {
         await restoreMic();
       }
     },
-    [playResponse, restoreMic],
+    [playResponse, restoreMic, setOriginal],
   );
 
   const startMic = useCallback(async () => {
@@ -204,10 +351,20 @@ export default function Home() {
 
       if (!vadRef.current) {
         const { MicVAD } = await import("@ricky0123/vad-web");
+        // vad-web's default getStream/resumeStream hardcode all three
+        // processing flags on; ours re-read the ref, and since pause() stops
+        // the tracks and start() re-acquires, a toggle lands on the next
+        // listening cycle without rebuilding the VAD.
+        const getStream = () =>
+          navigator.mediaDevices.getUserMedia({
+            audio: { channelCount: 1, ...micProcessingRef.current },
+          });
         vadRef.current = await MicVAD.new({
           model: "v5",
           baseAssetPath: "/vad/",
           onnxWASMBasePath: "/vad/",
+          getStream,
+          resumeStream: getStream,
           redemptionMs: 800,
           preSpeechPadMs: 150, // default 800ms puts noticeable silence before speech
           onSpeechStart: () => {
@@ -220,28 +377,75 @@ export default function Home() {
         });
       }
       micOnRef.current = true;
+      setMicOn(true);
       await vadRef.current.start();
       setStatus("listening");
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+      micOnRef.current = false;
+      setMicOn(false);
       setStatus(vadRef.current ? "muted" : "idle");
     }
   }, [trombone, onUtterance]);
 
-  const muteMic = useCallback(async () => {
+  const stopMic = useCallback(async () => {
     micOnRef.current = false;
+    setMicOn(false);
     await vadRef.current?.pause();
     if (!busyRef.current) setStatus("muted");
   }, []);
 
-  /** Play a WAV object URL through the hidden debug <audio> element. */
+  /** Flip one mic-processing flag. If we're listening right now, cycle the
+   * stream so it takes effect immediately rather than after the next
+   * utterance. */
+  const toggleMicProcessing = useCallback(async (key: keyof MicProcessing) => {
+    const next = {
+      ...micProcessingRef.current,
+      [key]: !micProcessingRef.current[key],
+    };
+    micProcessingRef.current = next;
+    setMicProcessing(next);
+
+    const vad = vadRef.current;
+    if (!vad || busyRef.current || !micOnRef.current || !vad.listening) return;
+    try {
+      await vad.pause();
+      await vad.start();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, []);
+
+  /** Play a WAV object URL to completion through a throwaway <audio> element.
+   *
+   * A fresh element per call, and listeners attached before play(): with one
+   * shared element, a second playback overwrote the first's ended/error
+   * handlers, so the first promise never settled and busyRef stayed true —
+   * every button dead until reload. Resolving on `pause` covers both the user
+   * hitting Pause and a playback cut short by the device switching under us
+   * (Chrome does that when a mic stream with echo cancellation comes and
+   * goes) — no pause event can reach us before play() is called. */
   const playUrl = useCallback(async (url: string) => {
-    const audio = (debugAudioRef.current ??= new Audio());
-    audio.src = url;
-    await audio.play();
-    await new Promise<void>((resolve) => {
-      audio.onended = () => resolve();
-      audio.onerror = () => resolve();
+    debugAudioRef.current?.pause(); // supersede anything still running
+    const audio = new Audio();
+    debugAudioRef.current = audio;
+    await new Promise<void>((resolve, reject) => {
+      let done = false;
+      const finish = () => {
+        if (!done) {
+          done = true;
+          resolve();
+        }
+      };
+      audio.addEventListener("ended", finish, { once: true });
+      audio.addEventListener("error", finish, { once: true });
+      audio.addEventListener("pause", finish, { once: true }); // truncated; don't hang
+      audio.src = url;
+      audio.play().catch((e: DOMException) => {
+        if (e.name === "AbortError")
+          finish(); // superseded by another play
+        else reject(e);
+      });
     });
   }, []);
 
@@ -255,8 +459,7 @@ export default function Home() {
       await trombone.resume(); // we're in a user gesture
       const response = await fetchDatasetClip();
       lastResponse.current = response;
-      if (synthUrlRef.current) URL.revokeObjectURL(synthUrlRef.current);
-      synthUrlRef.current = synthAudioUrl(response);
+      setOriginal(clipAudioUrl(response));
       setViewResponse(response);
       await playResponse(response);
     } catch (e) {
@@ -264,7 +467,7 @@ export default function Home() {
       setError(e instanceof Error ? e.message : String(e));
       await restoreMic();
     }
-  }, [trombone, playResponse, restoreMic]);
+  }, [trombone, playResponse, restoreMic, setOriginal]);
 
   /** Play from the scrub position (or the start, if at the end); pause if
    * already playing. */
@@ -318,76 +521,65 @@ export default function Home() {
     if (!busyRef.current) await restoreMic();
   }, [trombone, restoreMic]);
 
-  const playPythonSynth = useCallback(async () => {
-    if (!synthUrlRef.current || busyRef.current) return;
+  /** Play the audio the model heard — your trimmed recording, or the dataset
+   * clip — holding the mic and busy flag like a real response. Raw level: the
+   * RMS normalisation happens server-side. Pause stops it for good; the next
+   * click starts over, since there is nothing to scrub here. */
+  const toggleOriginal = useCallback(async () => {
+    if (playingOriginal) {
+      debugAudioRef.current?.pause(); // settles the in-flight playUrl()
+      return;
+    }
+    const url = originalUrlRef.current;
+    if (!url || busyRef.current) return;
     busyRef.current = true;
     setError(null);
     setStatus("speaking");
+    setPlayingOriginal(true);
     await vadRef.current?.pause();
     try {
-      await playUrl(synthUrlRef.current);
+      await playUrl(url);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
+      setPlayingOriginal(false);
       busyRef.current = false;
       await restoreMic();
     }
-  }, [playUrl, restoreMic]);
+  }, [playingOriginal, playUrl, restoreMic]);
 
-  const micActive = status !== "idle";
-  const notBusy =
-    status === "idle" || status === "listening" || status === "muted";
+  // "recording" only means the VAD currently hears *something* — a cough or a
+  // door must not disable the buttons, or every other click gets swallowed
+  // while it flaps. busyRef is the real guard, and starting a playback pauses
+  // the VAD, which discards the in-flight segment.
+  const notBusy = status !== "processing" && status !== "speaking";
   const canReplay = viewResponse !== null && notBusy;
+  const canPlayOriginal = hasOriginal && notBusy;
   const canScrub = viewResponse !== null && status !== "processing";
 
   return (
-    <main className="flex flex-1 flex-col items-center gap-6 p-8">
-      <header className="text-center">
-        <h1 className="font-display text-4xl tracking-wide text-fuchsia-600">
-          Samuel
-        </h1>
-        <p className="mt-1 text-sm text-neutral-500">
-          Speak — the vocal tract model mimics you.
-        </p>
-        {health && (
-          <p className="mt-1 font-mono text-xs break-all text-neutral-400">
-            {health.checkpoint.startsWith("https://") ? (
-              <a
-                href={health.checkpoint}
-                target="_blank"
-                rel="noreferrer"
-                className="underline decoration-dotted hover:text-fuchsia-600"
-              >
-                {health.checkpoint}
-              </a>
-            ) : (
-              health.checkpoint
-            )}
-          </p>
-        )}
+    <main className="flex flex-1 flex-col items-start gap-6 p-8">
+      <header>
+        <h1 className="text-5xl font-bold text-fuchsia-600">Samuel</h1>
       </header>
+      <div className="flex flex-wrap items-center gap-3">
+        <div className="font-bold text-fuchsia-600">Audio input</div>
 
-      <div className="flex flex-wrap items-center justify-center gap-3">
-        <span className="inline-flex items-center gap-2 rounded-full border border-neutral-200 bg-neutral-50 px-3 py-1 text-sm text-neutral-700">
-          <span className={`h-2 w-2 rounded-full ${STATUS_DOT[status]}`} />
-          {STATUS_LABEL[status]}
-        </span>
-
-        {!micActive || status === "muted" ? (
-          <button
-            onClick={startMic}
-            className="rounded-full bg-fuchsia-600 px-4 py-1.5 text-sm font-semibold text-white hover:bg-fuchsia-700"
-          >
-            {micActive ? "Mic on" : "Start"}
-          </button>
-        ) : (
-          <button
-            onClick={muteMic}
-            className="rounded-full border border-fuchsia-300 px-4 py-1.5 text-sm font-medium text-fuchsia-700 hover:bg-fuchsia-50"
-          >
-            Mic off
-          </button>
-        )}
+        <button
+          onClick={() => void (micOn ? stopMic() : startMic())}
+          title={
+            micOn
+              ? "Stop listening"
+              : "Listen continuously and mimic every utterance"
+          }
+          className={
+            micOn
+              ? "rounded-full border border-fuchsia-300 px-4 py-1.5 text-sm font-medium text-fuchsia-700 hover:bg-fuchsia-50"
+              : "rounded-full bg-fuchsia-600 px-4 py-1.5 text-sm font-semibold text-white hover:bg-fuchsia-700"
+          }
+        >
+          {micOn ? "Stop" : "Microphone"}
+        </button>
 
         <button
           onClick={playDatasetClip}
@@ -395,45 +587,53 @@ export default function Home() {
           title="Mimic a random 10s clip from the training dataset"
           className="rounded-full border border-sky-300 px-4 py-1.5 text-sm font-medium text-sky-700 hover:bg-sky-50 disabled:opacity-40 disabled:hover:bg-transparent"
         >
-          Dataset clip
+          Pre-recorded
         </button>
 
-        <button
-          onClick={playPythonSynth}
-          disabled={!canReplay}
-          title="Reference resynthesis from the Python synth (debug)"
-          className="rounded-full border border-dashed border-neutral-300 px-4 py-1.5 text-sm font-medium text-neutral-700 hover:border-fuchsia-300 hover:bg-fuchsia-50 hover:text-fuchsia-700 disabled:opacity-40 disabled:hover:border-neutral-300 disabled:hover:bg-transparent disabled:hover:text-neutral-700"
-        >
-          Python synth
-        </button>
+        {STATUS_LABEL[status] && (
+          <span className="inline-flex items-center gap-2 text-sm text-neutral-500">
+            <span className={`h-2 w-2 rounded-full ${STATUS_DOT[status]}`} />
+            {STATUS_LABEL[status]}
+          </span>
+        )}
       </div>
 
       <div className="flex w-full max-w-3xl items-center gap-3">
-        <div className="flex overflow-hidden rounded-full border border-neutral-300 text-xs">
-          {SPEEDS.map((s) => (
-            <button
-              key={s}
-              onClick={() => changeSpeed(s)}
-              title="Playback speed"
-              className={`px-2.5 py-1 font-medium ${
-                s === speed
-                  ? "bg-fuchsia-600 text-white"
-                  : "text-neutral-600 hover:bg-fuchsia-50 hover:text-fuchsia-700"
-              }`}
-            >
-              {s}×
-            </button>
-          ))}
-        </div>
-
-        <button
-          onClick={togglePlay}
-          disabled={!canReplay && !isPlaying}
-          title="Play the last response from the scrub position"
-          className="w-20 rounded-full bg-fuchsia-600 px-4 py-1.5 text-sm font-semibold text-white hover:bg-fuchsia-700 disabled:opacity-40 disabled:hover:bg-fuchsia-600"
+        <select
+          value={speed}
+          onChange={(e) => changeSpeed(Number(e.currentTarget.value))}
+          title="Playback speed"
+          className="rounded-full border border-neutral-300 py-1 pr-6 pl-2.5 text-xs font-medium text-neutral-600 hover:border-fuchsia-300 hover:text-fuchsia-700"
         >
-          {isPlaying ? "Pause" : "Play"}
-        </button>
+          {SPEEDS.map((s) => (
+            <option key={s} value={s}>
+              {s}× speed
+            </option>
+          ))}
+        </select>
+
+        {/* One pill, two sources: the model's imitation and the audio it was
+            made from. Whichever is playing offers Pause; the other is out of
+            reach until it stops, since they'd fight over the mic and busy
+            flag. */}
+        <div className="flex shrink-0 overflow-hidden rounded-full border border-fuchsia-300 text-sm">
+          <button
+            onClick={togglePlay}
+            disabled={!canReplay && !isPlaying}
+            title="Play the model's imitation from the scrub position"
+            className="w-24 bg-fuchsia-600 py-1.5 font-semibold text-white hover:bg-fuchsia-700 disabled:opacity-40 disabled:hover:bg-fuchsia-600"
+          >
+            {isPlaying ? "Pause" : "Play"}
+          </button>
+          <button
+            onClick={() => void toggleOriginal()}
+            disabled={!canPlayOriginal && !playingOriginal}
+            title="Play the audio the model heard, at its recorded level"
+            className="w-24 border-l border-fuchsia-300 py-1.5 font-medium text-fuchsia-700 hover:bg-fuchsia-50 disabled:opacity-40 disabled:hover:bg-transparent"
+          >
+            {playingOriginal ? "Pause" : "Original"}
+          </button>
+        </div>
 
         <input
           type="range"
@@ -458,13 +658,28 @@ export default function Home() {
       </div>
 
       {error && (
-        <p className="max-w-xl text-center text-sm text-red-600">{error}</p>
+        <p className="max-w-xl text-sm text-red-600">{error}</p>
       )}
 
       <div className="flex w-full max-w-5xl items-stretch gap-4">
-        <ParamPanel response={viewResponse} frac={scrubFrac} />
-        <pink-trombone className="block h-[60vh] min-w-0 flex-1" />
+        {/* The element's canvases are a fixed 600×500 anchored top-left, so
+            size the host to match rather than letting it stretch. */}
+        <div className="flex min-w-0 flex-1">
+          <pink-trombone className="block h-[500px] w-[600px] shrink-0" />
+        </div>
+        <DebugPanel
+          open={debugOpen}
+          onToggle={() => setDebugOpen((v) => !v)}
+          health={health}
+          response={viewResponse}
+          frac={scrubFrac}
+          micProcessing={micProcessing}
+          onToggleMicProcessing={(key) => void toggleMicProcessing(key)}
+        />
       </div>
+
+      {/* Placeholder — prose about the project goes here. */}
+      <div className="w-full max-w-3xl" />
     </main>
   );
 }
