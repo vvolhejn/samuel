@@ -3,6 +3,8 @@ name = "samuel"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
 authors = [
     { name = "Václav Volhejn", email = "vaclav.volhejn@gmail.com" }
 ]

@@ -1,4 +1,10 @@
 /*
+    Modified for the samuel project (GPL-3.0, see Pink-Trombone/LICENSE):
+      2026-07-18  fix the plosive-release transient (burst position, obstruction
+                  reset) so it actually fires
+      2026-07-26  fixed lip constriction at the last tract index, with its
+                  turbulence-noise injection clamped in bounds
+
     TODO
         using tongue as a k-rate constriction
 */

@@ -1,3 +1,8 @@
+/*
+    Modified for the samuel project (GPL-3.0, see Pink-Trombone/LICENSE):
+      2026-04-05  add the bypassTract parameter
+*/
+
 const ParameterDescriptors = [
   {
     name: "noise",

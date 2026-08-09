@@ -1,4 +1,8 @@
 /*
+    Modified for the samuel project (GPL-3.0, see Pink-Trombone/LICENSE):
+      2026-07-26  claim a constriction slot synchronously in newConstriction, so
+                  two constrictions created in one block don't share slot 0
+
     TODO
         *
 */

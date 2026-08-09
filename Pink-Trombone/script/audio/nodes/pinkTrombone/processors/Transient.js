@@ -1,3 +1,8 @@
+/*
+    Modified for the samuel project (GPL-3.0, see Pink-Trombone/LICENSE):
+      2026-07-18  fix the amplitude decay, which returned NaN every sample
+*/
+
 class Transient {
     constructor(position, seconds) {
         this.position = position;

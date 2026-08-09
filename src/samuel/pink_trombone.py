@@ -1,4 +1,7 @@
-"""Differentiable Pink Trombone vocal synthesizer in PyTorch."""
+"""Differentiable Pink Trombone vocal synthesizer in PyTorch.
+
+Based on the JS implementation under ``Pink-Trombone/``.
+"""
 
 import functools
 import math
