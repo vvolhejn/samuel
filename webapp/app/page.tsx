@@ -468,6 +468,16 @@ export default function Home() {
     if (!busyRef.current) setStatus("muted");
   }, []);
 
+  // Leaving the tab shouldn't leave a live mic behind: mute on hide, and stay
+  // muted on return so coming back is an explicit user gesture.
+  useEffect(() => {
+    const onHide = () => {
+      if (document.hidden && micOnRef.current) void stopMic();
+    };
+    document.addEventListener("visibilitychange", onHide);
+    return () => document.removeEventListener("visibilitychange", onHide);
+  }, [stopMic]);
+
   /** Flip one mic-processing flag. If we're listening right now, cycle the
    * stream so it takes effect immediately rather than after the next
    * utterance. */
