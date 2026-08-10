@@ -45,24 +45,30 @@ loss:
   # trajectories, sum_p smooth_weights[p] * mean|Δp_norm|. Params not listed
   # in smooth_weights are unpenalised. See LossConfig for details.
   # Baseline for the rest-pose experiment is run 2kzb65qc (s6-wdiam0.3):
-  # smooth and accel both on at 0.3 with the wider diameter weights.
+  # smooth and accel both on at 0.3. Same relative weights for both terms, as
+  # every run so far has used, now also covering voiceness and intensity --
+  # the two source params were previously unpenalised and free to jitter.
   smooth: 0.3
   smooth_weights:
     tongueIndex: 1.0
-    tongueDiameter: 0.3
     constrictionIndex: 1.0
+    tongueDiameter: 0.3
     constrictionDiameter: 0.3
     lipDiameter: 0.3
+    voiceness: 0.1
+    intensity: 0.1
   # Same L1 on the *second* difference: penalises direction changes rather
   # than movement, so a fast steady gesture is free and only zigzag is
   # charged. See LossConfig.accel.
   accel: 0.3
   accel_weights:
     tongueIndex: 1.0
-    tongueDiameter: 0.3
     constrictionIndex: 1.0
+    tongueDiameter: 0.3
     constrictionDiameter: 0.3
     lipDiameter: 0.3
+    voiceness: 0.1
+    intensity: 0.1
   # Rest posture: lips almost closed, tongue body down, tongue tip down.
   # A constant (L1) pull toward this pose — see LossConfig.rest and
   # scripts/calibrate_rest_prior.py. It is meant to decide only the frames the
