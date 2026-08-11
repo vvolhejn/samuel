@@ -5,6 +5,9 @@ __pycache__/
 
 runs/
 manifests/
+# Worktrees symlink manifests/ back to the main checkout; the trailing-slash
+# pattern above does not match a symlink, so `git add -A` would commit it.
+/manifests
 artifacts/
 logs/
 train.log
