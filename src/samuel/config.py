@@ -143,17 +143,22 @@ class LossConfig(BaseModel):
     # control trajectories, computed on range-normalised params (each trainable
     # param rescaled to [0, 1]. Contribution to the training loss:
     #   smooth * sum_p smooth_weights[p] * mean_{batch,time} |Δp_norm|
-    # Off in favour of ``accel``: penalising displacement cannot tell a fast
-    # gesture apart from jitter, so this either leaves the jitter in place or
-    # freezes the parameter.
-    smooth: float = 0.0
+    # On alongside ``accel`` at the same weight: penalising displacement alone
+    # cannot tell a fast gesture from jitter, but the two together score better
+    # than either (run metitgyo / 0d8kfyyf) than the accel-only recipe did.
+    smooth: float = 0.3
     smooth_weights: dict[str, float] = Field(
         default_factory=lambda: {
             "tongueIndex": 1.0,
-            "tongueDiameter": 0.3,
             "constrictionIndex": 1.0,
-            "constrictionDiameter": 0.1,
-            "lipDiameter": 0.1,
+            "tongueDiameter": 0.3,
+            "constrictionDiameter": 0.3,
+            "lipDiameter": 0.3,
+            # The source params: absent from these dicts until 2026-08-10, so
+            # free to jitter. intensity had the highest param_variation of any
+            # param (0.052) before it was penalised.
+            "voiceness": 0.1,
+            "intensity": 0.1,
         }
     )
 
@@ -167,10 +172,12 @@ class LossConfig(BaseModel):
     accel_weights: dict[str, float] = Field(
         default_factory=lambda: {
             "tongueIndex": 1.0,
-            "tongueDiameter": 0.3,
             "constrictionIndex": 1.0,
-            "constrictionDiameter": 0.1,
-            "lipDiameter": 0.1,
+            "tongueDiameter": 0.3,
+            "constrictionDiameter": 0.3,
+            "lipDiameter": 0.3,
+            "voiceness": 0.1,
+            "intensity": 0.1,
         }
     )
 
@@ -200,14 +207,26 @@ class LossConfig(BaseModel):
     # the median wins in the low-gradient majority of frames and the parameter
     # stops being used at all. Run irdqz9gv did exactly that to the tongue-tip
     # constriction (param_variation 3e-5, i.e. frozen) at rest=0.15.
-    rest: float = 0.0
+    rest: float = 0.01
     # Target values in *raw* parameter units (same scale as model.param_spec),
-    # normalised internally by the same [lo, hi] range.
-    rest_targets: dict[str, float] = Field(default_factory=dict)
+    # normalised internally by the same [lo, hi] range. Empty disables the term.
+    rest_targets: dict[str, float] = Field(
+        default_factory=lambda: {
+            "lipDiameter": 0.3,  # top of the [0, 0.3] closure band: almost closed
+            "tongueDiameter": 3.5,  # max of [1.5, 3.5]: tongue body down
+            "constrictionDiameter": 3.0,  # max of [-2, 3]: no tip constriction
+        }
+    )
     # Per-param multipliers; params absent here default to 1.0. Needed because
     # the recon gradient differs ~5x across these params, so a flat weight
     # would bias the lips far harder than the tongue.
-    rest_weights: dict[str, float] = Field(default_factory=dict)
+    rest_weights: dict[str, float] = Field(
+        default_factory=lambda: {
+            "lipDiameter": 0.3,
+            "tongueDiameter": 1.0,
+            "constrictionDiameter": 1.0,
+        }
+    )
 
     # SSL feature-matching (perceptual) loss on a frozen speech encoder.
     # L1 distance between the encoder's hidden states for pred vs. target audio.

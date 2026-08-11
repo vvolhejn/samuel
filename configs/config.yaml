@@ -44,10 +44,10 @@ loss:
   # Temporal smoothness: L1 on per-frame changes of range-normalised control
   # trajectories, sum_p smooth_weights[p] * mean|Δp_norm|. Params not listed
   # in smooth_weights are unpenalised. See LossConfig for details.
-  # Baseline for the rest-pose experiment is run 2kzb65qc (s6-wdiam0.3):
-  # smooth and accel both on at 0.3. Same relative weights for both terms, as
-  # every run so far has used, now also covering voiceness and intensity --
-  # the two source params were previously unpenalised and free to jitter.
+  # smooth and accel both on at 0.3, same relative weights for both terms, and
+  # voiceness/intensity included at 0.1 -- the two source params used to be
+  # absent from these dicts and so free to jitter, and intensity had the
+  # highest param_variation of any param (0.052) before being penalised.
   smooth: 0.3
   smooth_weights:
     tongueIndex: 1.0
@@ -77,19 +77,26 @@ loss:
   # gradient is small, so train/loss is not comparable to a run without it —
   # compare train/recon_loss and eval/wer instead.
   #
-  # 0.01, i.e. ~1 % of each param's median speech-frame recon gradient. Two
-  # stronger settings were measured first, and both cost intelligibility:
+  # 0.01, i.e. ~1 % of each param's median speech-frame recon gradient. This is
+  # the largest of three settings measured that costs nothing: at 100k it gets
+  # tongueDiameter and lipDiameter ~45 % closer to the pose on silent frames
+  # (0.658 -> 0.401, 0.414 -> 0.251) at WER 0.239 vs. 0.246 for the same recipe
+  # without it, at a matched 30k steps. Two stronger ones both cost
+  # intelligibility:
   #   rest=0.15 (run irdqz9gv, killed at 11.8k) froze the tongue-tip
-  #     constriction dead at its target, param_variation 3e-5 vs. the
-  #     baseline's 1.4e-2, WER ~2x baseline.
+  #     constriction dead at its target, param_variation 3e-5 vs. 1.4e-2, and
+  #     WER ~2x.
   #   rest=0.04 (run 1idcg86v, 30k) reached the pose -- silent-frame distance
-  #     1.46 -> 0.30 against baseline 2kzb65qc -- but WER 0.246 -> 0.357, and
-  #     constrictionDiameter still sat on the target on *all* frames (0.027)
-  #     rather than only silent ones (0.028), i.e. still suppressed.
+  #     1.46 -> 0.30 -- but WER 0.246 -> 0.357, and constrictionDiameter sat on
+  #     the target on *all* frames (0.027) rather than only silent ones
+  #     (0.028), i.e. pinned rather than resting.
   # The median is the wrong statistic to size against: these gradients are
   # heavy-tailed, large only in the frames where that articulator does the
   # work, so even a few percent of the median overrides the low-gradient
-  # majority of frames.
+  # majority of frames. The flip side is that constrictionDiameter, whose
+  # gradient is the largest of the three, does not respond at 0.01 either
+  # (0.393 -> 0.390) -- moving it likely needs a silence-gated term rather
+  # than a stronger constant one.
   rest: 0.01
   rest_targets:
     lipDiameter: 0.3          # top of the [0, 0.3] closure band: almost closed
