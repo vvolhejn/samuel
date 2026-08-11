@@ -48,6 +48,12 @@ pnpm dev   # in another shell
 
 Open http://localhost:3000 — `/api/*` is proxied to the backend on :8471.
 
+### Deployment
+
+`deploy/` puts both halves on Cloudflare as a single Worker: the static export
+from `out/`, and the backend as a container on the same origin. See
+`deploy/README.md`.
+
 ## How it works
 
 - `app/page.tsx` — state machine `idle → listening → recording → processing →

@@ -1,19 +1,5 @@
 import { utils } from "@ricky0123/vad-web";
 
-/**
- * Origin of the Python backend, without a trailing slash.
- *
- * Empty by default, i.e. same-origin: `samuel.server` serves this build itself,
- * and `pnpm dev` proxies `/api/*` (see next.config.ts). Set
- * `NEXT_PUBLIC_API_BASE` at build time to host the frontend separately from the
- * backend — the value is inlined into the bundle by `next build`, and the
- * backend must then allow this origin via `SAMUEL_ALLOW_ORIGINS`.
- *
- * Only `/api/*` uses it. Static assets (`/clips`, `/vad`, `/pink-trombone`)
- * ship with the frontend and stay relative.
- */
-const API_BASE = (process.env.NEXT_PUBLIC_API_BASE ?? "").replace(/\/+$/, "");
-
 /** Response of POST /api/synthesize (samuel.server). Trajectories are in
  * Pink Trombone's native units at `frame_rate` frames per second. */
 export interface SynthResponse {
@@ -113,7 +99,7 @@ export interface UtteranceResult {
 /** Send one audio file to the model backend, which sniffs the format itself
  * (WAV from the mic, MP3 for the pre-recorded clips). */
 async function synthesizeBlob(blob: Blob): Promise<UtteranceResult> {
-  const res = await fetch(`${API_BASE}/api/synthesize`, {
+  const res = await fetch("/api/synthesize", {
     method: "POST",
     headers: { "Content-Type": blob.type || "application/octet-stream" },
     body: blob,
@@ -159,7 +145,7 @@ export interface HealthResponse {
 /** null when the backend is unreachable or not serving a model. */
 export async function fetchHealth(): Promise<HealthResponse | null> {
   try {
-    const res = await fetch(`${API_BASE}/api/health`);
+    const res = await fetch("/api/health");
     return res.ok ? await res.json() : null;
   } catch {
     return null;

@@ -1,0 +1,44 @@
+{
+  // One Worker serves both halves of the app: the static export from `out/`,
+  // and the Python backend as a container. They share an origin, so the
+  // frontend's /api/* calls stay relative and CORS never enters the picture.
+  "name": "samuel",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-08-11",
+
+  "assets": {
+    "directory": "./out",
+    "not_found_handling": "404-page",
+    // Only these paths reach the Worker (and so the container); everything
+    // else is served from `out/` without waking it.
+    "run_worker_first": ["/api/*"]
+  },
+
+  "containers": [
+    {
+      "class_name": "SamuelBackend",
+      // Repo-relative: the image copies src/, which lives above this
+      // directory. See deploy/README.md.
+      "image": "../deploy/Dockerfile",
+      "image_build_context": "..",
+      // Which weights to bake in. Pin the revision to a Hub commit: on a
+      // branch name Docker caches the download layer, so a newer checkpoint
+      // would be silently ignored.
+      "image_vars": {
+        "MODEL_REPO": "vvolhejn/samuel",
+        "MODEL_REVISION": "main"
+      },
+      // 2 vCPU / 8 GiB. The thread counts in the Dockerfile match this.
+      "instance_type": "standard-3",
+      // Memory is billed per awake instance, so more instances multiply the
+      // bill. One is enough for a demo; uvicorn handles concurrency within it.
+      "max_instances": 1
+    }
+  ],
+
+  "durable_objects": {
+    "bindings": [{ "name": "BACKEND", "class_name": "SamuelBackend" }]
+  },
+
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SamuelBackend"] }]
+}
