@@ -63,10 +63,11 @@ def score(run_dir: Path, ckpt: str, n_clips: int, device: torch.device) -> dict:
             for k, v in _silent_frame_rest_metrics(params, model, target, cfg).items()
         }
     )
+    # Jitter for every param, not just the biased ones: the smoothness weights
+    # changed alongside the prior, so voiceness/intensity need watching too.
     var = _normalized_trainable_diffs(params, model).mean(dim=(0, 1))
     for name, v in zip(model.trainable_names_, var.tolist()):
-        if name in REST_TARGETS:
-            out[f"var/{name}"] = v
+        out[f"var/{name}"] = v
     return out
 
 
