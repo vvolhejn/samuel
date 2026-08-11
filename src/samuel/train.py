@@ -304,12 +304,7 @@ def _acceleration_loss(
 def _rest_targets_norm(
     module: PinkTromboneController, targets: dict[str, float]
 ) -> torch.Tensor:
-    """Rest targets in the same ``[0, 1]`` scale as the trajectories.
-
-    Targets are configured in raw parameter units; normalised here by the
-    bucket-center range used everywhere else. Params absent from ``targets``
-    get 0 and are masked out by the caller.
-    """
+    """Rest targets, given in raw units, rescaled to the trajectories' [0, 1]."""
     lo = module.bucket_centers[:, 0]
     hi = module.bucket_centers[:, -1]
     tgt = torch.tensor(
@@ -325,10 +320,7 @@ def _rest_pose_distance(
     module: PinkTromboneController,
     targets: dict[str, float],
 ) -> torch.Tensor:
-    """Per-param mean ``|p_norm - target_norm|``; ``[n_trainable]``, unweighted.
-
-    Params absent from ``targets`` get 0.
-    """
+    """Per-param mean ``|p_norm - target_norm|``; ``[n_trainable]``, unweighted."""
     tgt_norm = _rest_targets_norm(module, targets)
     mask = torch.tensor(
         [1.0 if n in targets else 0.0 for n in module.trainable_names_],
@@ -345,10 +337,7 @@ def _rest_pose_loss(
     targets: dict[str, float],
     weights: dict[str, float],
 ) -> torch.Tensor:
-    """``sum_p w_p * mean |p_norm - target_norm|`` over the params in ``targets``.
-
-    ``weights`` defaults to 1.0 per param. See LossConfig.rest.
-    """
+    """``sum_p w_p * mean |p_norm - target_norm|``; see LossConfig.rest."""
     dist = _rest_pose_distance(params, module, targets)
     coeffs = torch.tensor(
         [weights.get(n, 1.0) for n in module.trainable_names_],
@@ -366,14 +355,7 @@ def _silent_frame_rest_metrics(
     cfg: TrainConfig,
     silence_db: float = -20.0,
 ) -> dict[str, float]:
-    """Rest-pose distance restricted to frames where the target is silent.
-
-    ``silence_db`` is relative to the clip loudness (``data.target_rms``), so
-    -20 dB means "a hundredth of the clip's energy". These are the frames the
-    reconstruction loss leaves unconstrained, so they are where a rest-pose
-    prior is supposed to show up; the all-frame ``eval/rest_loss`` mixes them
-    with speech frames where being off-target is correct.
-    """
+    """Rest-pose distance on frames quieter than ``silence_db`` re. target_rms."""
     spf = module.samples_per_frame
     T = params.shape[1]
     S = T * spf
@@ -747,9 +729,6 @@ def _evaluate(
         for name, v in zip(model.trainable_names_, rest_dist.tolist()):
             if name in cfg.loss.rest_targets:
                 out[f"eval/rest_dist/{name}"] = v
-        # The metric the prior is actually for: how close the articulators sit
-        # to the rest pose on the frames where the target is silent and the
-        # recon loss therefore has no opinion about them.
         out.update(_silent_frame_rest_metrics(params, model, target, cfg))
 
     # Per-param variation too: the scalar mean hides which param is jittery,
