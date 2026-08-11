@@ -4,6 +4,11 @@ import type {
   PinkTromboneElement,
 } from "@/types/pink-trombone";
 import type { SynthResponse } from "@/lib/audio";
+import {
+  startVideoRecording,
+  type VideoRecorder,
+  type VideoRecording,
+} from "@/lib/videoRecorder";
 
 /** Headroom between scheduling and curve start; also the voicing fade-in. */
 const LEAD_S = 0.15;
@@ -44,6 +49,12 @@ export interface PinkTromboneHandle {
   scrub: (response: SynthResponse, frac: number) => void;
   /** Fade the voicing after scrubbing (the tract pose stays in place). */
   endScrub: () => void;
+  /** Start capturing the tract visualization and the synth's output. No-op if
+   * the browser can't record, or if a capture is already running. */
+  startRecording: () => void;
+  /** Finish the capture started by startRecording(); null if there wasn't one
+   * or the browser produced nothing. */
+  stopRecording: () => Promise<VideoRecording | null>;
   ready: () => boolean;
 }
 
@@ -143,6 +154,11 @@ export function usePinkTrombone(): PinkTromboneHandle {
   const playTokenRef = useRef(0);
   /** Non-null only while an utterance is scheduled and unfinished. */
   const playbackRef = useRef<Playback | null>(null);
+  /** Recording taps, set up in init(): what the synth outputs, and the stacked
+   * canvases the tract is drawn on (bottom first). */
+  const recordDestRef = useRef<MediaStreamAudioDestinationNode | null>(null);
+  const canvasesRef = useRef<HTMLCanvasElement[]>([]);
+  const recorderRef = useRef<VideoRecorder | null>(null);
 
   const init = useCallback(async (element: PinkTromboneElement) => {
     if (elementRef.current) return;
@@ -195,10 +211,20 @@ export function usePinkTrombone(): PinkTromboneHandle {
     element.connect(masterGain);
     masterGain.connect(ctx.destination);
     masterGainRef.current = masterGain;
+    // Second tap on the same signal, for the video's soundtrack. Always
+    // connected — a destination node nobody records from costs nothing.
+    recordDestRef.current = ctx.createMediaStreamDestination();
+    masterGain.connect(recordDestRef.current);
 
     element.start();
     element.enableUI();
     element.startUI();
+    // enableUI() has now appended TractUI's canvases. They are transparent and
+    // stacked by z-index (background 0, tract 1), which is the order the video
+    // recorder has to composite them in — DOM order is the other way round.
+    canvasesRef.current = Array.from(
+      element.querySelectorAll("canvas"),
+    ).sort((a, b) => Number(a.style.zIndex || 0) - Number(b.style.zIndex || 0));
     elementRef.current = element;
   }, []);
 
@@ -416,6 +442,20 @@ export function usePinkTrombone(): PinkTromboneHandle {
     masterGain.gain.setTargetAtTime(0, now, FADE_OUT_S);
   }, []);
 
+  const startRecording = useCallback(() => {
+    if (recorderRef.current) return;
+    recorderRef.current = startVideoRecording(
+      canvasesRef.current,
+      recordDestRef.current?.stream ?? null,
+    );
+  }, []);
+
+  const stopRecording = useCallback(async () => {
+    const recorder = recorderRef.current;
+    recorderRef.current = null;
+    return recorder ? recorder.stop() : null;
+  }, []);
+
   const ready = useCallback(() => elementRef.current !== null, []);
 
   // Stable handle: effects depending on it must not re-run on re-render.
@@ -428,8 +468,21 @@ export function usePinkTrombone(): PinkTromboneHandle {
       stop,
       scrub,
       endScrub,
+      startRecording,
+      stopRecording,
       ready,
     }),
-    [init, resume, speak, setPlaybackSpeed, stop, scrub, endScrub, ready],
+    [
+      init,
+      resume,
+      speak,
+      setPlaybackSpeed,
+      stop,
+      scrub,
+      endScrub,
+      startRecording,
+      stopRecording,
+      ready,
+    ],
   );
 }

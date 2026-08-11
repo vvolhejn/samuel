@@ -21,6 +21,7 @@ import {
 import { insecureContextMessage, micErrorMessage } from "@/lib/secureContext";
 import { downloadBlob, makeZip } from "@/lib/zip";
 import { usePinkTrombone } from "@/lib/usePinkTrombone";
+import type { VideoRecording } from "@/lib/videoRecorder";
 import type { PinkTromboneElement } from "@/types/pink-trombone";
 
 type Status =
@@ -59,6 +60,10 @@ interface Recording {
   input: Blob;
   /** WAV of the model's output, rendered by the Python synth. */
   output: Blob;
+  /** Screen capture of the tract animation with the browser synth's audio,
+   * filled in once the first playback of this response finishes. Absent when
+   * the browser can't record (see startVideoRecording). */
+  video?: VideoRecording;
 }
 
 /** Browser mic processing, toggleable so we can A/B it against training audio,
@@ -261,7 +266,7 @@ function DebugPanel({
         <button
           onClick={onDownloadHistory}
           disabled={historyCount === 0}
-          title="Zip of every utterance this session: what the model heard and what it said back"
+          title="Zip of every utterance this session: what the model heard, what it said back, and a video of the tract"
           className="rounded-full border border-neutral-300 px-3 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 disabled:opacity-40 disabled:hover:bg-transparent"
         >
           {historyCount === 0
@@ -363,11 +368,17 @@ export default function Home() {
     }
   }, []);
 
+  /** With `record`, the tract animation and the synth's audio are captured for
+   * the duration of the playback and returned as a video. Only the first,
+   * automatic playback of a response is recorded — replays and scrubs would
+   * otherwise keep overwriting the session's copy. */
   const playResponse = useCallback(
-    async (response: SynthResponse, startFrac = 0) => {
+    async (response: SynthResponse, startFrac = 0, record = false) => {
       setStatus("speaking");
       setIsPlaying(true);
       await vadRef.current?.pause(); // don't let the synth retrigger the mic
+      if (record) trombone.startRecording();
+      let video: VideoRecording | null = null;
       try {
         await trombone.speak(response, {
           speed: speedRef.current,
@@ -375,10 +386,14 @@ export default function Home() {
           onProgress: setScrubFrac,
         });
       } finally {
+        // In the finally so a failed speak() can't leave a capture running:
+        // startRecording() would then refuse the next one.
+        if (record) video = await trombone.stopRecording();
         setIsPlaying(false);
         busyRef.current = false;
         await restoreMic();
       }
+      return video;
     },
     [trombone, restoreMic],
   );
@@ -390,14 +405,18 @@ export default function Home() {
     setHasOriginal(true);
   }, []);
 
+  /** Returns the stored entry, which the caller may still fill in (the video
+   * only exists once the response has finished playing). */
   const remember = useCallback((recording: Recording) => {
     const history = historyRef.current;
     history.push(recording);
     if (history.length > MAX_HISTORY) history.splice(0, history.length - MAX_HISTORY);
     setHistoryCount(history.length);
+    return recording;
   }, []);
 
-  /** One zip of every input/output pair this session. */
+  /** One zip of every input/output pair this session, plus the tract video for
+   * each. */
   const downloadHistory = useCallback(async () => {
     const entries = await Promise.all(
       historyRef.current.flatMap((recording, i) => {
@@ -407,6 +426,12 @@ export default function Home() {
           [`${stem}-input.${inputExt}`, recording.input],
           [`${stem}-output.wav`, recording.output],
         ];
+        if (recording.video) {
+          files.push([
+            `${stem}-tract.${recording.video.extension}`,
+            recording.video.blob,
+          ]);
+        }
         return files.map(([name, blob]) =>
           blob.arrayBuffer().then((b) => ({ name, bytes: new Uint8Array(b) })),
         );
@@ -425,13 +450,14 @@ export default function Home() {
           await synthesizeUtterance(audio);
         lastResponse.current = response;
         setOriginal(inputUrl);
-        remember({
+        const entry = remember({
           kind: "mic",
           input: inputBlob,
           output: wavBlob(response.synth_audio_b64),
         });
         setViewResponse(response);
-        await playResponse(response);
+        const video = await playResponse(response, 0, true);
+        if (video) entry.video = video;
       } catch (e) {
         busyRef.current = false;
         setError(e instanceof Error ? e.message : String(e));
@@ -588,13 +614,14 @@ export default function Home() {
           await synthesizeDatasetClip(clip);
         lastResponse.current = response;
         setOriginal(inputUrl);
-        remember({
+        const entry = remember({
           kind: "dataset",
           input: inputBlob,
           output: wavBlob(response.synth_audio_b64),
         });
         setViewResponse(response);
-        await playResponse(response);
+        const video = await playResponse(response, 0, true);
+        if (video) entry.video = video;
       } catch (e) {
         busyRef.current = false;
         setError(e instanceof Error ? e.message : String(e));
