@@ -28,10 +28,12 @@ Env:
                         dir (<run_dir>/config.json), or taken from the wandb run
                         when SAMUEL_CHECKPOINT is a run URL. Required only for a
                         bare wandb-artifact checkpoint, which has no config beside it.
-    SAMUEL_MANIFEST     dataset manifest (jsonl) for /api/dataset_clip
-                        (default: the run config's data.manifest_path)
     SAMUEL_SERVE_FRONTEND    "0" to serve only the API (no build/mount).
                              Default builds and serves the frontend.
+    SAMUEL_ALLOW_ORIGINS     comma-separated origins allowed to call /api/*
+                             cross-origin, for a separately hosted frontend
+                             (e.g. https://samuel.vvolhejn.com). Localhost is
+                             always allowed.
     SAMUEL_FRONTEND_SKIP_BUILD  "1" to serve an existing webapp/out without
                              rebuilding (fast restarts during backend work).
 """
@@ -43,7 +45,6 @@ import io
 import json
 import logging
 import os
-import random
 import re
 import shutil
 import subprocess
@@ -80,9 +81,6 @@ PYIN_FRAME_LENGTH = 4096
 # Matches the run's synth.ir_length (read raw — the stored synth block has
 # keys the current SynthConfig rejects).
 IR_LENGTH = 256
-
-# Length of the clips /api/dataset_clip serves (matches the eval chunking).
-CLIP_SECONDS = 10.0
 
 
 # https://wandb.ai/<entity>/<project>/runs/<id>[/...][?query], or the bare
@@ -169,7 +167,7 @@ def _resolve_config_path(checkpoint_path: Path) -> Path:
 
 
 # Run config for the loaded checkpoint, populated by _load_model at startup so
-# request handlers (e.g. _get_clips) can reuse it without re-resolving paths.
+# request handlers can reuse it without re-resolving paths.
 _run_cfg: dict | None = None
 # What the webapp shows for the loaded checkpoint: a wandb run URL, or the
 # resolved local .pt path (also set by _load_model).
@@ -270,16 +268,37 @@ def _encode_wav_b64(audio: np.ndarray) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+# Localhost is always allowed: it covers both the single-process setup and the
+# dev workflow (Next on :3000, uvicorn on :8471).
+_LOCALHOST_ORIGIN_RE = r"https?://(localhost|127\.0\.0\.1)(:\d+)?"
+
+
+def _allow_origin_regex() -> str:
+    """Regex of origins allowed to call /api/* cross-origin.
+
+    Adds each comma-separated origin in ``SAMUEL_ALLOW_ORIGINS`` to localhost,
+    for a frontend hosted apart from this backend (e.g. the static export on
+    https://samuel.vvolhejn.com against a Hugging Face Space).
+    """
+    extra = os.environ.get("SAMUEL_ALLOW_ORIGINS", "")
+    origins = [o.strip().rstrip("/") for o in extra.split(",") if o.strip()]
+    if origins:
+        logger.info("allowing cross-origin requests from %s", ", ".join(origins))
+    return "|".join([_LOCALHOST_ORIGIN_RE, *(re.escape(o) for o in origins)])
+
+
 app = FastAPI(title="samuel speech-mimic backend")
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"http://(localhost|127\.0\.0\.1)(:\d+)?",
+    allow_origin_regex=_allow_origin_regex(),
     allow_methods=["*"],
     allow_headers=["*"],
+    # /api/synthesize sends Content-Type: audio/wav, which is not CORS-safelisted,
+    # so every utterance preflights. Let the browser cache that for an hour.
+    max_age=3600,
 )
 
 _model: PinkTromboneController | None = None
-_clips: list[dict] | None = None
 
 
 def _build_frontend() -> Path | None:
@@ -325,10 +344,28 @@ def _build_frontend() -> Path | None:
     return _FRONTEND_DIST
 
 
+def _warm_up() -> None:
+    """Run one throwaway request so the first real one is not the slow one.
+
+    librosa's pyin is numba-jitted, and compiling it costs several seconds the
+    first time it runs — long enough to look broken to whoever speaks first
+    after the server starts. Doing it here moves the cost into startup.
+    """
+    t = np.arange(SAMPLE_RATE // 2, dtype=np.float32) / SAMPLE_RATE
+    tone = 0.3 * np.sin(2 * np.pi * 140.0 * t, dtype=np.float32)
+    try:
+        _mimic(tone)
+    except Exception as e:  # noqa: BLE001 - an optimization; never block startup
+        logger.warning("warm-up pass failed (%s); first request will be slow", e)
+    else:
+        logger.info("warm-up pass done")
+
+
 @app.on_event("startup")
 def _startup() -> None:
     global _model
     _model = _load_model()
+    _warm_up()
 
     # Mount the built frontend last, so the explicit /api/* routes (registered
     # at import time) still take precedence over the catch-all mount at "/".
@@ -336,30 +373,6 @@ def _startup() -> None:
     if dist is not None:
         app.mount("/", StaticFiles(directory=dist, html=True), name="frontend")
         logger.info("serving frontend from %s", dist)
-
-
-def _get_clips() -> list[dict]:
-    """Manifest entries long enough for CLIP_SECONDS, loaded on first use
-    (the manifest may live on a filesystem that isn't always mounted)."""
-    global _clips
-    if _clips is None:
-        manifest_path = Path(
-            os.environ.get("SAMUEL_MANIFEST") or _run_config()["data"]["manifest_path"]
-        )
-        entries = [
-            json.loads(line)
-            for line in manifest_path.read_text().splitlines()
-            if line.strip()
-        ]
-        _clips = [e for e in entries if e["duration"] >= CLIP_SECONDS]
-        logger.info(
-            "manifest %s: %d/%d clips >= %.0fs",
-            manifest_path,
-            len(_clips),
-            len(entries),
-            CLIP_SECONDS,
-        )
-    return _clips
 
 
 @app.get("/api/health")
@@ -434,48 +447,6 @@ async def synthesize(request: Request) -> dict:
     if sr != SAMPLE_RATE:
         audio = librosa.resample(audio, orig_sr=sr, target_sr=SAMPLE_RATE)
     return _mimic(audio.astype(np.float32, copy=False))
-
-
-@app.post("/api/dataset_clip")
-def dataset_clip() -> dict:
-    """Mimic a random CLIP_SECONDS window from the training manifest.
-
-    The response is /api/synthesize's payload plus the source clip itself
-    (``clip_audio_b64``) so the browser can play it before the imitation.
-    """
-    try:
-        clips = _get_clips()
-    except OSError as e:
-        raise HTTPException(status_code=503, detail=f"manifest unavailable: {e}")
-    if not clips:
-        raise HTTPException(status_code=503, detail="no manifest clip is long enough")
-
-    entry = random.choice(clips)
-    try:
-        info = sf.info(entry["path"])
-        n_clip = int(CLIP_SECONDS * info.samplerate)
-        start = random.randint(0, max(0, info.frames - n_clip))
-        audio, sr = sf.read(
-            entry["path"],
-            start=start,
-            frames=n_clip,
-            dtype="float32",
-            always_2d=False,
-        )
-    except OSError as e:
-        raise HTTPException(status_code=503, detail=f"could not read clip: {e}")
-
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
-    if sr != SAMPLE_RATE:
-        audio = librosa.resample(audio, orig_sr=sr, target_sr=SAMPLE_RATE)
-    audio = audio.astype(np.float32, copy=False)
-
-    result = _mimic(audio)
-    result["clip_path"] = entry["path"]
-    result["clip_offset_s"] = start / sr
-    result["clip_audio_b64"] = _encode_wav_b64(audio)
-    return result
 
 
 # Uncommon default port (avoids clashing with the usual 8000/8080/3000). The

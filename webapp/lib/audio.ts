@@ -1,5 +1,19 @@
 import { utils } from "@ricky0123/vad-web";
 
+/**
+ * Origin of the Python backend, without a trailing slash.
+ *
+ * Empty by default, i.e. same-origin: `samuel.server` serves this build itself,
+ * and `pnpm dev` proxies `/api/*` (see next.config.ts). Set
+ * `NEXT_PUBLIC_API_BASE` at build time to host the frontend separately from the
+ * backend — the value is inlined into the bundle by `next build`, and the
+ * backend must then allow this origin via `SAMUEL_ALLOW_ORIGINS`.
+ *
+ * Only `/api/*` uses it. Static assets (`/clips`, `/vad`, `/pink-trombone`)
+ * ship with the frontend and stay relative.
+ */
+const API_BASE = (process.env.NEXT_PUBLIC_API_BASE ?? "").replace(/\/+$/, "");
+
 /** Response of POST /api/synthesize (samuel.server). Trajectories are in
  * Pink Trombone's native units at `frame_rate` frames per second. */
 export interface SynthResponse {
@@ -13,32 +27,32 @@ export interface SynthResponse {
   synth_audio_b64: string;
 }
 
-/** Response of POST /api/dataset_clip: a synthesize payload plus the source
- * dataset clip so the browser can play it before the imitation. */
-export interface DatasetClipResponse extends SynthResponse {
-  clip_path: string;
-  clip_offset_s: number;
-  clip_audio_b64: string;
-}
-
 /** Decode one of the base64 WAV fields into a blob. */
 export function wavBlob(b64: string): Blob {
   const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
   return new Blob([bytes], { type: "audio/wav" });
 }
 
-/** Object URL for the original dataset clip. */
-export function clipAudioUrl(response: DatasetClipResponse): string {
-  return URL.createObjectURL(wavBlob(response.clip_audio_b64));
+/** One pre-recorded clip under public/clips, as listed in sources.json. That
+ * file is also the recipe the WAVs are cut from — see
+ * scripts/build_webapp_clips.py — hence the dataset fields, which the UI does
+ * not use beyond the console log. */
+export interface DatasetClip {
+  name: string;
+  source: string;
+  offset_s: number;
+  duration_s: number;
 }
 
-/** Ask the backend for a random dataset clip run through the model. */
-export async function fetchDatasetClip(): Promise<DatasetClipResponse> {
-  const res = await fetch("/api/dataset_clip", { method: "POST" });
-  if (!res.ok) {
-    throw new Error(`backend error ${res.status}: ${await res.text()}`);
-  }
-  return res.json();
+let clipIndex: Promise<DatasetClip[]> | null = null;
+
+/** The committed clip list, fetched once per page load. */
+export function fetchDatasetClips(): Promise<DatasetClip[]> {
+  clipIndex ??= fetch("/clips/sources.json").then(async (res) => {
+    if (!res.ok) throw new Error(`clip index: ${res.status}`);
+    return res.json() as Promise<DatasetClip[]>;
+  });
+  return clipIndex;
 }
 
 /**
@@ -96,16 +110,12 @@ export interface UtteranceResult {
   inputBlob: Blob;
 }
 
-/** Send one VAD utterance (Float32Array at 16 kHz) to the model backend. */
-export async function synthesizeUtterance(
-  audio: Float32Array,
-): Promise<UtteranceResult> {
-  // defaults: 32-bit float WAV, 16 kHz mono — matches what MicVAD emits
-  const wav = utils.encodeWAV(trimTrailingSilence(audio));
-  const blob = new Blob([wav], { type: "audio/wav" });
-  const res = await fetch("/api/synthesize", {
+/** Send one audio file to the model backend, which sniffs the format itself
+ * (WAV from the mic, MP3 for the pre-recorded clips). */
+async function synthesizeBlob(blob: Blob): Promise<UtteranceResult> {
+  const res = await fetch(`${API_BASE}/api/synthesize`, {
     method: "POST",
-    headers: { "Content-Type": "audio/wav" },
+    headers: { "Content-Type": blob.type || "application/octet-stream" },
     body: blob,
   });
   if (!res.ok) {
@@ -117,6 +127,24 @@ export async function synthesizeUtterance(
     inputUrl: URL.createObjectURL(blob),
     inputBlob: blob,
   };
+}
+
+/** Send one VAD utterance (Float32Array at 16 kHz) to the model backend. */
+export function synthesizeUtterance(
+  audio: Float32Array,
+): Promise<UtteranceResult> {
+  // defaults: 32-bit float WAV, 16 kHz mono — matches what MicVAD emits
+  const wav = utils.encodeWAV(trimTrailingSilence(audio));
+  return synthesizeBlob(new Blob([wav], { type: "audio/wav" }));
+}
+
+/** Run one pre-recorded clip through the model. */
+export async function synthesizeDatasetClip(
+  clip: DatasetClip,
+): Promise<UtteranceResult> {
+  const res = await fetch(`/clips/${clip.name}`);
+  if (!res.ok) throw new Error(`clip ${clip.name}: ${res.status}`);
+  return synthesizeBlob(await res.blob());
 }
 
 /** Response of GET /api/health. */
@@ -131,7 +159,7 @@ export interface HealthResponse {
 /** null when the backend is unreachable or not serving a model. */
 export async function fetchHealth(): Promise<HealthResponse | null> {
   try {
-    const res = await fetch("/api/health");
+    const res = await fetch(`${API_BASE}/api/health`);
     return res.ok ? await res.json() : null;
   } catch {
     return null;

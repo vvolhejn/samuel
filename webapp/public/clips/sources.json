@@ -1,0 +1,38 @@
+[
+  {
+    "name": "clip-06b.mp3",
+    "source": "/lustre/scwpod02/client/kyutai/datasets/librilight_segmented/train/3157/8480/riseandfall2_36_davis_64kb_0003.flac",
+    "offset_s": 39.13,
+    "duration_s": 9.27
+  },
+  {
+    "name": "clip-13b.mp3",
+    "source": "/lustre/scwpod02/client/kyutai/datasets/librilight_segmented/train/3490/3009/deathworld_08_harrison_64kb_0002.flac",
+    "offset_s": 21.03,
+    "duration_s": 10.0
+  },
+  {
+    "name": "clip-14b.mp3",
+    "source": "/lustre/scwpod02/client/kyutai/datasets/librilight_segmented/train/248/1117/eightyyears_07_stanton_64kb_0033.flac",
+    "offset_s": 14.0,
+    "duration_s": 9.4
+  },
+  {
+    "name": "clip-21b.mp3",
+    "source": "/lustre/scwpod02/client/kyutai/datasets/librilight_segmented/train/83/4505/sylviebrunoconcluded_14_carroll_64kb_0010.flac",
+    "offset_s": 20.56,
+    "duration_s": 9.0
+  },
+  {
+    "name": "clip-23b.mp3",
+    "source": "/lustre/scwpod02/client/kyutai/datasets/librilight_segmented/train/204/4067/travelsinalaska_14_muir_64kb_0019.flac",
+    "offset_s": 25.94,
+    "duration_s": 8.9
+  },
+  {
+    "name": "clip-26b.mp3",
+    "source": "/lustre/scwpod02/client/kyutai/datasets/librilight_segmented/train/4078/8463/talesofspaceandtime_02_wells_64kb_0025.flac",
+    "offset_s": 11.63,
+    "duration_s": 10.0
+  }
+]

@@ -1,18 +1,27 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import type { MicVAD } from "@ricky0123/vad-web";
 import {
-  clipAudioUrl,
-  fetchDatasetClip,
+  fetchDatasetClips,
   fetchHealth,
+  synthesizeDatasetClip,
   synthesizeUtterance,
   wavBlob,
+  DatasetClip,
   HealthResponse,
   SynthResponse,
 } from "@/lib/audio";
+import { insecureContextMessage, micErrorMessage } from "@/lib/secureContext";
 import { downloadBlob, makeZip } from "@/lib/zip";
 import { usePinkTrombone } from "@/lib/usePinkTrombone";
+import type { VideoRecording } from "@/lib/videoRecorder";
 import type { PinkTromboneElement } from "@/types/pink-trombone";
 
 type Status =
@@ -37,6 +46,9 @@ const STATUS_LABEL: Record<Status, string | null> = {
 
 const SPEEDS = [0.25, 0.5, 1] as const;
 
+/** Nothing ever invalidates the secure-context snapshot. */
+const subscribeNever = () => () => {};
+
 /** One round trip: what the model heard, and what it said back. Held in memory
  * for the whole session, so cap it — a few seconds of 16 kHz float WAV is
  * ~250 kB per side, and nothing else evicts them. */
@@ -44,10 +56,14 @@ const MAX_HISTORY = 50;
 
 interface Recording {
   kind: "mic" | "dataset";
-  /** WAV the model was given. */
+  /** Audio the model was given: a WAV from the mic, an MP3 for a clip. */
   input: Blob;
   /** WAV of the model's output, rendered by the Python synth. */
   output: Blob;
+  /** Screen capture of the tract animation with the browser synth's audio,
+   * filled in once the first playback of this response finishes. Absent when
+   * the browser can't record (see startVideoRecording). */
+  video?: VideoRecording;
 }
 
 /** Browser mic processing, toggleable so we can A/B it against training audio,
@@ -250,7 +266,7 @@ function DebugPanel({
         <button
           onClick={onDownloadHistory}
           disabled={historyCount === 0}
-          title="Zip of every utterance this session: what the model heard and what it said back"
+          title="Zip of every utterance this session: what the model heard, what it said back, and a video of the tract"
           className="rounded-full border border-neutral-300 px-3 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 disabled:opacity-40 disabled:hover:bg-transparent"
         >
           {historyCount === 0
@@ -283,7 +299,19 @@ export default function Home() {
   /** User-intended mic state — the Record/Stop toggle. Mirrors micOnRef; the
    * status alone can't stand in for it (a dataset clip is "speaking" too). */
   const [micOn, setMicOn] = useState(false);
+  /** Pre-recorded clips shipped with the app, and the last one played (which
+   * is the button left filled in). */
+  const [clips, setClips] = useState<DatasetClip[]>([]);
+  const [playedClip, setPlayedClip] = useState<string>("");
   const [debugOpen, setDebugOpen] = useState(false);
+  /** Why this origin can't run the app at all, or null. Read through
+   * useSyncExternalStore because it is a client-only fact: the exported HTML is
+   * built without an origin. */
+  const insecure = useSyncExternalStore(
+    subscribeNever,
+    insecureContextMessage,
+    () => null,
+  );
 
   const trombone = usePinkTrombone();
   const vadRef = useRef<MicVAD | null>(null);
@@ -303,8 +331,11 @@ export default function Home() {
   // Bring up the synth + tract visualization immediately; the AudioContext
   // stays suspended until the first user gesture (Start).
   useEffect(() => {
-    const element =
-      document.querySelector<PinkTromboneElement>("pink-trombone");
+    // On an insecure origin nothing here works, and starting the synth anyway
+    // is what makes the visualization glitch — see insecureContextMessage.
+    const element = insecureContextMessage()
+      ? null
+      : document.querySelector<PinkTromboneElement>("pink-trombone");
     if (element) {
       trombone.init(element).catch((e) => {
         setError(e instanceof Error ? e.message : String(e));
@@ -321,6 +352,11 @@ export default function Home() {
     void fetchHealth().then(setHealth);
   }, []);
 
+  // The pre-recorded clips, one button each.
+  useEffect(() => {
+    void fetchDatasetClips().then(setClips);
+  }, []);
+
   /** Resume VAD only if the user hasn't muted the mic. */
   const restoreMic = useCallback(async () => {
     if (scrubbingRef.current) return; // the scrub owns the synth until pointer-up
@@ -332,11 +368,17 @@ export default function Home() {
     }
   }, []);
 
+  /** With `record`, the tract animation and the synth's audio are captured for
+   * the duration of the playback and returned as a video. Only the first,
+   * automatic playback of a response is recorded — replays and scrubs would
+   * otherwise keep overwriting the session's copy. */
   const playResponse = useCallback(
-    async (response: SynthResponse, startFrac = 0) => {
+    async (response: SynthResponse, startFrac = 0, record = false) => {
       setStatus("speaking");
       setIsPlaying(true);
       await vadRef.current?.pause(); // don't let the synth retrigger the mic
+      if (record) trombone.startRecording();
+      let video: VideoRecording | null = null;
       try {
         await trombone.speak(response, {
           speed: speedRef.current,
@@ -344,10 +386,14 @@ export default function Home() {
           onProgress: setScrubFrac,
         });
       } finally {
+        // In the finally so a failed speak() can't leave a capture running:
+        // startRecording() would then refuse the next one.
+        if (record) video = await trombone.stopRecording();
         setIsPlaying(false);
         busyRef.current = false;
         await restoreMic();
       }
+      return video;
     },
     [trombone, restoreMic],
   );
@@ -359,26 +405,36 @@ export default function Home() {
     setHasOriginal(true);
   }, []);
 
+  /** Returns the stored entry, which the caller may still fill in (the video
+   * only exists once the response has finished playing). */
   const remember = useCallback((recording: Recording) => {
     const history = historyRef.current;
     history.push(recording);
     if (history.length > MAX_HISTORY) history.splice(0, history.length - MAX_HISTORY);
     setHistoryCount(history.length);
+    return recording;
   }, []);
 
-  /** One zip of every input/output pair this session. */
+  /** One zip of every input/output pair this session, plus the tract video for
+   * each. */
   const downloadHistory = useCallback(async () => {
     const entries = await Promise.all(
       historyRef.current.flatMap((recording, i) => {
         const stem = `${String(i + 1).padStart(2, "0")}-${recording.kind}`;
-        return [
-          recording.input
-            .arrayBuffer()
-            .then((b) => ({ name: `${stem}-input.wav`, bytes: new Uint8Array(b) })),
-          recording.output
-            .arrayBuffer()
-            .then((b) => ({ name: `${stem}-output.wav`, bytes: new Uint8Array(b) })),
+        const inputExt = recording.input.type === "audio/mpeg" ? "mp3" : "wav";
+        const files: Array<[string, Blob]> = [
+          [`${stem}-input.${inputExt}`, recording.input],
+          [`${stem}-output.wav`, recording.output],
         ];
+        if (recording.video) {
+          files.push([
+            `${stem}-tract.${recording.video.extension}`,
+            recording.video.blob,
+          ]);
+        }
+        return files.map(([name, blob]) =>
+          blob.arrayBuffer().then((b) => ({ name, bytes: new Uint8Array(b) })),
+        );
       }),
     );
     downloadBlob(makeZip(entries), "samuel-session.zip");
@@ -394,13 +450,14 @@ export default function Home() {
           await synthesizeUtterance(audio);
         lastResponse.current = response;
         setOriginal(inputUrl);
-        remember({
+        const entry = remember({
           kind: "mic",
           input: inputBlob,
           output: wavBlob(response.synth_audio_b64),
         });
         setViewResponse(response);
-        await playResponse(response);
+        const video = await playResponse(response, 0, true);
+        if (video) entry.video = video;
       } catch (e) {
         busyRef.current = false;
         setError(e instanceof Error ? e.message : String(e));
@@ -454,7 +511,7 @@ export default function Home() {
       await vadRef.current.start();
       setStatus("listening");
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(micErrorMessage(e));
       micOnRef.current = false;
       setMicOn(false);
       setStatus(vadRef.current ? "muted" : "idle");
@@ -468,14 +525,22 @@ export default function Home() {
     if (!busyRef.current) setStatus("muted");
   }, []);
 
-  // Leaving the tab shouldn't leave a live mic behind: mute on hide, and stay
+  // Leaving shouldn't leave a live mic behind: mute when the tab is hidden or
+  // the window loses focus (another window on top still hears you), and stay
   // muted on return so coming back is an explicit user gesture.
   useEffect(() => {
-    const onHide = () => {
-      if (document.hidden && micOnRef.current) void stopMic();
+    const leave = () => {
+      if (micOnRef.current) void stopMic();
     };
-    document.addEventListener("visibilitychange", onHide);
-    return () => document.removeEventListener("visibilitychange", onHide);
+    const onVisibility = () => {
+      if (document.hidden) leave();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("blur", leave);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("blur", leave);
+    };
   }, [stopMic]);
 
   /** Flip one mic-processing flag. If we're listening right now, cycle the
@@ -495,7 +560,7 @@ export default function Home() {
       await vad.pause();
       await vad.start();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(micErrorMessage(e));
     }
   }, []);
 
@@ -532,30 +597,39 @@ export default function Home() {
     });
   }, []);
 
-  const playDatasetClip = useCallback(async () => {
-    if (busyRef.current) return;
-    busyRef.current = true;
-    setError(null);
-    setStatus("processing");
-    await vadRef.current?.pause();
-    try {
-      await trombone.resume(); // we're in a user gesture
-      const response = await fetchDatasetClip();
-      lastResponse.current = response;
-      setOriginal(clipAudioUrl(response));
-      remember({
-        kind: "dataset",
-        input: wavBlob(response.clip_audio_b64),
-        output: wavBlob(response.synth_audio_b64),
-      });
-      setViewResponse(response);
-      await playResponse(response);
-    } catch (e) {
-      busyRef.current = false;
-      setError(e instanceof Error ? e.message : String(e));
-      await restoreMic();
-    }
-  }, [trombone, playResponse, restoreMic, setOriginal, remember]);
+  /** Mimic one of the pre-recorded clips. */
+  const playClip = useCallback(
+    async (name: string) => {
+      const clip = clips.find((c) => c.name === name);
+      if (!clip || busyRef.current) return;
+      busyRef.current = true;
+      setError(null);
+      setPlayedClip(name);
+      setStatus("processing");
+      await vadRef.current?.pause();
+      try {
+        await trombone.resume(); // we're in a user gesture
+        console.log(`${clip.name}: ${clip.source} @${clip.offset_s}s`);
+        const { response, inputUrl, inputBlob } =
+          await synthesizeDatasetClip(clip);
+        lastResponse.current = response;
+        setOriginal(inputUrl);
+        const entry = remember({
+          kind: "dataset",
+          input: inputBlob,
+          output: wavBlob(response.synth_audio_b64),
+        });
+        setViewResponse(response);
+        const video = await playResponse(response, 0, true);
+        if (video) entry.video = video;
+      } catch (e) {
+        busyRef.current = false;
+        setError(e instanceof Error ? e.message : String(e));
+        await restoreMic();
+      }
+    },
+    [clips, trombone, playResponse, restoreMic, setOriginal, remember],
+  );
 
   /** Play from the scrub position (or the start, if at the end); pause if
    * already playing. */
@@ -640,7 +714,8 @@ export default function Home() {
   // door must not disable the buttons, or every other click gets swallowed
   // while it flaps. busyRef is the real guard, and starting a playback pauses
   // the VAD, which discards the in-flight segment.
-  const notBusy = status !== "processing" && status !== "speaking";
+  const notBusy =
+    insecure === null && status !== "processing" && status !== "speaking";
   const canReplay = viewResponse !== null && notBusy;
   const canPlayOriginal = hasOriginal && notBusy;
   const canScrub = viewResponse !== null && status !== "processing";
@@ -663,28 +738,51 @@ export default function Home() {
 
           <button
             onClick={() => void (micOn ? stopMic() : startMic())}
+            disabled={insecure !== null}
             title={
-              micOn
-                ? "Stop listening"
-                : "Listen continuously and mimic every utterance"
+              insecure
+                ? "Unavailable on an insecure origin"
+                : micOn
+                  ? "Stop listening"
+                  : "Listen continuously and mimic every utterance"
             }
             className={
               micOn
-                ? "rounded-full border border-fuchsia-300 px-4 py-1.5 text-sm font-medium text-fuchsia-700 hover:bg-fuchsia-50"
-                : "rounded-full bg-fuchsia-600 px-4 py-1.5 text-sm font-semibold text-white hover:bg-fuchsia-700"
+                ? "rounded-full border border-fuchsia-300 px-4 py-1.5 text-sm font-medium text-fuchsia-700 hover:bg-fuchsia-50 disabled:opacity-40"
+                : "rounded-full bg-fuchsia-600 px-4 py-1.5 text-sm font-semibold text-white hover:bg-fuchsia-700 disabled:opacity-40 disabled:hover:bg-fuchsia-600"
             }
           >
             {micOn ? "Stop" : "Microphone"}
           </button>
 
-          <button
-            onClick={playDatasetClip}
-            disabled={!notBusy}
-            title="Mimic a random 10s clip from the training dataset"
-            className="rounded-full border border-sky-300 px-4 py-1.5 text-sm font-medium text-sky-700 hover:bg-sky-50 disabled:opacity-40 disabled:hover:bg-transparent"
-          >
-            Pre-recorded
-          </button>
+          {/* One button per committed clip, numbered rather than named: which
+              recording is which only matters once you've heard them. */}
+          <div className="flex flex-col gap-1">
+            <div className="text-xs font-medium text-neutral-500">
+              Dataset clip
+            </div>
+            <div className="grid grid-cols-3 gap-1.5">
+              {clips.map((clip, i) => (
+                <button
+                  key={clip.name}
+                  onClick={() => void playClip(clip.name)}
+                  disabled={!notBusy}
+                  title={
+                    insecure
+                      ? "Unavailable on an insecure origin"
+                      : `Mimic ${clip.duration_s.toFixed(0)}s of held-out speech`
+                  }
+                  className={
+                    clip.name === playedClip
+                      ? "rounded-md bg-sky-600 px-3 py-1 text-sm font-semibold text-white disabled:opacity-40"
+                      : "rounded-md border border-sky-300 px-3 py-1 text-sm font-medium text-sky-700 hover:bg-sky-50 disabled:opacity-40 disabled:hover:bg-transparent"
+                  }
+                >
+                  {i + 1}
+                </button>
+              ))}
+            </div>
+          </div>
 
           {STATUS_LABEL[status] && (
             <span className="text-sm text-neutral-500">
@@ -767,6 +865,12 @@ export default function Home() {
           </div>
         </div>
 
+        {insecure && (
+          <p className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">
+            {insecure}
+          </p>
+        )}
+
         {error && <p className="text-sm text-red-600">{error}</p>}
 
         <DebugPanel
@@ -786,11 +890,15 @@ export default function Home() {
       </div>
 
       {/* The element's canvases are a fixed 600×500 anchored top-left, so
-          size the host to match rather than letting it stretch. */}
-      <pink-trombone
-        className="block h-[500px] w-[600px] shrink-0"
-        inactive={tractActive ? undefined : "true"}
-      />
+          size the host to match rather than letting it stretch. Left out
+          entirely on an insecure origin, where it would stay blank: the synth
+          it draws is never started there. */}
+      {insecure === null && (
+        <pink-trombone
+          className="block h-[500px] w-[600px] shrink-0"
+          inactive={tractActive ? undefined : "true"}
+        />
+      )}
     </main>
   );
 }
