@@ -6,6 +6,11 @@
   "main": "worker/index.ts",
   "compatibility_date": "2026-08-11",
 
+  // Cloudflare is authoritative DNS for the zone, so it creates the record and
+  // issues the certificate itself. Declaring any route turns the
+  // samuel.<subdomain>.workers.dev URL off; set "workers_dev": true to keep it.
+  "routes": [{ "pattern": "samuel.vvolhejn.com", "custom_domain": true }],
+
   "assets": {
     "directory": "./out",
     "not_found_handling": "404-page",
@@ -26,7 +31,7 @@
       // would be silently ignored.
       "image_vars": {
         "MODEL_REPO": "vvolhejn/samuel",
-        "MODEL_REVISION": "main"
+        "MODEL_REVISION": "d6b5c34d39bbffb1e7faa4ea7bc7518c0297f813"
       },
       // 2 vCPU / 8 GiB. The thread counts in the Dockerfile match this.
       "instance_type": "standard-3",

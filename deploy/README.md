@@ -1,5 +1,7 @@
 # Deploying to Cloudflare, as one Worker
 
+**Note to humans: slop below, refer to main README**
+
 `webapp/wrangler.jsonc` deploys a single Worker that serves the Next.js static
 export from `webapp/out/` and routes `/api/*` to the Python backend running as a
 Cloudflare Container. Both halves share an origin, so the frontend's `/api/*`
@@ -9,17 +11,13 @@ Requires the Workers Paid plan — containers have no free tier.
 
 ## Status
 
-Nothing has been deployed yet. Validated so far: `pnpm build`, the image build,
-and the container serving `/api/health` locally (~10 s cold start). Still to do,
-in order — delete this section once it is done:
+Live at https://samuel.vvolhejn.com. Still open, optionally: connect the git
+repo and read one build log to settle whether Cloudflare's builder has Docker
+(see "Deploying from git instead").
 
-1. Create the Hub model repo and upload the checkpoint (see below). Until then
-   the image build fails at the download step with an auth error, because the
-   Hub returns 401 rather than 404 for a repo that does not exist.
-2. `wrangler deploy` from a machine with Docker.
-3. Attach `samuel.vvolhejn.com` as a custom domain.
-4. Optionally connect the git repo and check one build log for whether
-   Cloudflare's builder has Docker (see "Deploying from git instead").
+A freshly created container application sits in `provisioning` for a few minutes
+after the first deploy, during which `/api/*` returns 500 with "The container
+service is unreachable". Watch it with `wrangler containers list`.
 
 ## Weights
 
@@ -98,7 +96,10 @@ checkpoint load.
 
 ## Custom domain
 
-`wrangler deploy` publishes to `samuel.<subdomain>.workers.dev`. To serve it at
-`samuel.vvolhejn.com`, add that hostname as a custom domain on the Worker
-(Cloudflare must be the authoritative DNS for the zone) and it issues the
-certificate itself.
+`samuel.vvolhejn.com` is declared as a custom-domain route in
+`webapp/wrangler.jsonc`, so `wrangler deploy` attaches it; no dashboard step.
+Cloudflare is authoritative DNS for the zone, so it creates the record and
+issues the certificate itself.
+
+Declaring any route disables the `samuel.<subdomain>.workers.dev` URL. Add
+`"workers_dev": true` to keep that one as well.

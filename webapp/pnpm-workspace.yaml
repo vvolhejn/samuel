@@ -1,6 +1,11 @@
 packages:
   - "."
 
-ignoredBuiltDependencies:
-  - sharp
-  - unrs-resolver
+# esbuild and workerd fetch/link their platform binaries in a postinstall;
+# wrangler needs both. The rest build native addons we do not use.
+allowBuilds:
+  esbuild: true
+  workerd: true
+  protobufjs: false
+  sharp: false
+  unrs-resolver: false
