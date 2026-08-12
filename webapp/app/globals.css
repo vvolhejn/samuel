@@ -1,10 +1,20 @@
 @import "tailwindcss";
 
-/* Light theme; highlight pink matches maps.vvolhejn.com (Tailwind fuchsia). */
+/* Light theme. */
 :root {
   --background: #ffffff;
   --foreground: #1c1520;
   color-scheme: light;
+}
+
+/* The accent colour: #f92672, plus tint/shade steps on the same oklch hue,
+   borrowing the lightness/chroma of Tailwind's own 50/300/700 steps (700 is
+   pulled in slightly, since the literal values fall outside sRGB). */
+@theme {
+  --color-highlight-50: oklch(97.7% 0.017 7.47);
+  --color-highlight-300: oklch(83.3% 0.145 7.47);
+  --color-highlight-600: oklch(64.2% 0.24 7.47);
+  --color-highlight-700: oklch(56% 0.22 7.47);
 }
 
 @theme inline {

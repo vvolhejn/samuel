@@ -153,6 +153,28 @@ function Ellipsis() {
   );
 }
 
+/** A link in the prose. Anything off-origin opens in a new tab — which, as it
+ * stands, is every link here. */
+function TextLink({
+  href,
+  children,
+}: {
+  href: string;
+  children: React.ReactNode;
+}) {
+  const external = /^(https?:)?\/\//.test(href);
+  return (
+    <a
+      href={href}
+      target={external ? "_blank" : undefined}
+      rel={external ? "noreferrer" : undefined}
+      className="text-highlight-600 underline decoration-dotted hover:text-highlight-700"
+    >
+      {children}
+    </a>
+  );
+}
+
 function SectionTitle({ children }: { children: React.ReactNode }) {
   return (
     <span className="font-semibold tracking-wide text-neutral-600 uppercase">
@@ -203,7 +225,7 @@ function DebugPanel({
         <button
           onClick={onToggle}
           title="Hide the debug panel"
-          className="text-neutral-400 hover:text-fuchsia-600"
+          className="text-neutral-400 hover:text-highlight-600"
         >
           hide
         </button>
@@ -220,7 +242,7 @@ function DebugPanel({
                 href={health.checkpoint}
                 target="_blank"
                 rel="noreferrer"
-                className="underline decoration-dotted hover:text-fuchsia-600"
+                className="underline decoration-dotted hover:text-highlight-600"
               >
                 {health.checkpoint}
               </a>
@@ -246,7 +268,7 @@ function DebugPanel({
                 type="checkbox"
                 checked={micProcessing[key]}
                 onChange={() => onToggleMicProcessing(key)}
-                className="accent-fuchsia-600"
+                className="accent-highlight-600"
               />
               {label}
             </label>
@@ -393,7 +415,8 @@ export default function Home() {
   const remember = useCallback((recording: Recording) => {
     const history = historyRef.current;
     history.push(recording);
-    if (history.length > MAX_HISTORY) history.splice(0, history.length - MAX_HISTORY);
+    if (history.length > MAX_HISTORY)
+      history.splice(0, history.length - MAX_HISTORY);
     setHistoryCount(history.length);
   }, []);
 
@@ -699,41 +722,56 @@ export default function Home() {
   return (
     <main className="flex flex-1 flex-wrap items-start gap-8 p-8">
       {/* Left: everything you operate. Right: the thing you look at. */}
-      <div className="flex min-w-md max-w-md flex-1 flex-col items-start gap-6">
+      <div className="flex min-w-md max-w-md flex-1 flex-col items-start gap-4">
         <header>
-          <h1 className="text-5xl font-bold text-fuchsia-600">Samuel</h1>
+          <h1 className="text-5xl font-bold text-highlight-600">Samuel</h1>
         </header>
-        {/* <div className="text-neutral-500">
-          TODO write description
-        </div> */}
-        <div className="flex flex-wrap items-center gap-3">
+        {/* TODO: write the real intro. */}
+        <p className="text-neutral-600">
+          Samuel is a model that learns to control this silly mouth on the right
+          to mimic speech. Say something and it will parrot after you, or if
+          you&apos;re shy, try one of the pre-made clips.
+        </p>
+        <p className="text-neutral-600">
+          The mouth itself is Pink Trombone, a project originally by{" "}
+          <TextLink href="https://dood.al/pinktrombone/">Neil Thapen</TextLink>,
+          described by
+          him as &quot;bare-handed speech synthesis&quot;. It&apos;s the QWOP of
+          text-to-speech.
+        </p>
+        <p className="text-neutral-600">
+          Made by <TextLink href="https://vvolhejn.com">Václav Volhejn</TextLink>
+          .
+        </p>
+        <div className="flex w-full flex-col gap-2">
           <div className="font-bold text-neutral-500">Audio input</div>
 
-          <button
-            onClick={() => void (micOn ? stopMic() : startMic())}
-            disabled={insecure !== null}
-            title={
-              insecure
-                ? "Unavailable on an insecure origin"
-                : micOn
-                  ? "Stop listening"
-                  : "Listen continuously and mimic every utterance"
-            }
-            className={
-              micOn
-                ? "rounded-full border border-fuchsia-300 px-4 py-1.5 text-sm font-medium text-fuchsia-700 hover:bg-fuchsia-50 disabled:opacity-40"
-                : "rounded-full bg-fuchsia-600 px-4 py-1.5 text-sm font-semibold text-white hover:bg-fuchsia-700 disabled:opacity-40 disabled:hover:bg-fuchsia-600"
-            }
-          >
-            {micOn ? "Stop" : "Microphone"}
-          </button>
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              onClick={() => void (micOn ? stopMic() : startMic())}
+              disabled={insecure !== null}
+              title={
+                insecure
+                  ? "Unavailable on an insecure origin"
+                  : micOn
+                    ? "Stop listening"
+                    : "Listen continuously and mimic every utterance"
+              }
+              className={
+                micOn
+                  ? "rounded-full border border-highlight-300 px-4 py-1.5 text-sm font-medium text-highlight-700 hover:bg-highlight-50 disabled:opacity-40"
+                  : "rounded-full bg-highlight-600 px-4 py-1.5 text-sm font-semibold text-white hover:bg-highlight-700 disabled:opacity-40 disabled:hover:bg-highlight-600"
+              }
+            >
+              {micOn ? "Stop" : "Microphone"}
+            </button>
 
-          {/* One button per committed clip, numbered rather than named: which
-              recording is which only matters once you've heard them. */}
-          <div className="flex flex-col gap-1">
-            <div className="text-xs font-medium text-neutral-500">
-              Dataset clip
-            </div>
+            <span className="text-sm text-neutral-500">
+              or use pre-recorded audio
+            </span>
+
+            {/* One button per committed clip, numbered rather than named: which
+                recording is which only matters once you've heard them. */}
             <div className="grid grid-cols-3 gap-1.5">
               {clips.map((clip, i) => (
                 <button
@@ -755,16 +793,15 @@ export default function Home() {
                 </button>
               ))}
             </div>
+
+            {STATUS_LABEL[status] && (
+              <span className="text-sm text-neutral-500">
+                {STATUS_LABEL[status]}
+                <Ellipsis />
+              </span>
+            )}
           </div>
-
-          {STATUS_LABEL[status] && (
-            <span className="text-sm text-neutral-500">
-              {STATUS_LABEL[status]}
-              <Ellipsis />
-            </span>
-          )}
         </div>
-
         <div className="flex w-full flex-col gap-3">
           <div className="flex items-center gap-3">
             {/* Own chevron: the native one is glued to the border box, so padding
@@ -774,7 +811,7 @@ export default function Home() {
                 value={speed}
                 onChange={(e) => changeSpeed(Number(e.currentTarget.value))}
                 title="Playback speed"
-                className="appearance-none rounded-full border border-neutral-300 py-1 pr-7 pl-2.5 text-xs font-medium text-neutral-600 hover:border-fuchsia-300 hover:text-fuchsia-700"
+                className="appearance-none rounded-full border border-neutral-300 py-1 pr-7 pl-2.5 text-xs font-medium text-neutral-600 hover:border-highlight-300 hover:text-highlight-700"
               >
                 {SPEEDS.map((s) => (
                   <option key={s} value={s}>
@@ -794,12 +831,12 @@ export default function Home() {
                 made from. Whichever is playing offers Pause; the other is out of
                 reach until it stops, since they'd fight over the mic and busy
                 flag. */}
-            <div className="flex shrink-0 overflow-hidden rounded-full border border-fuchsia-300 text-sm">
+            <div className="flex shrink-0 overflow-hidden rounded-full border border-highlight-300 text-sm">
               <button
                 onClick={togglePlay}
                 disabled={!canReplay && !isPlaying}
                 title="Play the model's imitation from the scrub position"
-                className="w-24 bg-fuchsia-600 py-1.5 font-semibold text-white hover:bg-fuchsia-700 disabled:opacity-40 disabled:hover:bg-fuchsia-600"
+                className="w-24 bg-highlight-600 py-1.5 font-semibold text-white hover:bg-highlight-700 disabled:opacity-40 disabled:hover:bg-highlight-600"
               >
                 {isPlaying ? "Pause" : "Play"}
               </button>
@@ -807,7 +844,7 @@ export default function Home() {
                 onClick={() => void toggleOriginal()}
                 disabled={!canPlayOriginal && !playingOriginal}
                 title="Play the audio the model heard, at its recorded level"
-                className="w-24 border-l border-fuchsia-300 py-1.5 font-medium text-fuchsia-700 hover:bg-fuchsia-50 disabled:opacity-40 disabled:hover:bg-transparent"
+                className="w-24 border-l border-highlight-300 py-1.5 font-medium text-highlight-700 hover:bg-highlight-50 disabled:opacity-40 disabled:hover:bg-transparent"
               >
                 {playingOriginal ? "Pause" : "Original"}
               </button>
@@ -827,7 +864,7 @@ export default function Home() {
               onPointerUp={() => void onScrubEnd()}
               onKeyUp={() => void onScrubEnd()}
               onBlur={() => void onScrubEnd()}
-              className="flex-1 accent-fuchsia-600 disabled:opacity-40"
+              className="flex-1 accent-highlight-600 disabled:opacity-40"
             />
 
             <span className="w-12 text-right text-xs tabular-nums text-neutral-500">
@@ -837,29 +874,27 @@ export default function Home() {
             </span>
           </div>
         </div>
-
         {insecure && (
           <p className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">
             {insecure}
           </p>
         )}
-
         {error && <p className="text-sm text-red-600">{error}</p>}
-
-        <DebugPanel
-          open={debugOpen}
-          onToggle={() => setDebugOpen((v) => !v)}
-          health={health}
-          response={viewResponse}
-          frac={scrubFrac}
-          micProcessing={micProcessing}
-          onToggleMicProcessing={(key) => void toggleMicProcessing(key)}
-          historyCount={historyCount}
-          onDownloadHistory={() => void downloadHistory()}
-        />
-
-        {/* Placeholder — prose about the project goes here. */}
-        <div className="w-full" />
+        {/* Dev-only: inlined at build time, so the deployed bundle has no
+            debug UI at all. */}
+        {process.env.NODE_ENV === "development" && (
+          <DebugPanel
+            open={debugOpen}
+            onToggle={() => setDebugOpen((v) => !v)}
+            health={health}
+            response={viewResponse}
+            frac={scrubFrac}
+            micProcessing={micProcessing}
+            onToggleMicProcessing={(key) => void toggleMicProcessing(key)}
+            historyCount={historyCount}
+            onDownloadHistory={() => void downloadHistory()}
+          />
+        )}
       </div>
 
       {/* The element's canvases are a fixed 600×500 anchored top-left, so

@@ -4,8 +4,8 @@
                   phoneme labels (the original leaves drawPositions disabled)
                   and draw the anatomical background layer instead; use the
                   webapp's Helvetica Neue stack rather than Arial
-      2026-08-09  recolour the tract onto the webapp's Tailwind fuchsia ramp
-                  (was pink/palePink/orchid/#C070C6), plus a grey "inactive"
+      2026-08-09  recolour the tract onto the webapp's accent ramp (was
+                  pink/palePink/orchid/#C070C6), plus a grey "inactive"
                   scheme for when the page has no audio input selected
 
     TODO
@@ -15,16 +15,16 @@
 // Matches the webapp's --font-sans stack (webapp/app/globals.css).
 const FONT_FAMILY = '"Helvetica Neue", Helvetica, Arial, Roboto, "Noto Sans", sans-serif';
 
-// Tailwind v4 ramps, so the tract matches the webapp's palette. (sRGB hex of
-// the oklch() values in tailwindcss/theme.css.) The active scheme replaces the
-// original pink/palePink/orchid/#C070C6; the inactive one greys the whole tract
-// out while there is no audio input selected.
+// The webapp's accent ramp (--color-highlight-* in webapp/app/globals.css):
+// #f92672 and steps at the same oklch hue, as sRGB hex. The active scheme
+// replaces the original pink/palePink/orchid/#C070C6; the inactive one greys
+// the whole tract out while there is no audio input selected.
 const COLOR_SCHEMES = {
   active: {
-    tongueControl: "#fae8ff", // fuchsia-100 — the tongue-control pad
-    tract: "#f4a8ff", // fuchsia-300 — tract/nose fill
-    wall: "#c800de", // fuchsia-600 — tract outline
-    accent: "#e12afb", // fuchsia-500 — labels, markers, amplitudes
+    tongueControl: "#ffe7eb", // ~highlight-100 — the tongue-control pad
+    tract: "#ffa7ba", // ~highlight-300 — tract/nose fill
+    wall: "#d40c5d", // highlight-700 — tract outline
+    accent: "#f92672", // highlight-600 — labels, markers, amplitudes
     innerLabel: "#ffffff", // labels drawn inside the tract
   },
   inactive: {
