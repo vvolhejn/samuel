@@ -10,6 +10,7 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@cloudflare/containers": "^0.3.7",
     "@ricky0123/vad-web": "^0.0.30",
     "next": "16.2.10",
     "react": "19.2.4",
@@ -23,6 +24,7 @@
     "eslint": "^9",
     "eslint-config-next": "16.2.10",
     "tailwindcss": "^4",
-    "typescript": "^5"
+    "typescript": "^5",
+    "wrangler": "~4.120.1"
   }
 }

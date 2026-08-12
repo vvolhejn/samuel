@@ -8,3 +8,6 @@ manifests/
 artifacts/
 logs/
 train.log
+
+# staged for the Cloudflare container image (see deploy/README.md)
+deploy/model/
