@@ -8,7 +8,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-08-02T09:37:21.083631211Z"
+exclude-newer = "2026-08-06T21:05:20.118944Z"
 exclude-newer-span = "P1W"
 
 [[package]]
@@ -2532,6 +2532,7 @@ dependencies = [
 [package.optional-dependencies]
 server = [
     { name = "fastapi" },
+    { name = "huggingface-hub" },
     { name = "uvicorn" },
 ]
 
@@ -2547,6 +2548,7 @@ requires-dist = [
     { name = "einops", specifier = ">=0.8.2" },
     { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.115" },
     { name = "faster-whisper", specifier = ">=1.0" },
+    { name = "huggingface-hub", marker = "extra == 'server'", specifier = ">=0.27" },
     { name = "hydra-core", specifier = ">=1.3" },
     { name = "jiwer", specifier = ">=3.0" },
     { name = "julius", specifier = ">=0.2.8" },

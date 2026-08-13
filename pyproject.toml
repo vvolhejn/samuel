@@ -31,6 +31,8 @@ dependencies = [
 [project.optional-dependencies]
 server = [
     "fastapi>=0.115",
+    # The default checkpoint is downloaded from the Hub, see samuel.server.
+    "huggingface-hub>=0.27",
     "uvicorn>=0.30",
 ]
 

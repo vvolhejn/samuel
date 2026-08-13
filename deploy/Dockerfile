@@ -27,6 +27,10 @@ RUN pip install --no-cache-dir \
 # from a git checkout alone — runs/ is 64 GB and never leaves the cluster. The
 # repo is public, so no credentials are needed here.
 #
+# This is the same repo samuel.server downloads by default; it is baked in at
+# build time (and SAMUEL_CHECKPOINT points at the local copy below) so the
+# container never fetches at startup and the revision is pinned by the image.
+#
 # Pin MODEL_REVISION to a commit: with a branch name, Docker caches this layer
 # and a newer checkpoint on the Hub is silently ignored.
 ARG MODEL_REPO=vvolhejn/samuel

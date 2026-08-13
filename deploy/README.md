@@ -46,6 +46,18 @@ upload produced. It defaults to `main`, which works but is cache-unsafe: Docker
 keys the download layer on the revision string, so a new checkpoint pushed to
 the same branch is silently ignored until the pin changes.
 
+A new checkpoint also invalidates the six precomputed clip answers the frontend
+ships (`webapp/public/clips/precomputed/`), so regenerate them against a backend
+running the new weights:
+
+```bash
+uv run python scripts/precompute_clip_responses.py
+```
+
+Until that is done the clips still work — the frontend notices the fingerprint
+mismatch and asks the backend instead — but they demo the old model. See the
+script's docstring.
+
 `deploy/model/` is gitignored — it is only a staging area for the upload.
 
 ## Deploying

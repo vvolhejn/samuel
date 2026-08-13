@@ -11,11 +11,14 @@ import type { MicVAD } from "@ricky0123/vad-web";
 import {
   fetchDatasetClips,
   fetchHealth,
+  fetchPrecomputedIndex,
+  precomputedMatches,
   synthesizeDatasetClip,
   synthesizeUtterance,
   wavBlob,
   DatasetClip,
   HealthResponse,
+  PrecomputedIndex,
   SynthResponse,
 } from "@/lib/audio";
 import { insecureContextMessage, micErrorMessage } from "@/lib/secureContext";
@@ -24,24 +27,19 @@ import { usePinkTrombone } from "@/lib/usePinkTrombone";
 import type { PinkTromboneElement } from "@/types/pink-trombone";
 
 type Status =
-  | "idle"
-  | "listening"
-  | "recording"
-  | "processing"
-  | "speaking"
-  | "muted";
+  "idle" | "listening" | "recording" | "processing" | "speaking" | "muted";
 
-/** Shown next to the transport controls, each followed by an animated ellipsis
- * (so no trailing "…" here). `null` states say nothing: the Record button
- * already reads as "the mic is off". */
-const STATUS_LABEL: Record<Status, string | null> = {
-  idle: null,
-  muted: null,
-  listening: "Listening",
-  recording: "Hearing you",
-  processing: "Thinking",
-  speaking: "Speaking back",
-};
+/** The three stages of the page, in the order you use them. Exactly one is
+ * highlighted at a time, which is how the eye gets handed along. */
+type Section = "input" | "playback" | "tract";
+
+/** Faint box around a stage; the active one takes the accent border. Padding is
+ * left to the call site — the tract host is a fixed 600×500 and wants less. */
+function sectionBox(active: boolean): string {
+  return `rounded-xl border transition-colors ${
+    active ? "border-highlight-300 bg-highlight-50/60" : "border-neutral-200"
+  }`;
+}
 
 const SPEEDS = [0.25, 0.5, 1] as const;
 
@@ -57,8 +55,22 @@ interface Recording {
   kind: "mic" | "dataset";
   /** Audio the model was given: a WAV from the mic, an MP3 for a clip. */
   input: Blob;
-  /** WAV of the model's output, rendered by the Python synth. */
-  output: Blob;
+  /** WAV of the model's output, rendered by the Python synth. Null for a
+   * precomputed clip: those responses drop the reference audio. */
+  output: Blob | null;
+}
+
+/** How long a precomputed clip pretends to think, in ms. The answer is on disk
+ * and comes back in no time, which reads as a button that didn't work — and
+ * makes the six clips feel unlike the mic, which really does take a moment. */
+const FAKE_THINKING_MS = [500, 1000] as const;
+
+const sleep = (ms: number) =>
+  new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+function fakeThinking(): Promise<void> {
+  const [lo, hi] = FAKE_THINKING_MS;
+  return sleep(lo + Math.random() * (hi - lo));
 }
 
 /** Browser mic processing, toggleable so we can A/B it against training audio,
@@ -190,6 +202,7 @@ function DebugPanel({
   open,
   onToggle,
   health,
+  precomputed,
   response,
   frac,
   micProcessing,
@@ -200,6 +213,7 @@ function DebugPanel({
   open: boolean;
   onToggle: () => void;
   health: HealthResponse | null;
+  precomputed: PrecomputedIndex | null;
   response: SynthResponse | null;
   frac: number;
   micProcessing: MicProcessing;
@@ -252,6 +266,27 @@ function DebugPanel({
           </p>
         ) : (
           <p className="text-neutral-400">backend unreachable</p>
+        )}
+      </section>
+
+      <section>
+        <div className="mb-1">
+          <SectionTitle>precomputed clips</SectionTitle>
+        </div>
+        {!precomputed ? (
+          <p className="text-neutral-500">
+            none committed — every clip goes to the backend
+          </p>
+        ) : precomputedMatches(precomputed, health?.model_fingerprint) ? (
+          <p className="font-mono text-neutral-500">
+            {precomputed.clips.length} clip(s), {precomputed.model_fingerprint}
+          </p>
+        ) : (
+          <p className="text-red-600">
+            stale: made by {precomputed.model_fingerprint}, backend serves{" "}
+            {health?.model_fingerprint}. Falling back to the backend — re-run{" "}
+            <code>scripts/precompute_clip_responses.py</code>.
+          </p>
         )}
       </section>
 
@@ -320,6 +355,8 @@ export default function Home() {
    * is the button left filled in). */
   const [clips, setClips] = useState<DatasetClip[]>([]);
   const [playedClip, setPlayedClip] = useState<string>("");
+  /** The committed clip answers, if any were generated for this checkpoint. */
+  const [precomputed, setPrecomputed] = useState<PrecomputedIndex | null>(null);
   const [debugOpen, setDebugOpen] = useState(false);
   /** Why this origin can't run the app at all, or null. Read through
    * useSyncExternalStore because it is a client-only fact: the exported HTML is
@@ -369,9 +406,10 @@ export default function Home() {
     void fetchHealth().then(setHealth);
   }, []);
 
-  // The pre-recorded clips, one button each.
+  // The pre-recorded clips, one button each, and the answers committed for them.
   useEffect(() => {
     void fetchDatasetClips().then(setClips);
+    void fetchPrecomputedIndex().then(setPrecomputed);
   }, []);
 
   /** Resume VAD only if the user hasn't muted the mic. */
@@ -428,8 +466,10 @@ export default function Home() {
         const inputExt = recording.input.type === "audio/mpeg" ? "mp3" : "wav";
         const files: Array<[string, Blob]> = [
           [`${stem}-input.${inputExt}`, recording.input],
-          [`${stem}-output.wav`, recording.output],
         ];
+        // Absent for a precomputed clip — see Recording.output.
+        if (recording.output)
+          files.push([`${stem}-output.wav`, recording.output]);
         return files.map(([name, blob]) =>
           blob.arrayBuffer().then((b) => ({ name, bytes: new Uint8Array(b) })),
         );
@@ -451,7 +491,9 @@ export default function Home() {
         remember({
           kind: "mic",
           input: inputBlob,
-          output: wavBlob(response.synth_audio_b64),
+          output: response.synth_audio_b64
+            ? wavBlob(response.synth_audio_b64)
+            : null,
         });
         setViewResponse(response);
         await playResponse(response);
@@ -607,14 +649,19 @@ export default function Home() {
       try {
         await trombone.resume(); // we're in a user gesture
         console.log(`${clip.name}: ${clip.source} @${clip.offset_s}s`);
-        const { response, inputUrl, inputBlob } =
-          await synthesizeDatasetClip(clip);
+        const { response, inputUrl, inputBlob, precomputed } =
+          await synthesizeDatasetClip(clip, health?.model_fingerprint);
+        // A committed answer is there instantly; hold it for a beat so the
+        // clips behave like the mic rather than firing on mousedown.
+        if (precomputed) await fakeThinking();
         lastResponse.current = response;
         setOriginal(inputUrl);
         remember({
           kind: "dataset",
           input: inputBlob,
-          output: wavBlob(response.synth_audio_b64),
+          output: response.synth_audio_b64
+            ? wavBlob(response.synth_audio_b64)
+            : null,
         });
         setViewResponse(response);
         await playResponse(response);
@@ -624,7 +671,7 @@ export default function Home() {
         await restoreMic();
       }
     },
-    [clips, trombone, playResponse, restoreMic, setOriginal, remember],
+    [clips, health, trombone, playResponse, restoreMic, setOriginal, remember],
   );
 
   /** Play from the scrub position (or the start, if at the end); pause if
@@ -718,6 +765,10 @@ export default function Home() {
   // The tract is drawn grey until an audio input is picked: the mic is on, or a
   // pre-recorded clip has come back from the model.
   const tractActive = micOn || viewResponse !== null;
+  // Where the interesting thing is happening right now: pick an input, then the
+  // transport takes over, and while anything plays it's the tract you watch.
+  const section: Section =
+    isPlaying || playingOriginal ? "tract" : tractActive ? "playback" : "input";
 
   return (
     <main className="flex flex-1 flex-wrap items-start gap-8 p-8">
@@ -735,74 +786,90 @@ export default function Home() {
         <p className="text-neutral-600">
           The mouth itself is Pink Trombone, a project originally by{" "}
           <TextLink href="https://dood.al/pinktrombone/">Neil Thapen</TextLink>,
-          described by
-          him as &quot;bare-handed speech synthesis&quot;. It&apos;s the QWOP of
-          text-to-speech.
+          described by him as &quot;bare-handed speech synthesis&quot;.
+          It&apos;s the QWOP of text-to-speech.
         </p>
         <p className="text-neutral-600">
-          Made by <TextLink href="https://vvolhejn.com">Václav Volhejn</TextLink>
-          .
+          Made by{" "}
+          <TextLink href="https://vvolhejn.com">Václav Volhejn</TextLink>.
         </p>
-        <div className="flex w-full flex-col gap-2">
-          <div className="font-bold text-neutral-500">Audio input</div>
+        <div
+          className={`flex w-full flex-col gap-2 p-3 ${sectionBox(section === "input")}`}
+        >
+          {/* Two columns: talk to it on the left, or pick a canned clip on the
+              right. Wraps to one column when there isn't room for both. */}
+          <div className="flex flex-wrap items-center justify-around gap-6">
+            <div className="flex min-w-0 flex-col items-center gap-1.5">
+              <button
+                onClick={() => void (micOn ? stopMic() : startMic())}
+                disabled={insecure !== null}
+                title={
+                  insecure
+                    ? "Unavailable on an insecure origin"
+                    : micOn
+                      ? "Stop listening"
+                      : "Listen continuously and mimic every utterance"
+                }
+                className={
+                  micOn
+                    ? "rounded-full border border-highlight-300 px-4 py-1.5 text-sm font-medium text-highlight-700 hover:bg-highlight-50 disabled:opacity-40"
+                    : "rounded-full bg-highlight-600 px-4 py-1.5 text-sm font-semibold text-white hover:bg-highlight-700 disabled:opacity-40 disabled:hover:bg-highlight-600"
+                }
+              >
+                {micOn ? "Stop" : "Microphone"}
+              </button>
 
-          <div className="flex flex-wrap items-center gap-3">
-            <button
-              onClick={() => void (micOn ? stopMic() : startMic())}
-              disabled={insecure !== null}
-              title={
-                insecure
-                  ? "Unavailable on an insecure origin"
-                  : micOn
-                    ? "Stop listening"
-                    : "Listen continuously and mimic every utterance"
-              }
-              className={
-                micOn
-                  ? "rounded-full border border-highlight-300 px-4 py-1.5 text-sm font-medium text-highlight-700 hover:bg-highlight-50 disabled:opacity-40"
-                  : "rounded-full bg-highlight-600 px-4 py-1.5 text-sm font-semibold text-white hover:bg-highlight-700 disabled:opacity-40 disabled:hover:bg-highlight-600"
-              }
-            >
-              {micOn ? "Stop" : "Microphone"}
-            </button>
-
-            <span className="text-sm text-neutral-500">
-              or use pre-recorded audio
-            </span>
-
-            {/* One button per committed clip, numbered rather than named: which
-                recording is which only matters once you've heard them. */}
-            <div className="grid grid-cols-3 gap-1.5">
-              {clips.map((clip, i) => (
-                <button
-                  key={clip.name}
-                  onClick={() => void playClip(clip.name)}
-                  disabled={!notBusy}
-                  title={
-                    insecure
-                      ? "Unavailable on an insecure origin"
-                      : `Mimic ${clip.duration_s.toFixed(0)}s of held-out speech`
-                  }
-                  className={
-                    clip.name === playedClip
-                      ? "rounded-md bg-sky-600 px-3 py-1 text-sm font-semibold text-white disabled:opacity-40"
-                      : "rounded-md border border-sky-300 px-3 py-1 text-sm font-medium text-sky-700 hover:bg-sky-50 disabled:opacity-40 disabled:hover:bg-transparent"
-                  }
-                >
-                  {i + 1}
-                </button>
-              ))}
+              {/* Reassurance, not an action: recordings go to the server only to
+                  be mimicked back, and nothing is written to disk there. Only
+                  the "self-host" escape hatch is clickable. */}
+              <span
+                className="text-center text-xs text-neutral-500"
+                title="Recordings are sent to the server only to be mimicked back; they are never written to disk."
+              >
+                Your audio is not stored.
+                <br />
+                <TextLink href="https://github.com/vvolhejn/samuel">
+                  Self-host
+                </TextLink>{" "}
+                if you don&apos;t trust me
+              </span>
             </div>
 
-            {STATUS_LABEL[status] && (
+            <div className="flex shrink-0 flex-col gap-1.5">
               <span className="text-sm text-neutral-500">
-                {STATUS_LABEL[status]}
-                <Ellipsis />
+                or use pre-recorded audio
               </span>
-            )}
+
+              {/* One button per committed clip, numbered rather than named:
+                  which recording is which only matters once you've heard
+                  them. */}
+              <div className="grid grid-cols-3 gap-1.5">
+                {clips.map((clip, i) => (
+                  <button
+                    key={clip.name}
+                    onClick={() => void playClip(clip.name)}
+                    disabled={!notBusy}
+                    title={
+                      insecure
+                        ? "Unavailable on an insecure origin"
+                        : `Mimic ${clip.duration_s.toFixed(0)}s of held-out speech`
+                    }
+                    className={
+                      clip.name === playedClip
+                        ? "rounded-md bg-sky-600 px-3 py-1 text-sm font-semibold text-white disabled:opacity-40"
+                        : "rounded-md border border-sky-300 px-3 py-1 text-sm font-medium text-sky-700 hover:bg-sky-50 disabled:opacity-40 disabled:hover:bg-transparent"
+                    }
+                  >
+                    {i + 1}
+                  </button>
+                ))}
+              </div>
+            </div>
           </div>
         </div>
-        <div className="flex w-full flex-col gap-3">
+        <div
+          className={`flex w-full flex-col gap-3 p-3 ${sectionBox(section === "playback")}`}
+        >
           <div className="flex items-center gap-3">
             {/* Own chevron: the native one is glued to the border box, so padding
                 can't give it any room inside the pill. */}
@@ -887,6 +954,7 @@ export default function Home() {
             open={debugOpen}
             onToggle={() => setDebugOpen((v) => !v)}
             health={health}
+            precomputed={precomputed}
             response={viewResponse}
             frac={scrubFrac}
             micProcessing={micProcessing}
@@ -902,10 +970,27 @@ export default function Home() {
           entirely on an insecure origin, where it would stay blank: the synth
           it draws is never started there. */}
       {insecure === null && (
-        <pink-trombone
-          className="block h-[500px] w-[600px] shrink-0"
-          inactive={tractActive ? undefined : "true"}
-        />
+        <div
+          className={`relative shrink-0 p-2 ${sectionBox(section === "tract")}`}
+        >
+          <pink-trombone
+            className="block h-[500px] w-[600px]"
+            inactive={tractActive ? undefined : "true"}
+          />
+          {/* Over the tract rather than beside the buttons: the wait is the one
+              moment nothing else on the page moves, and tucked next to the
+              controls it was easy to miss. */}
+          {status === "processing" && (
+            <div className="absolute inset-0 z-10 flex items-center justify-center rounded-xl bg-white/70">
+              {/* Solid plate behind the words: the tract is all thin dark lines,
+                  and the wash alone doesn't hide enough of them to read over. */}
+              <span className="rounded-lg bg-white px-4 py-2 text-2xl font-semibold text-neutral-600 shadow-sm">
+                Thinking
+                <Ellipsis />
+              </span>
+            </div>
+          )}
+        </div>
       )}
     </main>
   );

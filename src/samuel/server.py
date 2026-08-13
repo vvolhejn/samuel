@@ -9,16 +9,29 @@ export (``webapp/out``) and mounts it at ``/``, so a single process serves
 both the UI and the ``/api/*`` endpoints on the same origin — just open the
 server's URL, no separate ``pnpm dev`` needed.
 
+By default it serves the published checkpoint from the Hugging Face Hub
+(``vvolhejn/samuel``), downloaded and cached on first start, so a fresh clone
+runs without access to the training cluster. ``--checkpoint`` (or
+``SAMUEL_CHECKPOINT``) points it at something else.
+
 Run (serves UI + API on http://127.0.0.1:8471):
     uv run --extra server python -m samuel.server
-    # or, equivalently, with explicit uvicorn:
+    uv run --extra server python -m samuel.server --checkpoint runs/<run>/checkpoints/last.pt
+    # or, equivalently, with explicit uvicorn (env only, no CLI flags):
     uv run --extra server uvicorn samuel.server:app --port 8471
+
+The flags of ``python -m samuel.server --help`` each set the matching env var
+below, which is what the app itself reads.
 
 Env:
     SAMUEL_PORT / SAMUEL_HOST   override the default 127.0.0.1:8471
                                 (python -m samuel.server entrypoint only)
-    SAMUEL_CHECKPOINT   local .pt path, wandb run URL/path, or wandb artifact ref
-                        (default: runs/reg-f1.0-s0.1_20260719-120003/checkpoints/last.pt)
+    SAMUEL_CHECKPOINT   Hugging Face repo ref, local .pt path, wandb run
+                        URL/path, or wandb artifact ref
+                        (default: hf:vvolhejn/samuel)
+                        A Hub ref is ``hf:<repo-id>[@<revision>]``; the repo
+                        holds checkpoints/last.pt next to config.json, so it
+                        needs no SAMUEL_RUN_CONFIG either.
                         A run URL (https://wandb.ai/<entity>/<project>/runs/<id>,
                         or just <entity>/<project>/runs/<id>) is self-contained:
                         the run's model artifact and its config both come from
@@ -41,6 +54,7 @@ Env:
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import logging
@@ -65,8 +79,11 @@ from samuel.pink_trombone import PARAM_NAMES, SAMPLE_RATE, pink_trombone_ola
 logger = logging.getLogger("samuel.server")
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-# wandb: moboehle-kyutai/samuel/xl45k4i7
-_DEFAULT_RUN_DIR = _REPO_ROOT / "runs" / "reg-f1.0-s0.1_20260719-120003"
+
+# The published checkpoint, served unless overridden: a public Hub repo holding
+# checkpoints/last.pt plus the run's config.json (staged by deploy/stage-model.sh,
+# see deploy/README.md). Default so a clone without runs/ still works.
+_DEFAULT_CHECKPOINT = "hf:vvolhejn/samuel"
 
 # Next.js frontend: `pnpm build` (output: "export") emits the static site here.
 _WEBAPP_DIR = _REPO_ROOT / "webapp"
@@ -89,6 +106,36 @@ _WANDB_RUN_RE = re.compile(
     r"^(?:https?://[^/]*wandb\.ai/)?(?P<entity>[^/?#]+)/(?P<project>[^/?#]+)"
     r"/runs/(?P<run_id>[^/?#]+)"
 )
+
+# hf:<owner>/<name>[@<revision>], also spelled hf://... — deliberately an
+# explicit scheme, so a bare <a>/<b> string stays unambiguous next to the wandb
+# forms above.
+_HF_REPO_RE = re.compile(
+    r"^hf:(?://)?(?P<repo_id>[^/@?#]+/[^/@?#]+)(?:@(?P<revision>[^/?#]+))?$"
+)
+
+
+def _resolve_hf_repo(ref: str) -> Path:
+    """Download a Hub model repo; return the path to its checkpoint.
+
+    The repo mirrors a run dir (``checkpoints/last.pt`` beside ``config.json``),
+    so :func:`_resolve_config_path` finds the config without help.
+    """
+    from huggingface_hub import snapshot_download
+
+    match = _HF_REPO_RE.match(ref)
+    assert match is not None, ref
+    repo_id, revision = match.group("repo_id"), match.group("revision")
+    local_dir = Path(
+        snapshot_download(repo_id, revision=revision, allow_patterns=["*.json", "*.pt"])
+    )
+    logger.info(
+        "hugging face repo %s (revision %s): downloaded to %s",
+        repo_id,
+        revision or "main",
+        local_dir,
+    )
+    return local_dir / "checkpoints" / "last.pt"
 
 
 def _resolve_wandb_run(ref: str) -> tuple[Path, dict]:
@@ -123,10 +170,13 @@ def _resolve_wandb_run(ref: str) -> tuple[Path, dict]:
 def _resolve_checkpoint(ref: str) -> tuple[Path, dict | None]:
     """Resolve a checkpoint ref to a local path, plus its run config if known.
 
-    ``ref`` is a local ``.pt`` path, a wandb run URL/path, or a wandb artifact
-    ref. Only the run form carries a config; the others return None and leave
-    config resolution to :func:`_resolve_config_path`.
+    ``ref`` is a Hub repo ref, a local ``.pt`` path, a wandb run URL/path, or a
+    wandb artifact ref. Only the wandb-run form carries a config; the others
+    return None and leave config resolution to :func:`_resolve_config_path`.
     """
+    if _HF_REPO_RE.match(ref):
+        return _resolve_hf_repo(ref), None
+
     if Path(ref).exists():
         return Path(ref), None
 
@@ -172,6 +222,24 @@ _run_cfg: dict | None = None
 # What the webapp shows for the loaded checkpoint: a wandb run URL, or the
 # resolved local .pt path (also set by _load_model).
 _checkpoint: str | None = None
+# Content hash of the loaded model, see _model_fingerprint (also set there).
+_fingerprint: str | None = None
+
+
+def _model_fingerprint(model: PinkTromboneController) -> str:
+    """A short content hash of the loaded model: same weights, same string.
+
+    Unlike ``_checkpoint`` this does not depend on where the weights came from,
+    so it can be committed and compared across machines. The webapp's
+    precomputed clip responses carry it, which is how a checkpoint swap is
+    noticed instead of being served stale forever — see
+    ``scripts/precompute_clip_responses.py``.
+    """
+    digest = hashlib.sha256(model.config.model_dump_json().encode())
+    for name, tensor in sorted(model.state_dict().items()):
+        digest.update(name.encode())
+        digest.update(tensor.detach().to("cpu").numpy().tobytes())
+    return digest.hexdigest()[:16]
 
 
 def _run_config() -> dict:
@@ -180,10 +248,8 @@ def _run_config() -> dict:
 
 
 def _load_model() -> PinkTromboneController:
-    global _run_cfg, _checkpoint
-    checkpoint_ref = os.environ.get(
-        "SAMUEL_CHECKPOINT", str(_DEFAULT_RUN_DIR / "checkpoints" / "last.pt")
-    )
+    global _run_cfg, _checkpoint, _fingerprint
+    checkpoint_ref = os.environ.get("SAMUEL_CHECKPOINT") or _DEFAULT_CHECKPOINT
     checkpoint_path, run_cfg = _resolve_checkpoint(checkpoint_ref)
     override = os.environ.get("SAMUEL_RUN_CONFIG")
     if run_cfg is not None and not override:
@@ -203,11 +269,19 @@ def _load_model() -> PinkTromboneController:
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"])
     model.eval()
-    # Same precedence as _resolve_checkpoint: a local path wins over the run form.
+    # Same precedence as _resolve_checkpoint: hub ref, then local path, then run.
+    hf_match = _HF_REPO_RE.match(checkpoint_ref)
     run_match = (
-        None if Path(checkpoint_ref).exists() else _WANDB_RUN_RE.match(checkpoint_ref)
+        None
+        if hf_match is not None or Path(checkpoint_ref).exists()
+        else _WANDB_RUN_RE.match(checkpoint_ref)
     )
-    if run_match is not None:
+    if hf_match is not None:
+        # A URL, so the webapp renders it as a link (see app/page.tsx).
+        _checkpoint = "https://huggingface.co/" + hf_match.group("repo_id")
+        if hf_match.group("revision"):
+            _checkpoint += "/tree/" + hf_match.group("revision")
+    elif run_match is not None:
         # Normalized so the webapp can link it even for the bare-path form.
         _checkpoint = "https://wandb.ai/{entity}/{project}/runs/{run_id}".format(
             **run_match.groupdict()
@@ -215,12 +289,14 @@ def _load_model() -> PinkTromboneController:
     else:
         # last.pt is a symlink to <step>.pt; resolve so the real file is visible.
         _checkpoint = str(checkpoint_path.resolve())
+    _fingerprint = _model_fingerprint(model)
     logger.info(
-        "loaded checkpoint %s (config %s) on %s (frame_rate=%.3f)",
+        "loaded checkpoint %s (config %s) on %s (frame_rate=%.3f, fingerprint %s)",
         checkpoint_path,
         config_source,
         device,
         model_config.frame_rate,
+        _fingerprint,
     )
     return model
 
@@ -384,6 +460,7 @@ def health() -> dict:
         "frame_rate": _model.config.frame_rate,
         "device": str(next(_model.parameters()).device),
         "checkpoint": _checkpoint,
+        "model_fingerprint": _fingerprint,
     }
 
 
@@ -453,11 +530,65 @@ async def synthesize(request: Request) -> dict:
 # dev proxy in webapp/next.config.ts points here too — keep them in sync.
 DEFAULT_PORT = 8471
 
+def _parse_args() -> None:
+    """Turn CLI flags into the env vars the app reads.
+
+    Env stays the single source of truth, since ``uvicorn samuel.server:app``
+    imports the app directly and never sees these flags. Each flag defaults to
+    the matching env var, so both spellings work and the flag wins.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="python -m samuel.server",
+        description="Serve the samuel webapp (UI + /api/*).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--checkpoint",
+        default=os.environ.get("SAMUEL_CHECKPOINT") or _DEFAULT_CHECKPOINT,
+        help="hf:<repo-id>[@<revision>], a local .pt, a wandb run URL/path, "
+        "or a wandb artifact ref",
+    )
+    parser.add_argument(
+        "--run-config",
+        default=os.environ.get("SAMUEL_RUN_CONFIG"),
+        help="run config.json to build the model from; by default found next to "
+        "the checkpoint (only needed for a bare wandb artifact)",
+    )
+    parser.add_argument("--host", default=os.environ.get("SAMUEL_HOST", "127.0.0.1"))
+    parser.add_argument(
+        "--port", type=int, default=int(os.environ.get("SAMUEL_PORT", DEFAULT_PORT))
+    )
+    parser.add_argument(
+        "--no-frontend",
+        action="store_true",
+        default=os.environ.get("SAMUEL_SERVE_FRONTEND", "1") == "0",
+        help="serve only the API, without building or mounting the frontend",
+    )
+    parser.add_argument(
+        "--skip-frontend-build",
+        action="store_true",
+        default=os.environ.get("SAMUEL_FRONTEND_SKIP_BUILD") == "1",
+        help="serve an existing webapp/out without rebuilding it",
+    )
+    args = parser.parse_args()
+
+    os.environ["SAMUEL_CHECKPOINT"] = args.checkpoint
+    if args.run_config:
+        os.environ["SAMUEL_RUN_CONFIG"] = args.run_config
+    os.environ["SAMUEL_HOST"] = args.host
+    os.environ["SAMUEL_PORT"] = str(args.port)
+    os.environ["SAMUEL_SERVE_FRONTEND"] = "0" if args.no_frontend else "1"
+    os.environ["SAMUEL_FRONTEND_SKIP_BUILD"] = "1" if args.skip_frontend_build else "0"
+
+
 if __name__ == "__main__":
     import uvicorn
 
+    _parse_args()
     uvicorn.run(
         app,
-        host=os.environ.get("SAMUEL_HOST", "127.0.0.1"),
-        port=int(os.environ.get("SAMUEL_PORT", DEFAULT_PORT)),
+        host=os.environ["SAMUEL_HOST"],
+        port=int(os.environ["SAMUEL_PORT"]),
     )

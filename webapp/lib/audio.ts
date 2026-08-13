@@ -9,8 +9,9 @@ export interface SynthResponse {
   params: Record<string, number[]>;
   voiced: boolean[];
   /** Python-synth reference audio (WAV) for A/B debugging. Not volume-matched:
-   * the model produces its own level via the `intensity` trajectory. */
-  synth_audio_b64: string;
+   * the model produces its own level via the `intensity` trajectory. Absent
+   * from the precomputed clip responses, which drop it for size. */
+  synth_audio_b64?: string;
 }
 
 /** Decode one of the base64 WAV fields into a blob. */
@@ -94,6 +95,9 @@ export interface UtteranceResult {
   inputUrl: string;
   /** The same WAV as a blob, for the session download. */
   inputBlob: Blob;
+  /** Came from the committed precomputed responses rather than the backend, so
+   * it arrived instantly and the caller should fake the thinking pause. */
+  precomputed: boolean;
 }
 
 /** Send one audio file to the model backend, which sniffs the format itself
@@ -112,6 +116,7 @@ async function synthesizeBlob(blob: Blob): Promise<UtteranceResult> {
     response: (await res.json()) as SynthResponse,
     inputUrl: URL.createObjectURL(blob),
     inputBlob: blob,
+    precomputed: false,
   };
 }
 
@@ -124,13 +129,77 @@ export function synthesizeUtterance(
   return synthesizeBlob(new Blob([wav], { type: "audio/wav" }));
 }
 
-/** Run one pre-recorded clip through the model. */
+/** What the model answers with for each committed clip, computed ahead of time
+ * by scripts/precompute_clip_responses.py. `clips` are sources.json names;
+ * `model_fingerprint` is the checkpoint these were computed from. */
+export interface PrecomputedIndex {
+  model_fingerprint: string;
+  clips: string[];
+}
+
+let precomputedIndex: Promise<PrecomputedIndex | null> | null = null;
+
+/** The precomputed-response index, fetched once per page load, or null if it
+ * isn't there (nobody has run the script yet). */
+export function fetchPrecomputedIndex(): Promise<PrecomputedIndex | null> {
+  precomputedIndex ??= fetch("/clips/precomputed/index.json")
+    .then((res) => (res.ok ? (res.json() as Promise<PrecomputedIndex>) : null))
+    .catch(() => null);
+  return precomputedIndex;
+}
+
+/** Whether the precomputed responses were made by the checkpoint the backend is
+ * currently serving. A null fingerprint (backend unreachable) is not a mismatch:
+ * offline, the stored answers are the only ones there are. */
+export function precomputedMatches(
+  index: PrecomputedIndex | null,
+  modelFingerprint: string | null | undefined,
+): boolean {
+  if (!index) return false;
+  return !modelFingerprint || index.model_fingerprint === modelFingerprint;
+}
+
+/** The committed answer for one clip, or null if there isn't a usable one. */
+async function fetchPrecomputedClip(
+  clip: DatasetClip,
+  modelFingerprint: string | null | undefined,
+): Promise<SynthResponse | null> {
+  const index = await fetchPrecomputedIndex();
+  if (!index?.clips.includes(clip.name)) return null;
+  if (!precomputedMatches(index, modelFingerprint)) {
+    console.warn(
+      `precomputed clip responses are from checkpoint ${index.model_fingerprint}, ` +
+        `backend serves ${modelFingerprint} — asking the backend instead. ` +
+        "Re-run scripts/precompute_clip_responses.py.",
+    );
+    return null;
+  }
+  const stem = clip.name.replace(/\.[^.]+$/, "");
+  const res = await fetch(`/clips/precomputed/${stem}.json`);
+  return res.ok ? ((await res.json()) as SynthResponse) : null;
+}
+
+/** Run one pre-recorded clip through the model — or, since the clips never
+ * change, read the answer straight off disk when it was precomputed for the
+ * checkpoint the backend is serving. The clip itself is fetched either way: the
+ * Original button plays it back. */
 export async function synthesizeDatasetClip(
   clip: DatasetClip,
+  modelFingerprint: string | null | undefined,
 ): Promise<UtteranceResult> {
   const res = await fetch(`/clips/${clip.name}`);
   if (!res.ok) throw new Error(`clip ${clip.name}: ${res.status}`);
-  return synthesizeBlob(await res.blob());
+  const blob = await res.blob();
+  const response = await fetchPrecomputedClip(clip, modelFingerprint);
+  if (response) {
+    return {
+      response,
+      inputUrl: URL.createObjectURL(blob),
+      inputBlob: blob,
+      precomputed: true,
+    };
+  }
+  return synthesizeBlob(blob);
 }
 
 /** Response of GET /api/health. */
@@ -140,6 +209,9 @@ export interface HealthResponse {
   device: string;
   /** Wandb run URL, or the resolved local .pt path. */
   checkpoint: string;
+  /** Content hash of the loaded weights — the same string wherever they are
+   * loaded from, so the committed clip responses can be checked against it. */
+  model_fingerprint: string;
 }
 
 /** null when the backend is unreachable or not serving a model. */

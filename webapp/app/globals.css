@@ -31,7 +31,7 @@ body {
     sans-serif;
 }
 
-/* Animated ellipsis for the status label: ".", "..", "...", repeat. The dots
+/* Animated ellipsis for the "Thinking" overlay: ".", "..", "...", repeat. The dots
    keep their space and only toggle opacity, so nothing reflows. */
 .ellipsis > span:nth-child(2) {
   animation: ellipsis-2 1.2s infinite;
