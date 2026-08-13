@@ -3,7 +3,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Samuel",
-  description: "Speak — the vocal tract model mimics you.",
+  description: "A silly speech model - Pink Trombone automated",
 };
 
 export default function RootLayout({

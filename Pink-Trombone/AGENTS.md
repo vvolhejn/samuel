@@ -38,7 +38,13 @@ script/
 │       ├── Transient.js         # Click/transient sounds
 │       ├── SimplexNoise.js      # Noise for natural jitter
 │       └── ParameterDescriptors.js
-└── graphics/                    # Canvas-based visualization UI
+└── graphics/
+    ├── PinkTromboneUI.js        # Grid: the tract's 600x500 over the voicebox's
+    │                            #   600x100 — the original's 600x600 canvas
+    ├── TractUI.js               # The tract drawing, and drags on it
+    ├── GlottisUI.js             # The "voicebox control" strip (pitch x voicing)
+    ├── ButtonsUI.js             # The original's touch buttons
+    └── colors.js                # Shared palette (active / greyed "inactive")
 ```
 
 ## Key Constraints
@@ -75,6 +81,36 @@ el.vibrato.wobble
 const c = el.newConstriction(index, diameter);
 el.removeConstriction(c);
 ```
+
+### Attributes
+
+- `UI` — present ⇒ build and show the drawing (`enableUI()`).
+- `inactive` — present and not `"false"` ⇒ draw the whole thing greyed out
+  (`graphics/colors.js`), for a page with nothing loaded yet.
+- `interactive` — `"false"` ⇒ the drawing is read-only: drags on the tract and
+  on the voicebox are ignored. Absent ⇒ they drive the synth, as in the
+  original. Set this while automating the AudioParams: a drag writes `.value`
+  directly, which does *not* cancel scheduled curves, so the two otherwise
+  fight for as long as the pointer is down.
+
+### The `voicebox` event
+
+A drag on the voicebox strip dispatches a bubbling, **cancelable** `voicebox`
+event on the element before doing anything:
+
+```javascript
+el.addEventListener("voicebox", (event) => {
+  event.preventDefault();  // we'll set the parameters ourselves
+  const { phase, frequency, tenseness, loudness } = event.detail;
+  // phase: "start" | "move" | "end"; the values are absent on "end"
+});
+```
+
+Uncancelled, the element sets `frequency`/`tenseness`/`loudness` itself (and
+`intensity`, unless the "always voice" button is on) — the original's behaviour,
+which is what `index.html` relies on. Call `preventDefault()` to schedule them
+yourself instead. The handle follows the AudioParams whenever no one is dragging,
+by reading them back each animation frame, so automation moves it for free.
 
 ## Synthesis Model Mathematics
 

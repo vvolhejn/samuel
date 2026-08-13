@@ -1,4 +1,9 @@
 /*
+    Modified for the samuel project (GPL-3.0, see Pink-Trombone/LICENSE):
+      2026-08-14  add the `interactive` attribute: present (or absent) the
+                  drawings take drags as the original does, `="false"` they are
+                  read-only. See TractUI.interactive.
+
     TODO
         *
 */
@@ -175,6 +180,7 @@ class PinkTromboneElement extends HTMLElement {
     }
 
     this.UI.inactive = Boolean(this._inactive);
+    this.UI.interactive = this._interactive !== false;
     this.UI.show();
   }
   disableUI() {
@@ -198,7 +204,7 @@ class PinkTromboneElement extends HTMLElement {
 
   // getAttribute getter?
   static get observedAttributes() {
-    return ["UI", "inactive"];
+    return ["UI", "inactive", "interactive"];
   }
 
   attributeChangedCallback(name, oldValue, newValue) {
@@ -212,6 +218,12 @@ class PinkTromboneElement extends HTMLElement {
       case "inactive":
         this._inactive = newValue !== null && newValue !== "false";
         if (this.UI !== undefined) this.UI.inactive = this._inactive;
+        break;
+      // Whether drags drive the synth. Absent means they do, as in the
+      // original; only an explicit "false" makes the drawings read-only.
+      case "interactive":
+        this._interactive = newValue !== "false";
+        if (this.UI !== undefined) this.UI.interactive = this._interactive;
         break;
       default:
         break;

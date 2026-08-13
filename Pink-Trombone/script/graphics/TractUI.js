@@ -7,34 +7,15 @@
       2026-08-09  recolour the tract onto the webapp's accent ramp (was
                   pink/palePink/orchid/#C070C6), plus a grey "inactive"
                   scheme for when the page has no audio input selected
+      2026-08-14  move the palette to colors.js (shared with the voicebox);
+                  gate pointer input on the new `interactive` flag, so a page
+                  that automates the tract can stop drags fighting its curves
 
     TODO
         throttle value setter
 */
 
-// Matches the webapp's --font-sans stack (webapp/app/globals.css).
-const FONT_FAMILY = '"Helvetica Neue", Helvetica, Arial, Roboto, "Noto Sans", sans-serif';
-
-// The webapp's accent ramp (--color-highlight-* in webapp/app/globals.css):
-// #f92672 and steps at the same oklch hue, as sRGB hex. The active scheme
-// replaces the original pink/palePink/orchid/#C070C6; the inactive one greys
-// the whole tract out while there is no audio input selected.
-const COLOR_SCHEMES = {
-  active: {
-    tongueControl: "#ffe7eb", // ~highlight-100 — the tongue-control pad
-    tract: "#ffa7ba", // ~highlight-300 — tract/nose fill
-    wall: "#d40c5d", // highlight-700 — tract outline
-    accent: "#f92672", // highlight-600 — labels, markers, amplitudes
-    innerLabel: "#ffffff", // labels drawn inside the tract
-  },
-  inactive: {
-    tongueControl: "#f5f5f5", // neutral-100
-    tract: "#e5e5e5", // neutral-200
-    wall: "#a1a1a1", // neutral-400
-    accent: "#a1a1a1", // neutral-400
-    innerLabel: "#737373", // neutral-500 — white would vanish on the grey fill
-  },
-};
+import { COLOR_SCHEMES, FONT_FAMILY } from "./colors.js";
 
 class TractUI {
   constructor() {
@@ -87,6 +68,9 @@ class TractUI {
 
     this._inactive = false;
     this._colors = COLOR_SCHEMES.active;
+    // Whether a drag on the tract may move the tongue / add constrictions.
+    // Defaults to the original's behaviour: it always could.
+    this._interactive = true;
 
     this._touchConstrictionIndices = [];
 
@@ -192,6 +176,17 @@ class TractUI {
     this._colors = inactive ? COLOR_SCHEMES.inactive : COLOR_SCHEMES.active;
     this._didDrawBackground = false;
     if (this._processor) this._drawTract();
+  }
+
+  // Whether pointer input drives the tract. Off, the drawing still animates —
+  // it just becomes read-only, which is what a page automating the AudioParams
+  // wants: a direct `.value` write from a drag does not cancel scheduled
+  // curves, so the two fight for as long as the finger is down.
+  get interactive() {
+    return this._interactive;
+  }
+  set interactive(interactive) {
+    this._interactive = Boolean(interactive);
   }
 
   get width() {
@@ -616,6 +611,9 @@ class TractUI {
   }
 
   _startEvent(event) {
+    if (!this._interactive) return; // read-only: no drag is ever begun, so
+    // _moveEvent/_endEvent find nothing in _touchConstrictionIndices and fall
+    // through on their own.
     const touchIdentifier = event instanceof Touch ? event.identifier : -1;
     if (this._touchConstrictionIndices[touchIdentifier] == undefined) {
       const position = this._getEventPosition(event);

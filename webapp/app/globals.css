@@ -81,10 +81,10 @@ body {
   }
 }
 
-/* Pink Trombone: show only the animated tract, not the manual glottis pad
-   or the touch buttons. !important because the UI sets inline display
-   styles when showing/hiding. */
-pink-trombone #glottisUI,
+/* Pink Trombone: the tract and the voicebox pad under it are both ours; the
+   touch buttons ("always voice", "pitch wobble") are not — the model owns those
+   parameters. !important because the UI sets inline display styles when
+   showing/hiding. */
 pink-trombone #buttonsUI {
   display: none !important;
 }

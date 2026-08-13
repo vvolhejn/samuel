@@ -44,6 +44,16 @@ export interface PinkTromboneHandle {
   scrub: (response: SynthResponse, frac: number) => void;
   /** Fade the voicing after scrubbing (the tract pose stays in place). */
   endScrub: () => void;
+  /** Hold the glottis at one (frequency, voiceness) and sound it — the
+   * voicebox pad, played by hand. Freezes any automation in progress but
+   * leaves the tract pose alone, so the shape on screen, whether the model or
+   * a drag put it there, is the one you hear. */
+  voice: (frequency: number, voiceness: number) => void;
+  /** Start sounding wherever the glottis already stands — entering manual
+   * control, which holds the note until it is left again. */
+  startVoice: () => void;
+  /** Fade the voicing out (the pose stays in place). */
+  endVoice: () => void;
   /** The synth's AudioContext, or null before init(). Shared so callers can
    * decode and play their own audio on the same clock and device. */
   audioContext: () => AudioContext | null;
@@ -421,7 +431,57 @@ export function usePinkTrombone(): PinkTromboneHandle {
     scheduleEndRef.current = now;
   }, []);
 
-  const endScrub = useCallback(() => {
+  const voice = useCallback((frequency: number, voiceness: number) => {
+    playTokenRef.current++;
+    playbackRef.current = null;
+    const element = elementRef.current;
+    const constriction = constrictionRef.current;
+    const lipConstriction = lipConstrictionRef.current;
+    const masterGain = masterGainRef.current;
+    if (!element || !constriction || !lipConstriction || !masterGain) return;
+    const ctx = element.audioContext;
+    void ctx.resume(); // called from a user gesture
+    const now = ctx.currentTime;
+
+    // Freeze the tract where it stands: without this an interrupted utterance
+    // keeps moving the tongue under your hand for the rest of its curves.
+    for (const param of automatedParams(
+      element,
+      constriction,
+      lipConstriction,
+    )) {
+      cancelAndHold(param, now);
+    }
+    // Same mapping as the model's synth and the voicebox pad's own readout (see
+    // curveValues): tenseness = voiceness, loudness = voiceness ** 0.25.
+    element.frequency.setTargetAtTime(frequency, now, SCRUB_TAU_S);
+    element.tenseness.setTargetAtTime(voiceness, now, SCRUB_TAU_S);
+    element.loudness.setTargetAtTime(
+      Math.pow(Math.max(voiceness, 1e-6), 0.25),
+      now,
+      SCRUB_TAU_S,
+    );
+    // The model drives intensity as its energy envelope; by hand it's just the
+    // on switch, so it's the master gain that gates the sound.
+    element.intensity.setTargetAtTime(1, now, SCRUB_TAU_S);
+    cancelAndHold(masterGain.gain, now);
+    masterGain.gain.setTargetAtTime(1, now, 0.03);
+    scheduleEndRef.current = now;
+  }, []);
+
+  /** Sound the note the glottis is already on. Read off the AudioParams rather
+   * than passed in, so entering manual control picks up wherever the last
+   * playback left the voice — the same values the pad's handle is drawn at. */
+  const startVoice = useCallback(() => {
+    const element = elementRef.current;
+    if (!element) return;
+    voice(element.frequency.value, element.tenseness.value);
+  }, [voice]);
+
+  /** Fade the voicing out, leaving every param where it stands. Shared by the
+   * scrub bar (held while the pointer is down) and manual control (held until
+   * it's switched off). */
+  const fadeVoicing = useCallback(() => {
     const masterGain = masterGainRef.current;
     if (!masterGain) return;
     const now = masterGain.context.currentTime;
@@ -445,7 +505,10 @@ export function usePinkTrombone(): PinkTromboneHandle {
       setPlaybackSpeed,
       stop,
       scrub,
-      endScrub,
+      endScrub: fadeVoicing,
+      voice,
+      startVoice,
+      endVoice: fadeVoicing,
       audioContext,
       ready,
     }),
@@ -456,7 +519,9 @@ export function usePinkTrombone(): PinkTromboneHandle {
       setPlaybackSpeed,
       stop,
       scrub,
-      endScrub,
+      fadeVoicing,
+      voice,
+      startVoice,
       audioContext,
       ready,
     ],

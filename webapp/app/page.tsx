@@ -24,7 +24,11 @@ import {
 import { insecureContextMessage, micErrorMessage } from "@/lib/secureContext";
 import { downloadBlob, makeZip } from "@/lib/zip";
 import { usePinkTrombone } from "@/lib/usePinkTrombone";
-import type { PinkTromboneElement } from "@/types/pink-trombone";
+import { useOriginalAudio } from "@/lib/useOriginalAudio";
+import type {
+  PinkTromboneElement,
+  VoiceboxEventDetail,
+} from "@/types/pink-trombone";
 
 type Status =
   "idle" | "listening" | "recording" | "processing" | "speaking" | "muted";
@@ -49,25 +53,22 @@ function sectionBox(active: boolean): string {
  * or the audio it was made from. */
 type Source = "samuel" | "original";
 
-/** Floor under both faces of the input box, so toggling the mic doesn't resize
- * it and shove the page around. */
-const INPUT_MIN_H = "min-h-[5.5rem]";
-
 /** Silence the VAD waits through before it calls an utterance finished. The
- * meter greys out over exactly this window, so the wait reads as a countdown. */
+ * dots are typed out over this window, so the wait reads as a countdown. */
 const REDEMPTION_MS = 800;
+
+/** Long enough that the dips between words don't strobe the meter, short
+ * enough not to read as a countdown of its own — the dots do that. */
+const METER_FADE_MS = 150;
 
 /** vad-web's hysteresis, restated so the meter watches the same edges it does:
  * speech starts above the first, ends below the second. */
 const POSITIVE_SPEECH_THRESHOLD = 0.3;
 const NEGATIVE_SPEECH_THRESHOLD = 0.25;
 
-/** Heading in the recording panel. */
-function micHeading(status: Status): string {
-  if (status === "processing") return "Thinking…";
-  if (status === "speaking") return "Answering…";
-  return "Recording";
-}
+/** Grace period before an unfocused window mutes its mic. A hidden tab doesn't
+ * get it — that one mutes immediately. */
+const BLUR_MUTE_MS = 60_000;
 
 /** Pipes in the level meter. Unlit ones stay on screen, greyed. */
 const METER_SLOTS = 14;
@@ -114,8 +115,8 @@ function makeLevelStore() {
 
 type LevelStore = ReturnType<typeof makeLevelStore>;
 
-/** Mic level as a line of text: pink while `active`, draining to grey over the
- * redemption window, with dots typed out through `pending`. */
+/** Mic level as a line of text. Lit pipes are pink while `active` and grey
+ * otherwise, unlit ones fainter still, with dots typed out through `pending`. */
 function LevelMeter({
   store,
   active,
@@ -127,13 +128,17 @@ function LevelMeter({
 }) {
   const slots = useSyncExternalStore(store.subscribe, store.get, () => 0);
   return (
-    <p aria-hidden className="text-neutral-300">
+    // Tracked out because `|` has almost no side bearing: packed tight, the
+    // antialiased stems bleed into each other and the colours look mixed.
+    <p aria-hidden className="tracking-[0.2em] text-neutral-200">
       <span
         className="ease-linear"
         style={{
-          color: active ? "var(--color-highlight-600)" : "inherit",
+          color: active
+            ? "var(--color-highlight-600)"
+            : "var(--color-neutral-400)",
           transitionProperty: "color",
-          transitionDuration: active ? "60ms" : `${REDEMPTION_MS}ms`,
+          transitionDuration: `${METER_FADE_MS}ms`,
         }}
       >
         {"|".repeat(slots)}
@@ -151,15 +156,6 @@ function LevelMeter({
     </p>
   );
 }
-
-/** Tape-scrub preview of the original: dragging the bar plays a short window of
- * audio from under the thumb. One grain per move, each superseding the last.
- * GRAIN_S is long enough to hear a vowel, and outlives GRAIN_INTERVAL_MS so a
- * steady drag sounds continuous rather than stuttered; the fades are what keep
- * the cut edges from clicking. */
-const GRAIN_S = 0.12;
-const GRAIN_FADE_S = 0.01;
-const GRAIN_INTERVAL_MS = 55;
 
 /** Nothing ever invalidates the secure-context snapshot. */
 const subscribeNever = () => () => {};
@@ -473,8 +469,6 @@ export default function Home() {
   const [micProcessing, setMicProcessing] = useState<MicProcessing>(
     MIC_PROCESSING_DEFAULTS,
   );
-  /** Is there audio the model heard, i.e. can "Original" play anything? */
-  const [hasOriginal, setHasOriginal] = useState(false);
   /** User-intended mic state — the Record/Stop toggle. Mirrors micOnRef; the
    * status alone can't stand in for it (a dataset clip is "speaking" too). */
   const [micOn, setMicOn] = useState(false);
@@ -488,6 +482,10 @@ export default function Home() {
   const [playedClip, setPlayedClip] = useState<string>("");
   /** The committed clip answers, if any were generated for this checkpoint. */
   const [precomputed, setPrecomputed] = useState<PrecomputedIndex | null>(null);
+  /** Is the mouth yours to play? While it is, the voicebox pad under the tract
+   * and the tract itself take drags; while it isn't they are read-only, and the
+   * model has the only hands on them. */
+  const [manual, setManual] = useState(false);
   const [debugOpen, setDebugOpen] = useState(false);
   /** Why this origin can't run the app at all, or null. Read through
    * useSyncExternalStore because it is a client-only fact: the exported HTML is
@@ -499,32 +497,22 @@ export default function Home() {
   );
 
   const trombone = usePinkTrombone();
+  /** The audio the model heard, and everything that plays or previews it. */
+  const original = useOriginalAudio(trombone);
   const vadRef = useRef<MicVAD | null>(null);
   const lastResponse = useRef<SynthResponse | null>(null);
-  const originalUrlRef = useRef<string | null>(null); // audio the model heard
   /** Every utterance this session, for the debug panel's download. */
   const historyRef = useRef<Recording[]>([]);
   const [historyCount, setHistoryCount] = useState(0);
-  /** Plays originalUrlRef. One long-lived element, so its currentTime can drive
-   * the scrub bar and be driven by it. */
-  const originalAudioRef = useRef<HTMLAudioElement | null>(null);
-  /** The same audio decoded, for the scrub preview — grains need random access,
-   * which a media element's seek latency can't give. Null until the decode
-   * lands (or for good, if it fails: the preview is then simply silent). */
-  const originalBufferRef = useRef<AudioBuffer | null>(null);
-  /** Bumped per original, so a slow decode can't install a stale buffer. */
-  const originalTokenRef = useRef(0);
-  /** The scrub grain now sounding, kept so the next one can cut it short. */
-  const grainRef = useRef<{
-    source: AudioBufferSourceNode;
-    gain: GainNode;
-  } | null>(null);
-  const lastGrainAtRef = useRef(0);
   const busyRef = useRef(false); // ignore VAD events while processing/speaking
   /** Waiting on the model — the one state nothing can interrupt. */
   const processingRef = useRef(false);
   const micOnRef = useRef(false); // user-intended mic state (start/mute toggle)
   const scrubbingRef = useRef(false); // pointer is down on the scrub bar
+  /** Mirror of `manual`, for the callbacks that hand the mouth back. */
+  const manualRef = useRef(false);
+  /** Pointer is down on the voicebox pad, i.e. the synth is sounding by hand. */
+  const voicingRef = useRef(false);
   /** Bumped whenever a playback starts or is cut short, so the completion of a
    * superseded one can't clear the new one's state out from under it. */
   const playIdRef = useRef(0);
@@ -536,9 +524,6 @@ export default function Home() {
   const micProcessingRef = useRef<MicProcessing>(MIC_PROCESSING_DEFAULTS);
   /** Mirror of `heard`, so the per-frame callback only re-renders on edges. */
   const heardRef = useRef(false);
-  /** Mirror of the VAD's own `speaking` flag, which unlike heardRef stays up
-   * through the redemption window. */
-  const speakingRef = useRef(false);
   const [levelStore] = useState(makeLevelStore);
 
   // Bring up the synth + tract visualization immediately; the AudioContext
@@ -571,18 +556,6 @@ export default function Home() {
     void fetchPrecomputedIndex().then(setPrecomputed);
   }, []);
 
-  // The element that plays the original. Made once: a fresh element per play
-  // has no stable currentTime for the scrub bar to read or write.
-  useEffect(() => {
-    const audio = new Audio();
-    audio.preload = "metadata";
-    originalAudioRef.current = audio;
-    return () => {
-      audio.pause();
-      originalAudioRef.current = null;
-    };
-  }, []);
-
   /** Edge-triggered setter for the meter's colour. */
   const showHeard = useCallback((value: boolean) => {
     if (heardRef.current === value) return;
@@ -593,7 +566,6 @@ export default function Home() {
   /** Resume VAD only if the user hasn't muted the mic. */
   const restoreMic = useCallback(async () => {
     if (scrubbingRef.current) return; // the scrub owns the synth until pointer-up
-    speakingRef.current = false; // any pause() left the frame processor reset
     if (micOnRef.current) {
       await vadRef.current?.start();
       setStatus("listening");
@@ -607,60 +579,23 @@ export default function Home() {
     setScrubFrac(frac);
   }, []);
 
-  /** Length of the loaded original, or 0 before its metadata has arrived. */
-  const originalDuration = useCallback(() => {
-    const d = originalAudioRef.current?.duration ?? 0;
-    return Number.isFinite(d) && d > 0 ? d : 0;
-  }, []);
+  /** Stop sounding the voicebox, if manual control was. */
+  const endVoice = useCallback(() => {
+    if (!voicingRef.current) return;
+    voicingRef.current = false;
+    trombone.endVoice();
+  }, [trombone]);
 
-  /** Fade out the grain in flight. Ramped, not stopped dead: at these lengths a
-   * hard cut is audible as a click on every move of the thumb. */
-  const stopGrain = useCallback(() => {
-    const grain = grainRef.current;
-    if (!grain) return;
-    grainRef.current = null;
-    const t = grain.gain.context.currentTime;
-    const gain = grain.gain.gain;
-    gain.cancelScheduledValues(t);
-    gain.setValueAtTime(gain.value, t);
-    gain.linearRampToValueAtTime(0, t + GRAIN_FADE_S);
-    grain.source.stop(t + GRAIN_FADE_S);
-  }, []);
-
-  /** Play a short window of the original from `frac` — the sound of dragging
-   * the bar. Rate-limited, since a fast drag fires moves far quicker than a
-   * grain lasts and they would otherwise pile up into mush. */
-  const playGrain = useCallback(
-    (frac: number) => {
-      const ctx = trombone.audioContext();
-      const buffer = originalBufferRef.current;
-      if (!ctx || !buffer) return; // decode failed or hasn't landed
-      const now = performance.now();
-      if (now - lastGrainAtRef.current < GRAIN_INTERVAL_MS) return;
-      lastGrainAtRef.current = now;
-      void ctx.resume(); // we're in a user gesture
-
-      const offset = Math.max(0, Math.min(1, frac)) * buffer.duration;
-      const length = Math.min(GRAIN_S, buffer.duration - offset);
-      if (length <= 2 * GRAIN_FADE_S) return; // at the very end; nothing to hear
-      stopGrain();
-
-      const t = ctx.currentTime;
-      const gain = ctx.createGain();
-      gain.gain.setValueAtTime(0, t);
-      gain.gain.linearRampToValueAtTime(1, t + GRAIN_FADE_S);
-      gain.gain.setValueAtTime(1, t + length - GRAIN_FADE_S);
-      gain.gain.linearRampToValueAtTime(0, t + length);
-      gain.connect(ctx.destination);
-      const source = ctx.createBufferSource();
-      source.buffer = buffer;
-      source.connect(gain);
-      source.onended = () => gain.disconnect();
-      source.start(t, offset, length);
-      grainRef.current = { source, gain };
-    },
-    [trombone, stopGrain],
-  );
+  /** Take the mouth back off the user. Called by everything else that wants to
+   * drive it — a playback, a scrub, the mic — rather than disabling those while
+   * manual control is on: a dead button you have to find the release for is
+   * worse than a mode that steps aside when you reach past it. */
+  const exitManual = useCallback(() => {
+    if (!manualRef.current) return;
+    manualRef.current = false;
+    setManual(false);
+    endVoice();
+  }, [endVoice]);
 
   /** Silence whatever is playing and orphan its completion handler, leaving the
    * scrub position where it stands. Every new playback starts here, which is
@@ -668,10 +603,10 @@ export default function Home() {
   const stopPlayback = useCallback(() => {
     playIdRef.current++;
     trombone.stop();
-    originalAudioRef.current?.pause();
-    stopGrain();
+    original.pause();
+    original.stopGrain();
     setIsPlaying(false);
-  }, [trombone, stopGrain]);
+  }, [trombone, original]);
 
   /** End of a playback that wasn't superseded: hand the mic back. */
   const finishPlayback = useCallback(
@@ -711,19 +646,15 @@ export default function Home() {
    * Drives the same scrub bar as the imitation, off the element's clock. */
   const playOriginal = useCallback(
     async (startFrac = 0) => {
-      const audio = originalAudioRef.current;
-      if (!audio || !originalUrlRef.current) return;
+      if (!original.loaded) return;
       stopPlayback();
       const id = playIdRef.current;
       busyRef.current = true;
       setStatus("speaking");
       setIsPlaying(true);
       await vadRef.current?.pause();
-      const duration = originalDuration();
-      if (duration)
-        audio.currentTime = Math.min(duration - 0.01, startFrac * duration);
       try {
-        await audio.play();
+        await original.play(startFrac);
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
         await finishPlayback(id);
@@ -733,12 +664,11 @@ export default function Home() {
       // and leaves the bar visibly stepping.
       const tick = () => {
         if (playIdRef.current !== id) return;
-        const d = originalDuration();
-        if (d) updateFrac(Math.min(1, audio.currentTime / d));
-        if (audio.ended) {
+        updateFrac(original.currentFrac());
+        if (original.ended()) {
           updateFrac(1);
           void finishPlayback(id);
-        } else if (audio.paused) {
+        } else if (original.paused()) {
           void finishPlayback(id);
         } else {
           requestAnimationFrame(tick);
@@ -746,44 +676,7 @@ export default function Home() {
       };
       requestAnimationFrame(tick);
     },
-    [stopPlayback, finishPlayback, originalDuration, updateFrac],
-  );
-
-  /** Remember the audio a response was made from, so it can be replayed. */
-  const setOriginal = useCallback(
-    (url: string) => {
-      const previous = originalUrlRef.current;
-      originalUrlRef.current = url;
-      const audio = originalAudioRef.current;
-      if (audio) {
-        audio.pause();
-        audio.src = url;
-        audio.load(); // so duration is known before the first play
-      }
-      // Only after the element has let go of it.
-      if (previous) URL.revokeObjectURL(previous);
-      setHasOriginal(true);
-
-      // Decode a second copy for the scrub preview. Straight off the object URL
-      // rather than threading the blob through every caller; the token guards
-      // against a slow decode landing after the next original has replaced it.
-      const token = ++originalTokenRef.current;
-      originalBufferRef.current = null;
-      void (async () => {
-        const ctx = trombone.audioContext();
-        if (!ctx) return;
-        try {
-          const bytes = await (await fetch(url)).arrayBuffer();
-          const buffer = await ctx.decodeAudioData(bytes);
-          if (originalTokenRef.current === token)
-            originalBufferRef.current = buffer;
-        } catch {
-          // Only the scrub preview depends on this; playback goes through the
-          // media element either way, so a failure here stays silent.
-        }
-      })();
-    },
-    [trombone],
+    [original, stopPlayback, finishPlayback, updateFrac],
   );
 
   const remember = useCallback((recording: Recording) => {
@@ -824,7 +717,7 @@ export default function Home() {
         const { response, inputUrl, inputBlob } =
           await synthesizeUtterance(audio);
         lastResponse.current = response;
-        setOriginal(inputUrl);
+        original.set(inputUrl);
         remember({
           kind: "mic",
           input: inputBlob,
@@ -846,11 +739,12 @@ export default function Home() {
         await restoreMic();
       }
     },
-    [playSamuel, restoreMic, setOriginal, remember],
+    [playSamuel, restoreMic, original, remember],
   );
 
   const startMic = useCallback(async () => {
     setError(null);
+    exitManual(); // the mic and a hand on the pad both want the whole mouth
     try {
       const current = await fetchHealth();
       if (!current) {
@@ -882,16 +776,13 @@ export default function Home() {
           positiveSpeechThreshold: POSITIVE_SPEECH_THRESHOLD,
           negativeSpeechThreshold: NEGATIVE_SPEECH_THRESHOLD,
           onSpeechStart: () => {
-            speakingRef.current = true;
             if (!busyRef.current && micOnRef.current) setStatus("recording");
           },
           onVADMisfire: () => {
-            speakingRef.current = false;
             levelStore.set(0);
             if (!busyRef.current && micOnRef.current) setStatus("listening");
           },
           onSpeechEnd: (audio) => {
-            speakingRef.current = false;
             showHeard(false);
             levelStore.set(0);
             void onUtterance(audio);
@@ -900,10 +791,7 @@ export default function Home() {
             if (busyRef.current || !micOnRef.current) return;
             if (isSpeech >= POSITIVE_SPEECH_THRESHOLD) showHeard(true);
             else if (isSpeech < NEGATIVE_SPEECH_THRESHOLD) showHeard(false);
-            // Hold the level through the redemption window: left live it would
-            // collapse to nothing in the silence, leaving nothing to drain.
-            const redeeming = speakingRef.current && !heardRef.current;
-            if (!redeeming) levelStore.set(levelToSlots(frame));
+            levelStore.set(levelToSlots(frame));
           },
         });
       }
@@ -917,7 +805,7 @@ export default function Home() {
       setMicOn(false);
       setStatus(vadRef.current ? "muted" : "idle");
     }
-  }, [trombone, onUtterance, showHeard, levelStore]);
+  }, [trombone, onUtterance, showHeard, levelStore, exitManual]);
 
   /** Turn the mic off. `submit` sends a half-spoken utterance rather than
    * binning it — true from the button, since people press it meaning "I'm
@@ -927,7 +815,6 @@ export default function Home() {
       micOnRef.current = false;
       setMicOn(false);
       showHeard(false);
-      speakingRef.current = false;
       levelStore.set(0);
       const vad = vadRef.current;
       // Scoped to this one pause: the others (playback starting, a
@@ -942,23 +829,41 @@ export default function Home() {
     [showHeard, levelStore],
   );
 
-  // Leaving shouldn't leave a live mic behind: mute when the tab is hidden or
-  // the window loses focus (another window on top still hears you), and stay
-  // muted on return so coming back is an explicit user gesture.
+  // Leaving shouldn't leave a live mic — or a held note — behind, and coming
+  // back is always an explicit gesture: nothing auto-resumes. A hidden tab is
+  // gone for good, so it mutes at once; merely losing focus gets BLUR_MUTE_MS of
+  // grace, since another window on top is as likely to be devtools as it is to
+  // be leaving.
   useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const cancel = () => {
+      if (timer) clearTimeout(timer);
+      timer = null;
+    };
     const leave = () => {
+      cancel();
       if (micOnRef.current) void stopMic();
+      // Manual control sustains the synth indefinitely, which a tab you've
+      // walked away from must not go on doing.
+      exitManual();
     };
     const onVisibility = () => {
       if (document.hidden) leave();
     };
-    document.addEventListener("visibilitychange", onVisibility);
-    window.addEventListener("blur", leave);
-    return () => {
-      document.removeEventListener("visibilitychange", onVisibility);
-      window.removeEventListener("blur", leave);
+    const onBlur = () => {
+      cancel();
+      timer = setTimeout(leave, BLUR_MUTE_MS);
     };
-  }, [stopMic]);
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("blur", onBlur);
+    window.addEventListener("focus", cancel);
+    return () => {
+      cancel();
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("blur", onBlur);
+      window.removeEventListener("focus", cancel);
+    };
+  }, [stopMic, exitManual]);
 
   /** Flip one mic-processing flag. If we're listening right now, cycle the
    * stream so it takes effect immediately rather than after the next
@@ -987,6 +892,7 @@ export default function Home() {
     async (name: string) => {
       const clip = clips.find((c) => c.name === name);
       if (!clip || processingRef.current) return;
+      exitManual();
       stopPlayback();
       busyRef.current = true;
       processingRef.current = true;
@@ -1003,7 +909,7 @@ export default function Home() {
         // clips behave like the mic rather than firing on mousedown.
         if (precomputed) await fakeThinking();
         lastResponse.current = response;
-        setOriginal(inputUrl);
+        original.set(inputUrl);
         remember({
           kind: "dataset",
           input: inputBlob,
@@ -1032,8 +938,9 @@ export default function Home() {
       stopPlayback,
       playSamuel,
       restoreMic,
-      setOriginal,
+      original,
       remember,
+      exitManual,
     ],
   );
 
@@ -1041,13 +948,14 @@ export default function Home() {
   const playFrom = useCallback(
     async (which: Source, frac: number) => {
       setError(null);
+      exitManual();
       if (which === "original") {
         await playOriginal(frac);
       } else if (lastResponse.current) {
         await playSamuel(lastResponse.current, frac);
       }
     },
-    [playOriginal, playSamuel],
+    [playOriginal, playSamuel, exitManual],
   );
 
   /** Play from the scrub position (or the start, if at the end); pause if
@@ -1068,44 +976,102 @@ export default function Home() {
    * the same utterance, so the position carries over. */
   const toggleSource = useCallback(() => {
     const next: Source = sourceRef.current === "samuel" ? "original" : "samuel";
-    if (next === "original" && !originalUrlRef.current) return;
+    if (next === "original" && !original.loaded) return;
     sourceRef.current = next;
     setSource(next);
     if (isPlaying) void playFrom(next, scrubFracRef.current);
-  }, [isPlaying, playFrom]);
+  }, [isPlaying, playFrom, original.loaded]);
 
   const onScrub = useCallback(
     (frac: number) => {
       updateFrac(frac);
       if (!scrubbingRef.current) {
+        exitManual(); // the bar is about to drive the tract itself
         scrubbingRef.current = true;
         void vadRef.current?.pause(); // scrubbing makes sound; don't feed it back
         setStatus("speaking");
       }
       if (sourceRef.current === "original") {
-        const audio = originalAudioRef.current;
-        const duration = originalDuration();
-        if (audio && duration)
-          audio.currentTime = Math.min(duration - 0.01, frac * duration);
+        original.seek(frac);
         // Mid-playback the element is already the sound, and dragging just
         // seeks it. Stopped, the grains are the sound.
-        if (!audio || audio.paused) playGrain(frac);
+        if (original.paused()) original.playGrain(frac);
         return;
       }
       const response = lastResponse.current;
       if (!response) return;
       trombone.scrub(response, frac);
     },
-    [trombone, updateFrac, originalDuration, playGrain],
+    [trombone, updateFrac, original, exitManual],
   );
 
+  /** Letting go of the bar plays on from where you dropped it, whether or not
+   * it was playing when you grabbed it — the scrub is a seek, not a stop. */
   const onScrubEnd = useCallback(async () => {
     if (!scrubbingRef.current) return;
     scrubbingRef.current = false;
     trombone.endScrub();
-    stopGrain();
+    original.stopGrain();
+    const frac = scrubFracRef.current;
+    const hasSource =
+      sourceRef.current === "original"
+        ? original.loaded
+        : !!lastResponse.current;
+    if (!processingRef.current && hasSource && frac < 0.995) {
+      await playFrom(sourceRef.current, frac);
+      return;
+    }
     if (!busyRef.current) await restoreMic();
-  }, [trombone, stopGrain, restoreMic]);
+  }, [trombone, original, restoreMic, playFrom]);
+
+  // A drag on the voicebox pad, reported by the element (GlottisUI in the fork
+  // dispatches it, having worked out the pitch and voicing from the pointer).
+  // preventDefault() is what stops it setting the AudioParams itself: a plain
+  // `.value` write doesn't cancel our scheduled curves, so the two would fight
+  // for the length of the drag. Scheduling stays ours.
+  useEffect(() => {
+    const element =
+      document.querySelector<PinkTromboneElement>("pink-trombone");
+    if (!element) return;
+
+    const onVoicebox = (event: Event) => {
+      event.preventDefault();
+      const { frequency, tenseness } = (
+        event as CustomEvent<VoiceboxEventDetail>
+      ).detail;
+      // Releasing the pad is not a reason to stop: manual control holds the
+      // note until it is switched off, so "end" carries no values and there is
+      // nothing to do with it.
+      if (frequency === undefined || tenseness === undefined) return;
+      trombone.voice(frequency, tenseness);
+    };
+
+    element.addEventListener("voicebox", onVoicebox);
+    return () => element.removeEventListener("voicebox", onVoicebox);
+  }, [trombone]);
+
+  /** Manual control is a switch, not a key: it holds the note for as long as
+   * it's on, and dragging the voicebox or the tract shapes what you're already
+   * hearing. */
+  const toggleManual = useCallback(() => {
+    if (manualRef.current) {
+      exitManual();
+      void restoreMic(); // nothing to hand back to, so: muted or idle
+      return;
+    }
+    manualRef.current = true;
+    setManual(true);
+    // Silence the imitation but leave the tract in the pose it reached: that
+    // pose is the interesting starting point, and startVoice picks up the note
+    // the playback left off on, so switching this on continues from wherever
+    // the model got to rather than from some default.
+    stopPlayback();
+    busyRef.current = false;
+    void trombone.resume(); // we're in a user gesture
+    voicingRef.current = true;
+    trombone.startVoice();
+    setStatus("speaking");
+  }, [exitManual, restoreMic, stopPlayback, trombone]);
 
   // "recording" only means the VAD currently hears *something* — a cough or a
   // door must not disable the buttons, or every other click gets swallowed
@@ -1113,11 +1079,16 @@ export default function Home() {
   // the VAD, which discards the in-flight segment. Playback is *not* a reason
   // to disable anything: every control below interrupts it cleanly.
   const notBusy = insecure === null && status !== "processing";
-  const hasSource = source === "original" ? hasOriginal : viewResponse !== null;
+  const hasSource =
+    source === "original" ? original.loaded : viewResponse !== null;
   // Is there anything at all to play, on either source? Not `hasSource`:
   // flipping the switch to a side that happens to be empty shouldn't drain the
   // colour out of the switch you'd flip back with.
-  const transportReady = hasOriginal || viewResponse !== null;
+  const transportReady = original.loaded || viewResponse !== null;
+  // One gate for the whole transport, so every control inside it dims and
+  // desaturates on the same condition — a control that stays enabled here would
+  // desaturate without dimming and read a shade darker than its neighbours.
+  const transportLive = transportReady && !micOn;
   // A live mic and the transport are mutually exclusive: scrubbing sustains the
   // synth into your own microphone. Turning the mic off hands the page over.
   const canPlay = hasSource && notBusy && !micOn;
@@ -1125,16 +1096,16 @@ export default function Home() {
   // Mid-utterance but hearing nothing, i.e. the redemption window: "recording"
   // is set on speech start and cleared only when the segment ends or misfires.
   const pending = status === "recording" && !heard;
-  // The tract is drawn grey until an audio input is picked: the mic is on, or a
-  // pre-recorded clip has come back from the model.
-  const tractActive = micOn || viewResponse !== null;
+  // The drawing is grey until something has a claim on it: the mic is on, a
+  // pre-recorded clip has come back from the model, or you've taken it by hand.
+  const tractActive = micOn || viewResponse !== null || manual;
   // At most one box is lit, and it's wherever the interesting thing is: pick an
   // input, watch the tract while it thinks and answers, then the transport
   // takes over — unless the mic is still on, in which case it never left the
   // input box. The original doesn't move the tract, so it stays on the
   // transport. "tract" lights nothing: the tract has no box, it just moves.
   const section: Section =
-    status === "processing" || (isPlaying && source === "samuel")
+    status === "processing" || (isPlaying && source === "samuel") || manual
       ? "tract"
       : micOn
         ? "input"
@@ -1165,7 +1136,7 @@ export default function Home() {
           <TextLink href="https://www.foddy.net/Athletics.html" muted>
             QWOP
           </TextLink>{" "}
-          of text-to-speech.
+          of speech synthesis.
         </p>
         <p className="text-neutral-600">
           Made by{" "}
@@ -1175,123 +1146,129 @@ export default function Home() {
           </TextLink>
           .
         </p>
-        <div
-          className={`flex w-full flex-col gap-2 p-3 ${sectionBox(section === "input")}`}
-        >
-          {micOn ? (
-            <div
-              className={`flex flex-col justify-between gap-2 ${INPUT_MIN_H}`}
-            >
-              <div className="flex min-w-0 flex-col gap-1">
-                <span className="flex items-center gap-2 text-sm font-semibold text-highlight-700">
-                  <span
-                    aria-hidden
-                    className="h-2.5 w-2.5 shrink-0 rounded-full bg-highlight-600"
-                  />
-                  {micHeading(status)}
-                </span>
-                <span className="text-neutral-500">
-                  Samuel answers after you pause
-                </span>
-              </div>
+        {/* Both faces of the box share one grid cell, so it is always as tall
+            as the taller of them and toggling the mic can't move the page. The
+            hidden one is `invisible`, which still takes up space but drops out
+            of hit-testing and the tab order. */}
+        <div className={`grid w-full p-3 ${sectionBox(section === "input")}`}>
+          <div
+            className={`col-start-1 row-start-1 flex flex-col justify-between gap-2 ${micOn ? "" : "invisible"}`}
+            aria-hidden={!micOn}
+          >
+            <span className="flex min-w-0 items-center gap-2 text-neutral-500">
+              <span
+                aria-hidden
+                className="h-2.5 w-2.5 shrink-0 rounded-full bg-highlight-600"
+              />
+              Speak now, Samuel answers after you pause
+            </span>
 
-              <div className="flex items-end justify-between gap-4">
-                <LevelMeter
-                  store={levelStore}
-                  active={heard}
-                  pending={pending}
-                />
+            <div className="flex items-end justify-between gap-4">
+              <LevelMeter store={levelStore} active={heard} pending={pending} />
 
-                <button
-                  onClick={() => void stopMic(true)}
-                  title="Stop listening and hand the page back to the playback controls"
-                  className="rounded-full border border-highlight-300 px-4 py-1.5 text-sm font-medium text-highlight-700 hover:bg-highlight-50"
-                >
-                  Turn off
-                </button>
-              </div>
+              <button
+                onClick={() => void stopMic(true)}
+                title="Stop listening and hand the page back to the playback controls"
+                className="rounded-full border border-highlight-300 px-4 py-1.5 text-sm font-medium text-highlight-700 hover:bg-highlight-50"
+              >
+                Turn off
+              </button>
             </div>
-          ) : (
-            /* Two columns: talk to it on the left, or pick a canned clip on the
-               right. Wraps to one column when there isn't room for both. */
-            <div
-              className={`flex flex-wrap items-center justify-around gap-6 ${INPUT_MIN_H}`}
-            >
-              <div className="flex min-w-0 flex-col items-center gap-1.5">
-                <button
-                  onClick={() => void startMic()}
-                  disabled={insecure !== null}
-                  title={
-                    insecure
-                      ? "Unavailable on an insecure origin"
-                      : "Listen continuously and mimic every utterance"
-                  }
-                  className="rounded-full bg-highlight-600 px-4 py-1.5 text-sm font-semibold text-white hover:bg-highlight-700 disabled:opacity-40 disabled:hover:bg-highlight-600"
-                >
-                  Microphone
-                </button>
+          </div>
 
-                {/* Reassurance, not an action: recordings go to the server only
+          {/* Two columns: talk to it on the left, or pick a canned clip on the
+              right. Wraps to one column when there isn't room for both. */}
+          <div
+            className={`col-start-1 row-start-1 flex flex-wrap items-center justify-around gap-6 ${micOn ? "invisible" : ""}`}
+            aria-hidden={micOn}
+          >
+            <div className="flex min-w-0 flex-col items-center gap-1.5">
+              <button
+                onClick={() => void startMic()}
+                disabled={insecure !== null}
+                title={
+                  insecure
+                    ? "Unavailable on an insecure origin"
+                    : "Listen continuously and mimic every utterance"
+                }
+                className="rounded-full bg-highlight-600 px-4 py-1.5 text-sm font-semibold text-white hover:bg-highlight-700 disabled:opacity-40 disabled:hover:bg-highlight-600"
+              >
+                Microphone
+              </button>
+
+              {/* Reassurance, not an action: recordings go to the server only
                     to be mimicked back, and nothing is written to disk there.
                     Only the "self-host" escape hatch is clickable. */}
-                <span
-                  className="text-center text-xs text-neutral-500"
-                  title="Recordings are sent to the server only to be mimicked back; they are never written to disk."
-                >
-                  Your audio is not stored.
-                  <br />
-                  <TextLink href="https://github.com/vvolhejn/samuel" muted>
-                    Self-host
-                  </TextLink>{" "}
-                  if you don&apos;t trust me
-                </span>
-              </div>
+              <span
+                className="text-center text-xs text-neutral-500"
+                title="Recordings are sent to the server only to be mimicked back; they are never written to disk."
+              >
+                Your audio is not stored.
+                <br />
+                <TextLink href="https://github.com/vvolhejn/samuel" muted>
+                  Self-host
+                </TextLink>{" "}
+                if you don&apos;t trust me
+              </span>
+            </div>
 
-              <div className="flex shrink-0 flex-col gap-1.5">
-                <span className="text-sm text-neutral-500">
-                  or use pre-recorded audio
-                </span>
+            <div className="flex shrink-0 flex-col gap-1.5">
+              <span className="text-sm text-neutral-500">
+                or use pre-recorded audio
+              </span>
 
-                {/* One button per committed clip, numbered rather than named:
+              {/* One button per committed clip, numbered rather than named:
                     which recording is which only matters once you've heard
                     them. */}
-                <div className="grid grid-cols-3 gap-1.5">
-                  {clips.map((clip, i) => (
-                    <button
-                      key={clip.name}
-                      onClick={() => void playClip(clip.name)}
-                      disabled={!notBusy}
-                      title={
-                        insecure
-                          ? "Unavailable on an insecure origin"
-                          : `Mimic ${clip.duration_s.toFixed(0)}s of held-out speech`
-                      }
-                      className={
-                        clip.name === playedClip
-                          ? "rounded-md bg-highlight-600 px-3 py-1 text-sm font-semibold text-white disabled:opacity-40"
-                          : /* White like the Play pill, not transparent: these
+              <div className="grid grid-cols-3 gap-1.5">
+                {clips.map((clip, i) => (
+                  <button
+                    key={clip.name}
+                    onClick={() => void playClip(clip.name)}
+                    disabled={!notBusy}
+                    title={
+                      insecure
+                        ? "Unavailable on an insecure origin"
+                        : `Mimic ${clip.duration_s.toFixed(0)}s of held-out speech`
+                    }
+                    className={
+                      clip.name === playedClip
+                        ? "rounded-md bg-highlight-600 px-3 py-1 text-sm font-semibold text-white disabled:opacity-40"
+                        : /* White like the Play pill, not transparent: these
                              keep their own ground when the box behind them
                              lights up. */
-                            "rounded-md border border-highlight-300 bg-white px-3 py-1 text-sm font-medium text-highlight-700 hover:bg-highlight-50 disabled:opacity-40 disabled:hover:bg-white"
-                      }
-                    >
-                      {i + 1}
-                    </button>
-                  ))}
-                </div>
+                          "rounded-md border border-highlight-300 bg-white px-3 py-1 text-sm font-medium text-highlight-700 hover:bg-highlight-50 disabled:opacity-40 disabled:hover:bg-white"
+                    }
+                  >
+                    {i + 1}
+                  </button>
+                ))}
               </div>
             </div>
-          )}
+          </div>
         </div>
         {/* Same grey-until-there's-something rule as the tract, done in one
             place: with nothing to play, every accent inside the transport —
             the Play pill, the source switch, the scrubber — desaturates
-            together rather than each control needing its own dead colour. */}
+            together rather than each control needing its own dead colour. A
+            live mic greys it too, since the mic holds the page until it's off. */}
         <div
-          className={`flex w-full flex-col gap-3 p-3 ${sectionBox(section === "playback")} ${
-            transportReady ? "" : "grayscale"
+          className={`relative flex w-full flex-col gap-3 p-3 ${sectionBox(section === "playback")} ${
+            transportLive ? "" : "grayscale"
           }`}
         >
+          {/* Reaching for a dead transport says you're done talking, so treat
+              it as the "Turn off" button. Has to be an overlay rather than a
+              click handler on the box: the controls underneath are disabled,
+              and a disabled control swallows the click instead of bubbling. */}
+          {micOn && (
+            <button
+              onClick={() => void stopMic(true)}
+              title="Turn the microphone off to play back what you said"
+              aria-label="Turn the microphone off to use the playback controls"
+              className="absolute inset-0 z-10 rounded-xl"
+            />
+          )}
           <div className="flex items-center gap-4">
             <button
               onClick={() => void togglePlay()}
@@ -1318,7 +1295,7 @@ export default function Home() {
                 aria-checked={source === "original"}
                 aria-label="Play the original instead of the imitation"
                 onClick={toggleSource}
-                disabled={!hasOriginal}
+                disabled={!original.loaded || !transportLive}
                 title="Switch between the model's imitation and the audio it heard"
                 className={`relative h-6 w-11 shrink-0 rounded-full transition-colors disabled:opacity-40 ${
                   source === "original" ? "bg-neutral-500" : "bg-highlight-600"
@@ -1383,24 +1360,63 @@ export default function Home() {
           that's moving already announces itself, and the greyed-out state
           covers the rest. */}
       {insecure === null && (
-        <div className="relative shrink-0 p-2">
-          <pink-trombone
-            className="block h-[500px] w-[600px]"
-            inactive={tractActive ? undefined : "true"}
-          />
-          {/* Over the tract rather than beside the buttons: the wait is the one
-              moment nothing else on the page moves, and tucked next to the
-              controls it was easy to miss. */}
-          {status === "processing" && (
-            <div className="absolute inset-0 z-10 flex items-center justify-center rounded-xl bg-white/70">
-              {/* Solid strip behind the words: the tract is all thin dark lines,
-                  and the wash alone doesn't hide enough of them to read over. */}
-              <span className="w-full bg-white py-2 text-center text-2xl text-neutral-600">
-                Thinking
-                <Ellipsis />
-              </span>
-            </div>
-          )}
+        <div className="shrink-0 p-2">
+          {/* The element draws a fixed 600×600 — the tract's 600×500 with the
+              voicebox strip under it, which is the original Pink Trombone's
+              canvas — so size the host to match rather than letting it stretch.
+              Left out entirely on an insecure origin, where it would stay blank:
+              the synth it draws is never started there. No box of its own
+              either: a tract that's moving already announces itself, and the
+              greyed-out state covers the rest. */}
+          <div className="relative">
+            {/* Read-only unless the mouth is yours. The element's drags write
+                the same AudioParams our curves automate, and a `.value` write
+                doesn't cancel a scheduled curve — so an idle poke used to fight
+                the imitation and win for as long as your finger was down. */}
+            <pink-trombone
+              className="block h-[600px] w-[600px]"
+              inactive={tractActive ? undefined : "true"}
+              interactive={manual ? undefined : "false"}
+            />
+
+            {/* Over the tract rather than beside the buttons: the wait is the one
+                moment nothing else on the page moves, and tucked next to the
+                controls it was easy to miss. Bounded to the tract's own 500px so
+                it doesn't cover the voicebox. */}
+            {status === "processing" && (
+              <div className="absolute inset-x-0 top-0 z-10 flex h-[500px] items-center justify-center rounded-xl bg-white/70">
+                {/* Solid strip behind the words: the tract is all thin dark lines,
+                    and the wash alone doesn't hide enough of them to read over. */}
+                <span className="w-full bg-white py-2 text-center text-2xl text-neutral-600">
+                  Thinking
+                  <Ellipsis />
+                </span>
+              </div>
+            )}
+          </div>
+
+          {/* A plain page control rather than one of the original's pills drawn
+              into the canvas: it is chrome, not part of the picture, so it
+              belongs to the page's own idiom (and stays focusable). Under the
+              drawing, since what it hands you is the drawing. */}
+          <div className="flex justify-end px-1 pt-2">
+            <button
+              onClick={toggleManual}
+              disabled={micOn}
+              title={
+                micOn
+                  ? "Turn the microphone off first"
+                  : "Play the mouth yourself: drag the voicebox to pitch and voice it, and drag the tract to move the tongue"
+              }
+              className={
+                manual
+                  ? "shrink-0 rounded-full bg-highlight-600 px-4 py-1.5 text-sm font-semibold text-white hover:bg-highlight-700"
+                  : "shrink-0 rounded-full border border-neutral-300 bg-white px-4 py-1.5 text-sm font-medium text-neutral-600 hover:bg-neutral-50 disabled:opacity-40 disabled:hover:bg-white"
+              }
+            >
+              Manual control
+            </button>
+          </div>
         </div>
       )}
     </main>
