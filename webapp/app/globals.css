@@ -20,15 +20,15 @@
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: "Helvetica Neue", Helvetica, Arial, Roboto, "Noto Sans",
-    sans-serif;
+  --font-sans:
+    "Helvetica Neue", Helvetica, Arial, Roboto, "Noto Sans", sans-serif;
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: "Helvetica Neue", Helvetica, Arial, Roboto, "Noto Sans",
-    sans-serif;
+  font-family:
+    "Helvetica Neue", Helvetica, Arial, Roboto, "Noto Sans", sans-serif;
 }
 
 /* Animated ellipsis for the "Thinking" overlay: ".", "..", "...", repeat. The dots
@@ -56,6 +56,27 @@ body {
   }
   66.66%,
   100% {
+    opacity: 1;
+  }
+}
+
+/* Dots typed out after the mic level meter during the VAD's redemption window.
+   Delays must stay in step with REDEMPTION_MS in page.tsx. */
+.meter-dots > span {
+  opacity: 0;
+  animation: meter-dot 1ms linear forwards;
+}
+.meter-dots > span:nth-child(1) {
+  animation-delay: 200ms;
+}
+.meter-dots > span:nth-child(2) {
+  animation-delay: 400ms;
+}
+.meter-dots > span:nth-child(3) {
+  animation-delay: 600ms;
+}
+@keyframes meter-dot {
+  to {
     opacity: 1;
   }
 }

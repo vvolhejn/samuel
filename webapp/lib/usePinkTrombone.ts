@@ -44,6 +44,9 @@ export interface PinkTromboneHandle {
   scrub: (response: SynthResponse, frac: number) => void;
   /** Fade the voicing after scrubbing (the tract pose stays in place). */
   endScrub: () => void;
+  /** The synth's AudioContext, or null before init(). Shared so callers can
+   * decode and play their own audio on the same clock and device. */
+  audioContext: () => AudioContext | null;
   ready: () => boolean;
 }
 
@@ -314,7 +317,13 @@ export function usePinkTrombone(): PinkTromboneHandle {
     const constriction = constrictionRef.current;
     const lipConstriction = lipConstrictionRef.current;
     const masterGain = masterGainRef.current;
-    if (!playback || !element || !constriction || !lipConstriction || !masterGain)
+    if (
+      !playback ||
+      !element ||
+      !constriction ||
+      !lipConstriction ||
+      !masterGain
+    )
       return;
     if (speed === playback.speed) return;
     // Without cancelAndHoldAtTime the running curve cannot be truncated, and
@@ -370,7 +379,11 @@ export function usePinkTrombone(): PinkTromboneHandle {
     const masterGain = masterGainRef.current;
     if (!element || !constriction || !lipConstriction || !masterGain) return;
     const now = element.audioContext.currentTime;
-    for (const param of automatedParams(element, constriction, lipConstriction)) {
+    for (const param of automatedParams(
+      element,
+      constriction,
+      lipConstriction,
+    )) {
       cancelAndHold(param, now);
     }
     cancelAndHold(masterGain.gain, now);
@@ -416,6 +429,11 @@ export function usePinkTrombone(): PinkTromboneHandle {
     masterGain.gain.setTargetAtTime(0, now, FADE_OUT_S);
   }, []);
 
+  const audioContext = useCallback(
+    () => elementRef.current?.audioContext ?? null,
+    [],
+  );
+
   const ready = useCallback(() => elementRef.current !== null, []);
 
   // Stable handle: effects depending on it must not re-run on re-render.
@@ -428,8 +446,19 @@ export function usePinkTrombone(): PinkTromboneHandle {
       stop,
       scrub,
       endScrub,
+      audioContext,
       ready,
     }),
-    [init, resume, speak, setPlaybackSpeed, stop, scrub, endScrub, ready],
+    [
+      init,
+      resume,
+      speak,
+      setPlaybackSpeed,
+      stop,
+      scrub,
+      endScrub,
+      audioContext,
+      ready,
+    ],
   );
 }

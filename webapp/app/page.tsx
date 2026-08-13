@@ -33,15 +33,133 @@ type Status =
  * highlighted at a time, which is how the eye gets handed along. */
 type Section = "input" | "playback" | "tract";
 
-/** Faint box around a stage; the active one takes the accent border. Padding is
- * left to the call site — the tract host is a fixed 600×500 and wants less. */
+/** Faint box around a stage; the active one drops the outline and fills with the
+ * accent wash instead, so only one thing at a time reads as raised. The border
+ * stays declared but transparent when lit, or the box would shift a pixel.
+ * Padding is left to the call site. */
 function sectionBox(active: boolean): string {
-  return `rounded-xl border transition-colors ${
-    active ? "border-highlight-300 bg-highlight-50/60" : "border-neutral-200"
+  return `rounded-xl border transition-[color,background-color,border-color,filter] ${
+    active
+      ? "border-transparent bg-highlight-50/60"
+      : "border-neutral-200 bg-white"
   }`;
 }
 
-const SPEEDS = [0.25, 0.5, 1] as const;
+/** Which of the two audio sources the transport plays: the model's imitation,
+ * or the audio it was made from. */
+type Source = "samuel" | "original";
+
+/** Floor under both faces of the input box, so toggling the mic doesn't resize
+ * it and shove the page around. */
+const INPUT_MIN_H = "min-h-[5.5rem]";
+
+/** Silence the VAD waits through before it calls an utterance finished. The
+ * meter greys out over exactly this window, so the wait reads as a countdown. */
+const REDEMPTION_MS = 800;
+
+/** vad-web's hysteresis, restated so the meter watches the same edges it does:
+ * speech starts above the first, ends below the second. */
+const POSITIVE_SPEECH_THRESHOLD = 0.3;
+const NEGATIVE_SPEECH_THRESHOLD = 0.25;
+
+/** Heading in the recording panel. */
+function micHeading(status: Status): string {
+  if (status === "processing") return "Thinking…";
+  if (status === "speaking") return "Answering…";
+  return "Recording";
+}
+
+/** Pipes in the level meter. Unlit ones stay on screen, greyed. */
+const METER_SLOTS = 14;
+
+/** Dots typed out after the meter during the redemption window. */
+const METER_DOTS = 3;
+
+/** RMS range spanned by the meter, in dBFS: under a quiet room to under a
+ * shout, so ordinary speech lands mid-scale. */
+const METER_FLOOR_DB = -55;
+const METER_CEIL_DB = -18;
+
+function levelToSlots(frame: Float32Array): number {
+  let sum = 0;
+  for (const sample of frame) sum += sample * sample;
+  const rms = Math.sqrt(sum / frame.length);
+  if (rms <= 0) return 0;
+  const db = 20 * Math.log10(rms);
+  const frac = (db - METER_FLOOR_DB) / (METER_CEIL_DB - METER_FLOOR_DB);
+  return Math.max(0, Math.min(METER_SLOTS, Math.round(frac * METER_SLOTS)));
+}
+
+/** Publishes the mic level outside React, so the ~31 frames a second repaint
+ * the meter rather than the whole page. Quantised to a slot count, so most
+ * frames don't notify at all. */
+function makeLevelStore() {
+  let slots = 0;
+  const listeners = new Set<() => void>();
+  return {
+    set(next: number) {
+      if (next === slots) return;
+      slots = next;
+      for (const listener of listeners) listener();
+    },
+    subscribe(listener: () => void) {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+    get: () => slots,
+  };
+}
+
+type LevelStore = ReturnType<typeof makeLevelStore>;
+
+/** Mic level as a line of text: pink while `active`, draining to grey over the
+ * redemption window, with dots typed out through `pending`. */
+function LevelMeter({
+  store,
+  active,
+  pending,
+}: {
+  store: LevelStore;
+  active: boolean;
+  pending: boolean;
+}) {
+  const slots = useSyncExternalStore(store.subscribe, store.get, () => 0);
+  return (
+    <p aria-hidden className="text-neutral-300">
+      <span
+        className="ease-linear"
+        style={{
+          color: active ? "var(--color-highlight-600)" : "inherit",
+          transitionProperty: "color",
+          transitionDuration: active ? "60ms" : `${REDEMPTION_MS}ms`,
+        }}
+      >
+        {"|".repeat(slots)}
+      </span>
+      {"|".repeat(METER_SLOTS - slots)}
+      {/* Staggered in CSS, so mounting starts the animation and unmounting
+          wipes it. */}
+      {pending && (
+        <span className="meter-dots text-neutral-400">
+          {Array.from({ length: METER_DOTS }, (_, i) => (
+            <span key={i}>.</span>
+          ))}
+        </span>
+      )}
+    </p>
+  );
+}
+
+/** Tape-scrub preview of the original: dragging the bar plays a short window of
+ * audio from under the thumb. One grain per move, each superseding the last.
+ * GRAIN_S is long enough to hear a vowel, and outlives GRAIN_INTERVAL_MS so a
+ * steady drag sounds continuous rather than stuttered; the fades are what keep
+ * the cut edges from clicking. */
+const GRAIN_S = 0.12;
+const GRAIN_FADE_S = 0.01;
+const GRAIN_INTERVAL_MS = 55;
 
 /** Nothing ever invalidates the secure-context snapshot. */
 const subscribeNever = () => () => {};
@@ -166,12 +284,18 @@ function Ellipsis() {
 }
 
 /** A link in the prose. Anything off-origin opens in a new tab — which, as it
- * stands, is every link here. */
+ * stands, is every link here.
+ *
+ * `muted` is for asides nobody needs to follow (the QWOP joke, the credit for
+ * the original): the pink underline still says "link", but the text stays the
+ * colour of the sentence around it so it doesn't ask for the click. */
 function TextLink({
   href,
+  muted,
   children,
 }: {
   href: string;
+  muted?: boolean;
   children: React.ReactNode;
 }) {
   const external = /^(https?:)?\/\//.test(href);
@@ -180,7 +304,11 @@ function TextLink({
       href={href}
       target={external ? "_blank" : undefined}
       rel={external ? "noreferrer" : undefined}
-      className="text-highlight-600 underline decoration-dotted hover:text-highlight-700"
+      className={
+        muted
+          ? "text-inherit underline decoration-highlight-600 decoration-dotted underline-offset-2 hover:text-highlight-600"
+          : "text-highlight-600 underline decoration-dotted hover:text-highlight-700"
+      }
     >
       {children}
     </a>
@@ -338,19 +466,22 @@ export default function Home() {
   /** Render-side mirror of lastResponse (refs must not be read in render). */
   const [viewResponse, setViewResponse] = useState<SynthResponse | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [speed, setSpeed] = useState<number>(1);
-  /** Playback/scrub position within the last response, in [0, 1]. */
+  /** Which source the transport is pointed at. */
+  const [source, setSource] = useState<Source>("samuel");
+  /** Playback/scrub position within the current source, in [0, 1]. */
   const [scrubFrac, setScrubFrac] = useState(0);
   const [micProcessing, setMicProcessing] = useState<MicProcessing>(
     MIC_PROCESSING_DEFAULTS,
   );
   /** Is there audio the model heard, i.e. can "Original" play anything? */
   const [hasOriginal, setHasOriginal] = useState(false);
-  /** The original is playing, so its segment of the pill offers Pause. */
-  const [playingOriginal, setPlayingOriginal] = useState(false);
   /** User-intended mic state — the Record/Stop toggle. Mirrors micOnRef; the
    * status alone can't stand in for it (a dataset clip is "speaking" too). */
   const [micOn, setMicOn] = useState(false);
+  /** Is the VAD hearing speech *this frame*? Drives the ring around the
+   * recording panel, and nothing else — unlike status "recording" it flips tens
+   * of times a second, so it must never gate a control. */
+  const [heard, setHeard] = useState(false);
   /** Pre-recorded clips shipped with the app, and the last one played (which
    * is the button left filled in). */
   const [clips, setClips] = useState<DatasetClip[]>([]);
@@ -374,13 +505,41 @@ export default function Home() {
   /** Every utterance this session, for the debug panel's download. */
   const historyRef = useRef<Recording[]>([]);
   const [historyCount, setHistoryCount] = useState(0);
-  const debugAudioRef = useRef<HTMLAudioElement | null>(null);
+  /** Plays originalUrlRef. One long-lived element, so its currentTime can drive
+   * the scrub bar and be driven by it. */
+  const originalAudioRef = useRef<HTMLAudioElement | null>(null);
+  /** The same audio decoded, for the scrub preview — grains need random access,
+   * which a media element's seek latency can't give. Null until the decode
+   * lands (or for good, if it fails: the preview is then simply silent). */
+  const originalBufferRef = useRef<AudioBuffer | null>(null);
+  /** Bumped per original, so a slow decode can't install a stale buffer. */
+  const originalTokenRef = useRef(0);
+  /** The scrub grain now sounding, kept so the next one can cut it short. */
+  const grainRef = useRef<{
+    source: AudioBufferSourceNode;
+    gain: GainNode;
+  } | null>(null);
+  const lastGrainAtRef = useRef(0);
   const busyRef = useRef(false); // ignore VAD events while processing/speaking
+  /** Waiting on the model — the one state nothing can interrupt. */
+  const processingRef = useRef(false);
   const micOnRef = useRef(false); // user-intended mic state (start/mute toggle)
-  const speedRef = useRef(1); // playResponse is a stable callback; read via ref
   const scrubbingRef = useRef(false); // pointer is down on the scrub bar
+  /** Bumped whenever a playback starts or is cut short, so the completion of a
+   * superseded one can't clear the new one's state out from under it. */
+  const playIdRef = useRef(0);
+  /** Mirror of scrubFrac for the callbacks that must not re-bind on every
+   * progress tick. */
+  const scrubFracRef = useRef(0);
+  const sourceRef = useRef<Source>("samuel");
   // Read by getStream/resumeStream, which vad-web calls on every start().
   const micProcessingRef = useRef<MicProcessing>(MIC_PROCESSING_DEFAULTS);
+  /** Mirror of `heard`, so the per-frame callback only re-renders on edges. */
+  const heardRef = useRef(false);
+  /** Mirror of the VAD's own `speaking` flag, which unlike heardRef stays up
+   * through the redemption window. */
+  const speakingRef = useRef(false);
+  const [levelStore] = useState(makeLevelStore);
 
   // Bring up the synth + tract visualization immediately; the AudioContext
   // stays suspended until the first user gesture (Start).
@@ -412,9 +571,29 @@ export default function Home() {
     void fetchPrecomputedIndex().then(setPrecomputed);
   }, []);
 
+  // The element that plays the original. Made once: a fresh element per play
+  // has no stable currentTime for the scrub bar to read or write.
+  useEffect(() => {
+    const audio = new Audio();
+    audio.preload = "metadata";
+    originalAudioRef.current = audio;
+    return () => {
+      audio.pause();
+      originalAudioRef.current = null;
+    };
+  }, []);
+
+  /** Edge-triggered setter for the meter's colour. */
+  const showHeard = useCallback((value: boolean) => {
+    if (heardRef.current === value) return;
+    heardRef.current = value;
+    setHeard(value);
+  }, []);
+
   /** Resume VAD only if the user hasn't muted the mic. */
   const restoreMic = useCallback(async () => {
     if (scrubbingRef.current) return; // the scrub owns the synth until pointer-up
+    speakingRef.current = false; // any pause() left the frame processor reset
     if (micOnRef.current) {
       await vadRef.current?.start();
       setStatus("listening");
@@ -423,32 +602,189 @@ export default function Home() {
     }
   }, []);
 
-  const playResponse = useCallback(
+  const updateFrac = useCallback((frac: number) => {
+    scrubFracRef.current = frac;
+    setScrubFrac(frac);
+  }, []);
+
+  /** Length of the loaded original, or 0 before its metadata has arrived. */
+  const originalDuration = useCallback(() => {
+    const d = originalAudioRef.current?.duration ?? 0;
+    return Number.isFinite(d) && d > 0 ? d : 0;
+  }, []);
+
+  /** Fade out the grain in flight. Ramped, not stopped dead: at these lengths a
+   * hard cut is audible as a click on every move of the thumb. */
+  const stopGrain = useCallback(() => {
+    const grain = grainRef.current;
+    if (!grain) return;
+    grainRef.current = null;
+    const t = grain.gain.context.currentTime;
+    const gain = grain.gain.gain;
+    gain.cancelScheduledValues(t);
+    gain.setValueAtTime(gain.value, t);
+    gain.linearRampToValueAtTime(0, t + GRAIN_FADE_S);
+    grain.source.stop(t + GRAIN_FADE_S);
+  }, []);
+
+  /** Play a short window of the original from `frac` — the sound of dragging
+   * the bar. Rate-limited, since a fast drag fires moves far quicker than a
+   * grain lasts and they would otherwise pile up into mush. */
+  const playGrain = useCallback(
+    (frac: number) => {
+      const ctx = trombone.audioContext();
+      const buffer = originalBufferRef.current;
+      if (!ctx || !buffer) return; // decode failed or hasn't landed
+      const now = performance.now();
+      if (now - lastGrainAtRef.current < GRAIN_INTERVAL_MS) return;
+      lastGrainAtRef.current = now;
+      void ctx.resume(); // we're in a user gesture
+
+      const offset = Math.max(0, Math.min(1, frac)) * buffer.duration;
+      const length = Math.min(GRAIN_S, buffer.duration - offset);
+      if (length <= 2 * GRAIN_FADE_S) return; // at the very end; nothing to hear
+      stopGrain();
+
+      const t = ctx.currentTime;
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(0, t);
+      gain.gain.linearRampToValueAtTime(1, t + GRAIN_FADE_S);
+      gain.gain.setValueAtTime(1, t + length - GRAIN_FADE_S);
+      gain.gain.linearRampToValueAtTime(0, t + length);
+      gain.connect(ctx.destination);
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(gain);
+      source.onended = () => gain.disconnect();
+      source.start(t, offset, length);
+      grainRef.current = { source, gain };
+    },
+    [trombone, stopGrain],
+  );
+
+  /** Silence whatever is playing and orphan its completion handler, leaving the
+   * scrub position where it stands. Every new playback starts here, which is
+   * what makes a second clip interrupt the first instead of being locked out. */
+  const stopPlayback = useCallback(() => {
+    playIdRef.current++;
+    trombone.stop();
+    originalAudioRef.current?.pause();
+    stopGrain();
+    setIsPlaying(false);
+  }, [trombone, stopGrain]);
+
+  /** End of a playback that wasn't superseded: hand the mic back. */
+  const finishPlayback = useCallback(
+    async (id: number) => {
+      if (playIdRef.current !== id) return;
+      setIsPlaying(false);
+      busyRef.current = false;
+      await restoreMic();
+    },
+    [restoreMic],
+  );
+
+  const playSamuel = useCallback(
     async (response: SynthResponse, startFrac = 0) => {
+      stopPlayback();
+      const id = playIdRef.current;
+      busyRef.current = true;
       setStatus("speaking");
       setIsPlaying(true);
       await vadRef.current?.pause(); // don't let the synth retrigger the mic
       try {
         await trombone.speak(response, {
-          speed: speedRef.current,
           startFrac,
-          onProgress: setScrubFrac,
+          onProgress: (frac) => {
+            if (playIdRef.current === id) updateFrac(frac);
+          },
         });
       } finally {
-        setIsPlaying(false);
-        busyRef.current = false;
-        await restoreMic();
+        await finishPlayback(id);
       }
     },
-    [trombone, restoreMic],
+    [trombone, stopPlayback, finishPlayback, updateFrac],
+  );
+
+  /** Play the audio the model heard — your trimmed recording, or the dataset
+   * clip — at its recorded level; the RMS normalisation happens server-side.
+   * Drives the same scrub bar as the imitation, off the element's clock. */
+  const playOriginal = useCallback(
+    async (startFrac = 0) => {
+      const audio = originalAudioRef.current;
+      if (!audio || !originalUrlRef.current) return;
+      stopPlayback();
+      const id = playIdRef.current;
+      busyRef.current = true;
+      setStatus("speaking");
+      setIsPlaying(true);
+      await vadRef.current?.pause();
+      const duration = originalDuration();
+      if (duration)
+        audio.currentTime = Math.min(duration - 0.01, startFrac * duration);
+      try {
+        await audio.play();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+        await finishPlayback(id);
+        return;
+      }
+      // Poll rather than lean on timeupdate, which fires a few times a second
+      // and leaves the bar visibly stepping.
+      const tick = () => {
+        if (playIdRef.current !== id) return;
+        const d = originalDuration();
+        if (d) updateFrac(Math.min(1, audio.currentTime / d));
+        if (audio.ended) {
+          updateFrac(1);
+          void finishPlayback(id);
+        } else if (audio.paused) {
+          void finishPlayback(id);
+        } else {
+          requestAnimationFrame(tick);
+        }
+      };
+      requestAnimationFrame(tick);
+    },
+    [stopPlayback, finishPlayback, originalDuration, updateFrac],
   );
 
   /** Remember the audio a response was made from, so it can be replayed. */
-  const setOriginal = useCallback((url: string) => {
-    if (originalUrlRef.current) URL.revokeObjectURL(originalUrlRef.current);
-    originalUrlRef.current = url;
-    setHasOriginal(true);
-  }, []);
+  const setOriginal = useCallback(
+    (url: string) => {
+      const previous = originalUrlRef.current;
+      originalUrlRef.current = url;
+      const audio = originalAudioRef.current;
+      if (audio) {
+        audio.pause();
+        audio.src = url;
+        audio.load(); // so duration is known before the first play
+      }
+      // Only after the element has let go of it.
+      if (previous) URL.revokeObjectURL(previous);
+      setHasOriginal(true);
+
+      // Decode a second copy for the scrub preview. Straight off the object URL
+      // rather than threading the blob through every caller; the token guards
+      // against a slow decode landing after the next original has replaced it.
+      const token = ++originalTokenRef.current;
+      originalBufferRef.current = null;
+      void (async () => {
+        const ctx = trombone.audioContext();
+        if (!ctx) return;
+        try {
+          const bytes = await (await fetch(url)).arrayBuffer();
+          const buffer = await ctx.decodeAudioData(bytes);
+          if (originalTokenRef.current === token)
+            originalBufferRef.current = buffer;
+        } catch {
+          // Only the scrub preview depends on this; playback goes through the
+          // media element either way, so a failure here stays silent.
+        }
+      })();
+    },
+    [trombone],
+  );
 
   const remember = useCallback((recording: Recording) => {
     const history = historyRef.current;
@@ -482,6 +818,7 @@ export default function Home() {
     async (audio: Float32Array) => {
       if (busyRef.current) return;
       busyRef.current = true;
+      processingRef.current = true;
       setStatus("processing");
       try {
         const { response, inputUrl, inputBlob } =
@@ -496,14 +833,20 @@ export default function Home() {
             : null,
         });
         setViewResponse(response);
-        await playResponse(response);
+        processingRef.current = false;
+        // A fresh imitation is what you want to hear, whatever the toggle was
+        // left on.
+        sourceRef.current = "samuel";
+        setSource("samuel");
+        await playSamuel(response);
       } catch (e) {
         busyRef.current = false;
+        processingRef.current = false;
         setError(e instanceof Error ? e.message : String(e));
         await restoreMic();
       }
     },
-    [playResponse, restoreMic, setOriginal, remember],
+    [playSamuel, restoreMic, setOriginal, remember],
   );
 
   const startMic = useCallback(async () => {
@@ -534,15 +877,34 @@ export default function Home() {
           onnxWASMBasePath: "/vad/",
           getStream,
           resumeStream: getStream,
-          redemptionMs: 800,
+          redemptionMs: REDEMPTION_MS,
           preSpeechPadMs: 150, // default 800ms puts noticeable silence before speech
+          positiveSpeechThreshold: POSITIVE_SPEECH_THRESHOLD,
+          negativeSpeechThreshold: NEGATIVE_SPEECH_THRESHOLD,
           onSpeechStart: () => {
+            speakingRef.current = true;
             if (!busyRef.current && micOnRef.current) setStatus("recording");
           },
           onVADMisfire: () => {
+            speakingRef.current = false;
+            levelStore.set(0);
             if (!busyRef.current && micOnRef.current) setStatus("listening");
           },
-          onSpeechEnd: (audio) => void onUtterance(audio),
+          onSpeechEnd: (audio) => {
+            speakingRef.current = false;
+            showHeard(false);
+            levelStore.set(0);
+            void onUtterance(audio);
+          },
+          onFrameProcessed: ({ isSpeech }, frame) => {
+            if (busyRef.current || !micOnRef.current) return;
+            if (isSpeech >= POSITIVE_SPEECH_THRESHOLD) showHeard(true);
+            else if (isSpeech < NEGATIVE_SPEECH_THRESHOLD) showHeard(false);
+            // Hold the level through the redemption window: left live it would
+            // collapse to nothing in the silence, leaving nothing to drain.
+            const redeeming = speakingRef.current && !heardRef.current;
+            if (!redeeming) levelStore.set(levelToSlots(frame));
+          },
         });
       }
       micOnRef.current = true;
@@ -555,14 +917,30 @@ export default function Home() {
       setMicOn(false);
       setStatus(vadRef.current ? "muted" : "idle");
     }
-  }, [trombone, onUtterance]);
+  }, [trombone, onUtterance, showHeard, levelStore]);
 
-  const stopMic = useCallback(async () => {
-    micOnRef.current = false;
-    setMicOn(false);
-    await vadRef.current?.pause();
-    if (!busyRef.current) setStatus("muted");
-  }, []);
+  /** Turn the mic off. `submit` sends a half-spoken utterance rather than
+   * binning it — true from the button, since people press it meaning "I'm
+   * done"; false when the tab is left, where an unasked-for answer is worse. */
+  const stopMic = useCallback(
+    async (submit = false) => {
+      micOnRef.current = false;
+      setMicOn(false);
+      showHeard(false);
+      speakingRef.current = false;
+      levelStore.set(0);
+      const vad = vadRef.current;
+      // Scoped to this one pause: the others (playback starting, a
+      // mic-processing toggle) must keep discarding, or the response would feed
+      // itself back in as a new utterance.
+      if (submit) vad?.setOptions({ submitUserSpeechOnPause: true });
+      await vad?.pause(); // fires onSpeechEnd synchronously if it had one
+      if (submit) vad?.setOptions({ submitUserSpeechOnPause: false });
+      // onUtterance has already claimed busyRef by now if something was sent.
+      if (!busyRef.current) setStatus("muted");
+    },
+    [showHeard, levelStore],
+  );
 
   // Leaving shouldn't leave a live mic behind: mute when the tab is hidden or
   // the window loses focus (another window on top still hears you), and stay
@@ -603,45 +981,15 @@ export default function Home() {
     }
   }, []);
 
-  /** Play a WAV object URL to completion through a throwaway <audio> element.
-   *
-   * A fresh element per call, and listeners attached before play(): with one
-   * shared element, a second playback overwrote the first's ended/error
-   * handlers, so the first promise never settled and busyRef stayed true —
-   * every button dead until reload. Resolving on `pause` covers both the user
-   * hitting Pause and a playback cut short by the device switching under us
-   * (Chrome does that when a mic stream with echo cancellation comes and
-   * goes) — no pause event can reach us before play() is called. */
-  const playUrl = useCallback(async (url: string) => {
-    debugAudioRef.current?.pause(); // supersede anything still running
-    const audio = new Audio();
-    debugAudioRef.current = audio;
-    await new Promise<void>((resolve, reject) => {
-      let done = false;
-      const finish = () => {
-        if (!done) {
-          done = true;
-          resolve();
-        }
-      };
-      audio.addEventListener("ended", finish, { once: true });
-      audio.addEventListener("error", finish, { once: true });
-      audio.addEventListener("pause", finish, { once: true }); // truncated; don't hang
-      audio.src = url;
-      audio.play().catch((e: DOMException) => {
-        if (e.name === "AbortError")
-          finish(); // superseded by another play
-        else reject(e);
-      });
-    });
-  }, []);
-
-  /** Mimic one of the pre-recorded clips. */
+  /** Mimic one of the pre-recorded clips. Interrupts anything playing — only a
+   * request already in flight to the model holds it off. */
   const playClip = useCallback(
     async (name: string) => {
       const clip = clips.find((c) => c.name === name);
-      if (!clip || busyRef.current) return;
+      if (!clip || processingRef.current) return;
+      stopPlayback();
       busyRef.current = true;
+      processingRef.current = true;
       setError(null);
       setPlayedClip(name);
       setStatus("processing");
@@ -664,111 +1012,135 @@ export default function Home() {
             : null,
         });
         setViewResponse(response);
-        await playResponse(response);
+        processingRef.current = false;
+        // A new clip is a new thing to listen to: back to the imitation, from
+        // the top.
+        sourceRef.current = "samuel";
+        setSource("samuel");
+        await playSamuel(response);
       } catch (e) {
         busyRef.current = false;
+        processingRef.current = false;
         setError(e instanceof Error ? e.message : String(e));
         await restoreMic();
       }
     },
-    [clips, health, trombone, playResponse, restoreMic, setOriginal, remember],
+    [
+      clips,
+      health,
+      trombone,
+      stopPlayback,
+      playSamuel,
+      restoreMic,
+      setOriginal,
+      remember,
+    ],
+  );
+
+  /** Start whichever source is selected, from `frac`. */
+  const playFrom = useCallback(
+    async (which: Source, frac: number) => {
+      setError(null);
+      if (which === "original") {
+        await playOriginal(frac);
+      } else if (lastResponse.current) {
+        await playSamuel(lastResponse.current, frac);
+      }
+    },
+    [playOriginal, playSamuel],
   );
 
   /** Play from the scrub position (or the start, if at the end); pause if
    * already playing. */
   const togglePlay = useCallback(async () => {
     if (isPlaying) {
-      trombone.stop(); // settles the in-flight speak(), which restores the mic
+      stopPlayback();
+      busyRef.current = false;
+      await restoreMic();
       return;
     }
-    if (!lastResponse.current || busyRef.current) return;
-    busyRef.current = true;
-    setError(null);
-    const from = scrubFrac >= 0.995 ? 0 : scrubFrac;
-    try {
-      await playResponse(lastResponse.current, from);
-    } catch (e) {
-      busyRef.current = false;
-      setError(e instanceof Error ? e.message : String(e));
-      await restoreMic();
-    }
-  }, [isPlaying, scrubFrac, trombone, playResponse, restoreMic]);
+    if (processingRef.current) return;
+    const from = scrubFracRef.current >= 0.995 ? 0 : scrubFracRef.current;
+    await playFrom(sourceRef.current, from);
+  }, [isPlaying, stopPlayback, restoreMic, playFrom]);
 
-  /** Speed applies to the next play, and to one already in flight. */
-  const changeSpeed = useCallback(
-    (s: number) => {
-      speedRef.current = s;
-      setSpeed(s);
-      trombone.setPlaybackSpeed(s);
-    },
-    [trombone],
-  );
+  /** Flip between the imitation and the original. Playback follows: the two are
+   * the same utterance, so the position carries over. */
+  const toggleSource = useCallback(() => {
+    const next: Source = sourceRef.current === "samuel" ? "original" : "samuel";
+    if (next === "original" && !originalUrlRef.current) return;
+    sourceRef.current = next;
+    setSource(next);
+    if (isPlaying) void playFrom(next, scrubFracRef.current);
+  }, [isPlaying, playFrom]);
 
   const onScrub = useCallback(
     (frac: number) => {
-      const response = lastResponse.current;
-      if (!response) return;
+      updateFrac(frac);
       if (!scrubbingRef.current) {
         scrubbingRef.current = true;
-        void vadRef.current?.pause(); // the sustained synth would trigger it
+        void vadRef.current?.pause(); // scrubbing makes sound; don't feed it back
         setStatus("speaking");
       }
-      setScrubFrac(frac);
+      if (sourceRef.current === "original") {
+        const audio = originalAudioRef.current;
+        const duration = originalDuration();
+        if (audio && duration)
+          audio.currentTime = Math.min(duration - 0.01, frac * duration);
+        // Mid-playback the element is already the sound, and dragging just
+        // seeks it. Stopped, the grains are the sound.
+        if (!audio || audio.paused) playGrain(frac);
+        return;
+      }
+      const response = lastResponse.current;
+      if (!response) return;
       trombone.scrub(response, frac);
     },
-    [trombone],
+    [trombone, updateFrac, originalDuration, playGrain],
   );
 
   const onScrubEnd = useCallback(async () => {
     if (!scrubbingRef.current) return;
     scrubbingRef.current = false;
     trombone.endScrub();
+    stopGrain();
     if (!busyRef.current) await restoreMic();
-  }, [trombone, restoreMic]);
-
-  /** Play the audio the model heard — your trimmed recording, or the dataset
-   * clip — holding the mic and busy flag like a real response. Raw level: the
-   * RMS normalisation happens server-side. Pause stops it for good; the next
-   * click starts over, since there is nothing to scrub here. */
-  const toggleOriginal = useCallback(async () => {
-    if (playingOriginal) {
-      debugAudioRef.current?.pause(); // settles the in-flight playUrl()
-      return;
-    }
-    const url = originalUrlRef.current;
-    if (!url || busyRef.current) return;
-    busyRef.current = true;
-    setError(null);
-    setStatus("speaking");
-    setPlayingOriginal(true);
-    await vadRef.current?.pause();
-    try {
-      await playUrl(url);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setPlayingOriginal(false);
-      busyRef.current = false;
-      await restoreMic();
-    }
-  }, [playingOriginal, playUrl, restoreMic]);
+  }, [trombone, stopGrain, restoreMic]);
 
   // "recording" only means the VAD currently hears *something* — a cough or a
   // door must not disable the buttons, or every other click gets swallowed
   // while it flaps. busyRef is the real guard, and starting a playback pauses
-  // the VAD, which discards the in-flight segment.
-  const notBusy =
-    insecure === null && status !== "processing" && status !== "speaking";
-  const canReplay = viewResponse !== null && notBusy;
-  const canPlayOriginal = hasOriginal && notBusy;
-  const canScrub = viewResponse !== null && status !== "processing";
+  // the VAD, which discards the in-flight segment. Playback is *not* a reason
+  // to disable anything: every control below interrupts it cleanly.
+  const notBusy = insecure === null && status !== "processing";
+  const hasSource = source === "original" ? hasOriginal : viewResponse !== null;
+  // Is there anything at all to play, on either source? Not `hasSource`:
+  // flipping the switch to a side that happens to be empty shouldn't drain the
+  // colour out of the switch you'd flip back with.
+  const transportReady = hasOriginal || viewResponse !== null;
+  // A live mic and the transport are mutually exclusive: scrubbing sustains the
+  // synth into your own microphone. Turning the mic off hands the page over.
+  const canPlay = hasSource && notBusy && !micOn;
+  const canScrub = hasSource && status !== "processing" && !micOn;
+  // Mid-utterance but hearing nothing, i.e. the redemption window: "recording"
+  // is set on speech start and cleared only when the segment ends or misfires.
+  const pending = status === "recording" && !heard;
   // The tract is drawn grey until an audio input is picked: the mic is on, or a
   // pre-recorded clip has come back from the model.
   const tractActive = micOn || viewResponse !== null;
-  // Where the interesting thing is happening right now: pick an input, then the
-  // transport takes over, and while anything plays it's the tract you watch.
+  // At most one box is lit, and it's wherever the interesting thing is: pick an
+  // input, watch the tract while it thinks and answers, then the transport
+  // takes over — unless the mic is still on, in which case it never left the
+  // input box. The original doesn't move the tract, so it stays on the
+  // transport. "tract" lights nothing: the tract has no box, it just moves.
   const section: Section =
-    isPlaying || playingOriginal ? "tract" : tractActive ? "playback" : "input";
+    status === "processing" || (isPlaying && source === "samuel")
+      ? "tract"
+      : micOn
+        ? "input"
+        : tractActive
+          ? "playback"
+          : "input";
 
   return (
     <main className="flex flex-1 flex-wrap items-start gap-8 p-8">
@@ -785,161 +1157,200 @@ export default function Home() {
         </p>
         <p className="text-neutral-600">
           The mouth itself is Pink Trombone, a project originally by{" "}
-          <TextLink href="https://dood.al/pinktrombone/">Neil Thapen</TextLink>,
-          described by him as &quot;bare-handed speech synthesis&quot;.
-          It&apos;s the QWOP of text-to-speech.
+          <TextLink href="https://dood.al/pinktrombone/" muted>
+            Neil Thapen
+          </TextLink>
+          , described by him as &quot;bare-handed speech synthesis&quot;.
+          It&apos;s the{" "}
+          <TextLink href="https://www.foddy.net/Athletics.html" muted>
+            QWOP
+          </TextLink>{" "}
+          of text-to-speech.
         </p>
         <p className="text-neutral-600">
           Made by{" "}
-          <TextLink href="https://vvolhejn.com">Václav Volhejn</TextLink>.
+          <TextLink href="https://vvolhejn.com">Václav Volhejn</TextLink>. Code{" "}
+          <TextLink href="https://github.com/vvolhejn/samuel">
+            on GitHub
+          </TextLink>
+          .
         </p>
         <div
           className={`flex w-full flex-col gap-2 p-3 ${sectionBox(section === "input")}`}
         >
-          {/* Two columns: talk to it on the left, or pick a canned clip on the
-              right. Wraps to one column when there isn't room for both. */}
-          <div className="flex flex-wrap items-center justify-around gap-6">
-            <div className="flex min-w-0 flex-col items-center gap-1.5">
-              <button
-                onClick={() => void (micOn ? stopMic() : startMic())}
-                disabled={insecure !== null}
-                title={
-                  insecure
-                    ? "Unavailable on an insecure origin"
-                    : micOn
-                      ? "Stop listening"
-                      : "Listen continuously and mimic every utterance"
-                }
-                className={
-                  micOn
-                    ? "rounded-full border border-highlight-300 px-4 py-1.5 text-sm font-medium text-highlight-700 hover:bg-highlight-50 disabled:opacity-40"
-                    : "rounded-full bg-highlight-600 px-4 py-1.5 text-sm font-semibold text-white hover:bg-highlight-700 disabled:opacity-40 disabled:hover:bg-highlight-600"
-                }
-              >
-                {micOn ? "Stop" : "Microphone"}
-              </button>
+          {micOn ? (
+            <div
+              className={`flex flex-col justify-between gap-2 ${INPUT_MIN_H}`}
+            >
+              <div className="flex min-w-0 flex-col gap-1">
+                <span className="flex items-center gap-2 text-sm font-semibold text-highlight-700">
+                  <span
+                    aria-hidden
+                    className="h-2.5 w-2.5 shrink-0 rounded-full bg-highlight-600"
+                  />
+                  {micHeading(status)}
+                </span>
+                <span className="text-neutral-500">
+                  Samuel answers after you pause
+                </span>
+              </div>
 
-              {/* Reassurance, not an action: recordings go to the server only to
-                  be mimicked back, and nothing is written to disk there. Only
-                  the "self-host" escape hatch is clickable. */}
-              <span
-                className="text-center text-xs text-neutral-500"
-                title="Recordings are sent to the server only to be mimicked back; they are never written to disk."
-              >
-                Your audio is not stored.
-                <br />
-                <TextLink href="https://github.com/vvolhejn/samuel">
-                  Self-host
-                </TextLink>{" "}
-                if you don&apos;t trust me
-              </span>
-            </div>
+              <div className="flex items-end justify-between gap-4">
+                <LevelMeter
+                  store={levelStore}
+                  active={heard}
+                  pending={pending}
+                />
 
-            <div className="flex shrink-0 flex-col gap-1.5">
-              <span className="text-sm text-neutral-500">
-                or use pre-recorded audio
-              </span>
-
-              {/* One button per committed clip, numbered rather than named:
-                  which recording is which only matters once you've heard
-                  them. */}
-              <div className="grid grid-cols-3 gap-1.5">
-                {clips.map((clip, i) => (
-                  <button
-                    key={clip.name}
-                    onClick={() => void playClip(clip.name)}
-                    disabled={!notBusy}
-                    title={
-                      insecure
-                        ? "Unavailable on an insecure origin"
-                        : `Mimic ${clip.duration_s.toFixed(0)}s of held-out speech`
-                    }
-                    className={
-                      clip.name === playedClip
-                        ? "rounded-md bg-sky-600 px-3 py-1 text-sm font-semibold text-white disabled:opacity-40"
-                        : "rounded-md border border-sky-300 px-3 py-1 text-sm font-medium text-sky-700 hover:bg-sky-50 disabled:opacity-40 disabled:hover:bg-transparent"
-                    }
-                  >
-                    {i + 1}
-                  </button>
-                ))}
+                <button
+                  onClick={() => void stopMic(true)}
+                  title="Stop listening and hand the page back to the playback controls"
+                  className="rounded-full border border-highlight-300 px-4 py-1.5 text-sm font-medium text-highlight-700 hover:bg-highlight-50"
+                >
+                  Turn off
+                </button>
               </div>
             </div>
-          </div>
+          ) : (
+            /* Two columns: talk to it on the left, or pick a canned clip on the
+               right. Wraps to one column when there isn't room for both. */
+            <div
+              className={`flex flex-wrap items-center justify-around gap-6 ${INPUT_MIN_H}`}
+            >
+              <div className="flex min-w-0 flex-col items-center gap-1.5">
+                <button
+                  onClick={() => void startMic()}
+                  disabled={insecure !== null}
+                  title={
+                    insecure
+                      ? "Unavailable on an insecure origin"
+                      : "Listen continuously and mimic every utterance"
+                  }
+                  className="rounded-full bg-highlight-600 px-4 py-1.5 text-sm font-semibold text-white hover:bg-highlight-700 disabled:opacity-40 disabled:hover:bg-highlight-600"
+                >
+                  Microphone
+                </button>
+
+                {/* Reassurance, not an action: recordings go to the server only
+                    to be mimicked back, and nothing is written to disk there.
+                    Only the "self-host" escape hatch is clickable. */}
+                <span
+                  className="text-center text-xs text-neutral-500"
+                  title="Recordings are sent to the server only to be mimicked back; they are never written to disk."
+                >
+                  Your audio is not stored.
+                  <br />
+                  <TextLink href="https://github.com/vvolhejn/samuel" muted>
+                    Self-host
+                  </TextLink>{" "}
+                  if you don&apos;t trust me
+                </span>
+              </div>
+
+              <div className="flex shrink-0 flex-col gap-1.5">
+                <span className="text-sm text-neutral-500">
+                  or use pre-recorded audio
+                </span>
+
+                {/* One button per committed clip, numbered rather than named:
+                    which recording is which only matters once you've heard
+                    them. */}
+                <div className="grid grid-cols-3 gap-1.5">
+                  {clips.map((clip, i) => (
+                    <button
+                      key={clip.name}
+                      onClick={() => void playClip(clip.name)}
+                      disabled={!notBusy}
+                      title={
+                        insecure
+                          ? "Unavailable on an insecure origin"
+                          : `Mimic ${clip.duration_s.toFixed(0)}s of held-out speech`
+                      }
+                      className={
+                        clip.name === playedClip
+                          ? "rounded-md bg-highlight-600 px-3 py-1 text-sm font-semibold text-white disabled:opacity-40"
+                          : /* White like the Play pill, not transparent: these
+                             keep their own ground when the box behind them
+                             lights up. */
+                            "rounded-md border border-highlight-300 bg-white px-3 py-1 text-sm font-medium text-highlight-700 hover:bg-highlight-50 disabled:opacity-40 disabled:hover:bg-white"
+                      }
+                    >
+                      {i + 1}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
         </div>
+        {/* Same grey-until-there's-something rule as the tract, done in one
+            place: with nothing to play, every accent inside the transport —
+            the Play pill, the source switch, the scrubber — desaturates
+            together rather than each control needing its own dead colour. */}
         <div
-          className={`flex w-full flex-col gap-3 p-3 ${sectionBox(section === "playback")}`}
+          className={`flex w-full flex-col gap-3 p-3 ${sectionBox(section === "playback")} ${
+            transportReady ? "" : "grayscale"
+          }`}
         >
-          <div className="flex items-center gap-3">
-            {/* Own chevron: the native one is glued to the border box, so padding
-                can't give it any room inside the pill. */}
-            <div className="relative shrink-0">
-              <select
-                value={speed}
-                onChange={(e) => changeSpeed(Number(e.currentTarget.value))}
-                title="Playback speed"
-                className="appearance-none rounded-full border border-neutral-300 py-1 pr-7 pl-2.5 text-xs font-medium text-neutral-600 hover:border-highlight-300 hover:text-highlight-700"
+          <div className="flex items-center gap-4">
+            <button
+              onClick={() => void togglePlay()}
+              disabled={!canPlay && !isPlaying}
+              title={
+                source === "original"
+                  ? "Play the audio the model heard, at its recorded level"
+                  : "Play the model's imitation from the scrub position"
+              }
+              /* White, not accent-filled: the solid pill is the microphone's,
+                 and two of them made the transport shout for a click it doesn't
+                 need. Explicitly white rather than transparent so it keeps its
+                 own ground when the box around it lights up. */
+              className="w-24 shrink-0 rounded-full border border-highlight-300 bg-white py-1.5 text-sm font-medium text-highlight-700 hover:bg-highlight-50 disabled:opacity-40 disabled:hover:bg-white"
+            >
+              {isPlaying ? "Pause" : "Play"}
+            </button>
+
+            {/* Which of the two takes of the same utterance you're listening to.
+                Flipping it mid-playback carries the position across. */}
+            <div className="flex items-center gap-2">
+              <button
+                role="switch"
+                aria-checked={source === "original"}
+                aria-label="Play the original instead of the imitation"
+                onClick={toggleSource}
+                disabled={!hasOriginal}
+                title="Switch between the model's imitation and the audio it heard"
+                className={`relative h-6 w-11 shrink-0 rounded-full transition-colors disabled:opacity-40 ${
+                  source === "original" ? "bg-neutral-500" : "bg-highlight-600"
+                }`}
               >
-                {SPEEDS.map((s) => (
-                  <option key={s} value={s}>
-                    {s}× speed
-                  </option>
-                ))}
-              </select>
-              <span
-                aria-hidden
-                className="pointer-events-none absolute inset-y-0 right-2.5 flex items-center text-[0.5rem] text-neutral-500"
-              >
-                ▼
+                <span
+                  aria-hidden
+                  className={`absolute top-0.5 left-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform ${
+                    source === "original" ? "translate-x-5" : "translate-x-0"
+                  }`}
+                />
+              </button>
+              <span className="text-sm text-neutral-600">
+                {source === "original" ? "Original" : "Imitated"}
               </span>
             </div>
-
-            {/* One pill, two sources: the model's imitation and the audio it was
-                made from. Whichever is playing offers Pause; the other is out of
-                reach until it stops, since they'd fight over the mic and busy
-                flag. */}
-            <div className="flex shrink-0 overflow-hidden rounded-full border border-highlight-300 text-sm">
-              <button
-                onClick={togglePlay}
-                disabled={!canReplay && !isPlaying}
-                title="Play the model's imitation from the scrub position"
-                className="w-24 bg-highlight-600 py-1.5 font-semibold text-white hover:bg-highlight-700 disabled:opacity-40 disabled:hover:bg-highlight-600"
-              >
-                {isPlaying ? "Pause" : "Play"}
-              </button>
-              <button
-                onClick={() => void toggleOriginal()}
-                disabled={!canPlayOriginal && !playingOriginal}
-                title="Play the audio the model heard, at its recorded level"
-                className="w-24 border-l border-highlight-300 py-1.5 font-medium text-highlight-700 hover:bg-highlight-50 disabled:opacity-40 disabled:hover:bg-transparent"
-              >
-                {playingOriginal ? "Pause" : "Original"}
-              </button>
-            </div>
           </div>
 
-          <div className="flex items-center gap-3">
-            <input
-              type="range"
-              min={0}
-              max={1000}
-              value={Math.round(scrubFrac * 1000)}
-              disabled={!canScrub}
-              aria-label="Scrub through the last response"
-              onPointerDown={() => onScrub(scrubFrac)}
-              onChange={(e) => onScrub(Number(e.currentTarget.value) / 1000)}
-              onPointerUp={() => void onScrubEnd()}
-              onKeyUp={() => void onScrubEnd()}
-              onBlur={() => void onScrubEnd()}
-              className="flex-1 accent-highlight-600 disabled:opacity-40"
-            />
-
-            <span className="w-12 text-right text-xs tabular-nums text-neutral-500">
-              {viewResponse
-                ? `${(scrubFrac * viewResponse.duration_s).toFixed(1)}s`
-                : "–"}
-            </span>
-          </div>
+          <input
+            type="range"
+            min={0}
+            max={1000}
+            value={Math.round(scrubFrac * 1000)}
+            disabled={!canScrub}
+            aria-label="Scrub through the current audio"
+            onPointerDown={() => onScrub(scrubFrac)}
+            onChange={(e) => onScrub(Number(e.currentTarget.value) / 1000)}
+            onPointerUp={() => void onScrubEnd()}
+            onKeyUp={() => void onScrubEnd()}
+            onBlur={() => void onScrubEnd()}
+            className="w-full accent-highlight-600 disabled:opacity-40"
+          />
         </div>
         {insecure && (
           <p className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">
@@ -968,11 +1379,11 @@ export default function Home() {
       {/* The element's canvases are a fixed 600×500 anchored top-left, so
           size the host to match rather than letting it stretch. Left out
           entirely on an insecure origin, where it would stay blank: the synth
-          it draws is never started there. */}
+          it draws is never started there. No box of its own either: a tract
+          that's moving already announces itself, and the greyed-out state
+          covers the rest. */}
       {insecure === null && (
-        <div
-          className={`relative shrink-0 p-2 ${sectionBox(section === "tract")}`}
-        >
+        <div className="relative shrink-0 p-2">
           <pink-trombone
             className="block h-[500px] w-[600px]"
             inactive={tractActive ? undefined : "true"}
@@ -982,9 +1393,9 @@ export default function Home() {
               controls it was easy to miss. */}
           {status === "processing" && (
             <div className="absolute inset-0 z-10 flex items-center justify-center rounded-xl bg-white/70">
-              {/* Solid plate behind the words: the tract is all thin dark lines,
+              {/* Solid strip behind the words: the tract is all thin dark lines,
                   and the wash alone doesn't hide enough of them to read over. */}
-              <span className="rounded-lg bg-white px-4 py-2 text-2xl font-semibold text-neutral-600 shadow-sm">
+              <span className="w-full bg-white py-2 text-center text-2xl text-neutral-600">
                 Thinking
                 <Ellipsis />
               </span>
