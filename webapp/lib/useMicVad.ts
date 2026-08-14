@@ -3,6 +3,7 @@ import type { MicVAD } from "@ricky0123/vad-web";
 import { levelToSlots, makeLevelStore } from "@/lib/levelStore";
 import { micErrorMessage } from "@/lib/secureContext";
 import { MicProcessing, MIC_PROCESSING_DEFAULTS } from "@/lib/micProcessing";
+import { useMirroredState } from "@/lib/useMirroredState";
 import type { Status } from "@/lib/status";
 
 /** Silence the VAD waits through before it calls an utterance finished. The
@@ -48,25 +49,20 @@ export function useMicVad({
   setError,
 }: Options) {
   const vadRef = useRef<MicVAD | null>(null);
-  /** User-intended mic state — the Microphone/Turn off toggle. Mirrors micOn;
-   * the status alone can't stand in for it (a dataset clip is "speaking"
-   * too). */
-  const micOnRef = useRef(false);
-  const [micOn, setMicOn] = useState(false);
+  /** User-intended mic state — the Microphone/Turn off toggle. The status alone
+   * can't stand in for it (a dataset clip is "speaking" too). */
+  const [micOn, micOnRef, setMicOn] = useMirroredState(false);
   /** Is the VAD hearing speech *this frame*? Drives the meter's colour, and
    * nothing else — unlike status "recording" it flips tens of times a second,
    * so it must never gate a control. */
-  const [heard, setHeard] = useState(false);
-  /** Mirror of `heard`, so the per-frame callback only re-renders on edges. */
-  const heardRef = useRef(false);
+  const [heard, heardRef, setHeard] = useMirroredState(false);
   /** When the in-flight utterance started, or 0 if there isn't one. Watched
    * per frame against MAX_SPEECH_MS. */
   const speechStartRef = useRef(0);
-  const [micProcessing, setMicProcessing] = useState<MicProcessing>(
-    MIC_PROCESSING_DEFAULTS,
-  );
-  // Read by getStream/resumeStream, which vad-web calls on every start().
-  const micProcessingRef = useRef<MicProcessing>(MIC_PROCESSING_DEFAULTS);
+  // The ref is read by getStream/resumeStream, which vad-web calls on every
+  // start().
+  const [micProcessing, micProcessingRef, setMicProcessing] =
+    useMirroredState<MicProcessing>(MIC_PROCESSING_DEFAULTS);
   const [levelStore] = useState(makeLevelStore);
 
   // Everything below reads the options through this ref rather than closing
@@ -96,12 +92,14 @@ export function useMicVad({
     [],
   );
 
-  /** Edge-triggered setter for the meter's colour. */
-  const showHeard = useCallback((value: boolean) => {
-    if (heardRef.current === value) return;
-    heardRef.current = value;
-    setHeard(value);
-  }, []);
+  /** Edge-triggered, so a frame that changes nothing never reaches React. */
+  const showHeard = useCallback(
+    (value: boolean) => {
+      if (heardRef.current === value) return;
+      setHeard(value);
+    },
+    [heardRef, setHeard],
+  );
 
   /** Resume the VAD only if the user hasn't muted the mic. Everything that
    * takes the mouth hands it back this way. */
@@ -117,7 +115,7 @@ export function useMicVad({
     } else {
       setStatus(vadRef.current ? "muted" : "idle");
     }
-  }, []);
+  }, [micOnRef]);
 
   /** Cut an over-long utterance short and send what's been said. Pausing with
    * submitUserSpeechOnPause is what ends the segment; onUtterance takes it from
@@ -192,24 +190,28 @@ export function useMicVad({
           },
         });
       }
-      micOnRef.current = true;
       setMicOn(true);
       await vadRef.current.start();
       setStatus("listening");
     } catch (e) {
       setError(micErrorMessage(e));
-      micOnRef.current = false;
       setMicOn(false);
       setStatus(vadRef.current ? "muted" : "idle");
     }
-  }, [showHeard, levelStore, cutUtterance]);
+  }, [
+    showHeard,
+    levelStore,
+    cutUtterance,
+    micOnRef,
+    setMicOn,
+    micProcessingRef,
+  ]);
 
   /** Turn the mic off. `submit` sends a half-spoken utterance rather than
    * binning it — true from the button, since people press it meaning "I'm
    * done"; false when the tab is left, where an unasked-for answer is worse. */
   const stopMic = useCallback(
     async (submit = false) => {
-      micOnRef.current = false;
       setMicOn(false);
       showHeard(false);
       levelStore.set(0);
@@ -225,35 +227,37 @@ export function useMicVad({
       // sent.
       if (!optionsRef.current.isBusy()) optionsRef.current.setStatus("muted");
     },
-    [showHeard, levelStore],
+    [showHeard, levelStore, setMicOn],
   );
 
   /** Flip one mic-processing flag. If we're listening right now, cycle the
    * stream so it takes effect immediately rather than after the next
    * utterance. */
-  const toggleMicProcessing = useCallback(async (key: keyof MicProcessing) => {
-    const next = {
-      ...micProcessingRef.current,
-      [key]: !micProcessingRef.current[key],
-    };
-    micProcessingRef.current = next;
-    setMicProcessing(next);
+  const toggleMicProcessing = useCallback(
+    async (key: keyof MicProcessing) => {
+      const next = {
+        ...micProcessingRef.current,
+        [key]: !micProcessingRef.current[key],
+      };
+      setMicProcessing(next);
 
-    const vad = vadRef.current;
-    if (
-      !vad ||
-      optionsRef.current.isBusy() ||
-      !micOnRef.current ||
-      !vad.listening
-    )
-      return;
-    try {
-      await vad.pause();
-      await vad.start();
-    } catch (e) {
-      optionsRef.current.setError(micErrorMessage(e));
-    }
-  }, []);
+      const vad = vadRef.current;
+      if (
+        !vad ||
+        optionsRef.current.isBusy() ||
+        !micOnRef.current ||
+        !vad.listening
+      )
+        return;
+      try {
+        await vad.pause();
+        await vad.start();
+      } catch (e) {
+        optionsRef.current.setError(micErrorMessage(e));
+      }
+    },
+    [micOnRef, micProcessingRef, setMicProcessing],
+  );
 
   /** Stop listening without touching the user's intent, for whatever is about
    * to make sound. `restoreMic` is what undoes it. */

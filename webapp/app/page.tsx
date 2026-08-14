@@ -24,6 +24,7 @@ import { downloadBlob, makeZip } from "@/lib/zip";
 import { usePinkTrombone } from "@/lib/usePinkTrombone";
 import { useOriginalAudio } from "@/lib/useOriginalAudio";
 import { useMicVad } from "@/lib/useMicVad";
+import { useMirroredState } from "@/lib/useMirroredState";
 import type { Status } from "@/lib/status";
 import { MUTED_LINK, STRIP, TextLink, sectionBox } from "@/components/ui";
 import { LevelMeter } from "@/components/LevelMeter";
@@ -54,6 +55,14 @@ const subscribeNever = () => () => {};
  * ~250 kB per side, and nothing else evicts them. */
 const MAX_HISTORY = 50;
 
+/** What `imitate` needs back from a request: the answer, plus the audio that
+ * was sent, for the transport and the session download. */
+type SynthRequest = {
+  response: SynthResponse;
+  inputUrl: string;
+  inputBlob: Blob;
+};
+
 interface Recording {
   kind: "mic" | "dataset";
   /** Audio the model was given: a WAV from the mic, an MP3 for a clip. */
@@ -81,13 +90,15 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   /** null until /api/health answers (or if the backend is down). */
   const [health, setHealth] = useState<HealthResponse | null>(null);
-  /** Render-side mirror of lastResponse (refs must not be read in render). */
-  const [viewResponse, setViewResponse] = useState<SynthResponse | null>(null);
+  /** The model's last answer. `lastResponse` is the copy the callbacks read;
+   * refs must not be read in render, so the state is what the panel shows. */
+  const [viewResponse, lastResponse, setResponse] =
+    useMirroredState<SynthResponse | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   /** Which source the transport is pointed at. */
-  const [source, setSource] = useState<Source>("samuel");
+  const [source, sourceRef, setSource] = useMirroredState<Source>("samuel");
   /** Playback/scrub position within the current source, in [0, 1]. */
-  const [scrubFrac, setScrubFrac] = useState(0);
+  const [scrubFrac, scrubFracRef, setScrubFrac] = useMirroredState(0);
   /** Pre-recorded clips shipped with the app, and the last one played (which
    * is the button left filled in). */
   const [clips, setClips] = useState<DatasetClip[]>([]);
@@ -97,7 +108,7 @@ export default function Home() {
   /** Is the mouth yours to play? While it is, the voicebox pad under the tract
    * and the tract itself take drags; while it isn't they are read-only, and the
    * model has the only hands on them. */
-  const [manual, setManual] = useState(false);
+  const [manual, manualRef, setManual] = useMirroredState(false);
   const [debugOpen, setDebugOpen] = useState(false);
   /** Is the intro past its first sentence showing? Only ever false below `md`,
    * where the fold is worth saving. */
@@ -114,7 +125,6 @@ export default function Home() {
   const trombone = usePinkTrombone();
   /** The audio the model heard, and everything that plays or previews it. */
   const original = useOriginalAudio(trombone);
-  const lastResponse = useRef<SynthResponse | null>(null);
   /** Every utterance this session, for the debug panel's download. */
   const historyRef = useRef<Recording[]>([]);
   const [historyCount, setHistoryCount] = useState(0);
@@ -122,17 +132,11 @@ export default function Home() {
   /** Waiting on the model — the one state nothing can interrupt. */
   const processingRef = useRef(false);
   const scrubbingRef = useRef(false); // pointer is down on the scrub bar
-  /** Mirror of `manual`, for the callbacks that hand the mouth back. */
-  const manualRef = useRef(false);
   /** Pointer is down on the voicebox pad, i.e. the synth is sounding by hand. */
   const voicingRef = useRef(false);
   /** Bumped whenever a playback starts or is cut short, so the completion of a
    * superseded one can't clear the new one's state out from under it. */
   const playIdRef = useRef(0);
-  /** Mirror of scrubFrac for the callbacks that must not re-bind on every
-   * progress tick. */
-  const scrubFracRef = useRef(0);
-  const sourceRef = useRef<Source>("samuel");
 
   // The mic and everything downstream of it. Its callbacks are read through a
   // ref inside the hook, so the ones named here may be defined further down —
@@ -194,11 +198,6 @@ export default function Home() {
     void fetchPrecomputedIndex().then(setPrecomputed);
   }, []);
 
-  const updateFrac = useCallback((frac: number) => {
-    scrubFracRef.current = frac;
-    setScrubFrac(frac);
-  }, []);
-
   /** Stop sounding the voicebox, if manual control was. */
   const endVoice = useCallback(() => {
     if (!voicingRef.current) return;
@@ -212,10 +211,9 @@ export default function Home() {
    * worse than a mode that steps aside when you reach past it. */
   const exitManual = useCallback(() => {
     if (!manualRef.current) return;
-    manualRef.current = false;
     setManual(false);
     endVoice();
-  }, [endVoice]);
+  }, [endVoice, manualRef, setManual]);
 
   /** Silence whatever is playing and orphan its completion handler, leaving the
    * scrub position where it stands. Every new playback starts here, which is
@@ -251,14 +249,14 @@ export default function Home() {
         await trombone.speak(response, {
           startFrac,
           onProgress: (frac) => {
-            if (playIdRef.current === id) updateFrac(frac);
+            if (playIdRef.current === id) setScrubFrac(frac);
           },
         });
       } finally {
         await finishPlayback(id);
       }
     },
-    [trombone, stopPlayback, finishPlayback, updateFrac, pauseMic],
+    [trombone, stopPlayback, finishPlayback, setScrubFrac, pauseMic],
   );
 
   /** Play the audio the model heard — your trimmed recording, or the dataset
@@ -284,9 +282,9 @@ export default function Home() {
       // and leaves the bar visibly stepping.
       const tick = () => {
         if (playIdRef.current !== id) return;
-        updateFrac(original.currentFrac());
+        setScrubFrac(original.currentFrac());
         if (original.ended()) {
-          updateFrac(1);
+          setScrubFrac(1);
           void finishPlayback(id);
         } else if (original.paused()) {
           void finishPlayback(id);
@@ -296,7 +294,7 @@ export default function Home() {
       };
       requestAnimationFrame(tick);
     },
-    [original, stopPlayback, finishPlayback, updateFrac, pauseMic],
+    [original, stopPlayback, finishPlayback, setScrubFrac, pauseMic],
   );
 
   const remember = useCallback((recording: Recording) => {
@@ -327,29 +325,28 @@ export default function Home() {
     downloadBlob(makeZip(entries), "samuel-session.zip");
   }, []);
 
-  const onUtterance = useCallback(
-    async (audio: Float32Array) => {
-      if (busyRef.current) return;
+  /** One round trip through the model: send it some audio, keep what comes
+   * back, and play the imitation. `send` is whatever gets the answer — the
+   * caller has already taken the mouth off whoever had it. */
+  const imitate = useCallback(
+    async (kind: Recording["kind"], send: () => Promise<SynthRequest>) => {
       busyRef.current = true;
       processingRef.current = true;
       setStatus("processing");
       try {
-        const { response, inputUrl, inputBlob } =
-          await synthesizeUtterance(audio);
-        lastResponse.current = response;
+        const { response, inputUrl, inputBlob } = await send();
+        setResponse(response);
         original.set(inputUrl);
         remember({
-          kind: "mic",
+          kind,
           input: inputBlob,
           output: response.synth_audio_b64
             ? wavBlob(response.synth_audio_b64)
             : null,
         });
-        setViewResponse(response);
         processingRef.current = false;
         // A fresh imitation is what you want to hear, whatever the toggle was
         // left on.
-        sourceRef.current = "samuel";
         setSource("samuel");
         await playSamuel(response);
       } catch (e) {
@@ -359,7 +356,15 @@ export default function Home() {
         await restoreMic();
       }
     },
-    [playSamuel, restoreMic, original, remember],
+    [playSamuel, restoreMic, original, remember, setResponse, setSource],
+  );
+
+  const onUtterance = useCallback(
+    async (audio: Float32Array) => {
+      if (busyRef.current) return;
+      await imitate("mic", () => synthesizeUtterance(audio));
+    },
+    [imitate],
   );
 
   // Leaving shouldn't leave a live mic — or a held note — behind, and coming
@@ -406,55 +411,24 @@ export default function Home() {
       if (!clip || processingRef.current) return;
       exitManual();
       stopPlayback();
-      busyRef.current = true;
-      processingRef.current = true;
+      busyRef.current = true; // claimed before the first await, not after it
       setError(null);
       setPlayedClip(name);
-      setStatus("processing");
       await pauseMic();
-      try {
+      await imitate("dataset", async () => {
         await trombone.resume(); // we're in a user gesture
         console.log(`${clip.name}: ${clip.source} @${clip.offset_s}s`);
-        const { response, inputUrl, inputBlob, precomputed } =
-          await synthesizeDatasetClip(clip, health?.model_fingerprint);
+        const answer = await synthesizeDatasetClip(
+          clip,
+          health?.model_fingerprint,
+        );
         // A committed answer is there instantly; hold it for a beat so the
         // clips behave like the mic rather than firing on mousedown.
-        if (precomputed) await fakeThinking();
-        lastResponse.current = response;
-        original.set(inputUrl);
-        remember({
-          kind: "dataset",
-          input: inputBlob,
-          output: response.synth_audio_b64
-            ? wavBlob(response.synth_audio_b64)
-            : null,
-        });
-        setViewResponse(response);
-        processingRef.current = false;
-        // A new clip is a new thing to listen to: back to the imitation, from
-        // the top.
-        sourceRef.current = "samuel";
-        setSource("samuel");
-        await playSamuel(response);
-      } catch (e) {
-        busyRef.current = false;
-        processingRef.current = false;
-        setError(e instanceof Error ? e.message : String(e));
-        await restoreMic();
-      }
+        if (answer.precomputed) await fakeThinking();
+        return answer;
+      });
     },
-    [
-      clips,
-      health,
-      trombone,
-      stopPlayback,
-      playSamuel,
-      restoreMic,
-      original,
-      remember,
-      exitManual,
-      pauseMic,
-    ],
+    [clips, health, trombone, stopPlayback, exitManual, pauseMic, imitate],
   );
 
   /** Start whichever source is selected, from `frac`. */
@@ -468,7 +442,7 @@ export default function Home() {
         await playSamuel(lastResponse.current, frac);
       }
     },
-    [playOriginal, playSamuel, exitManual],
+    [playOriginal, playSamuel, exitManual, lastResponse],
   );
 
   /** Play from the scrub position (or the start, if at the end); pause if
@@ -483,7 +457,7 @@ export default function Home() {
     if (processingRef.current) return;
     const from = scrubFracRef.current >= 0.995 ? 0 : scrubFracRef.current;
     await playFrom(sourceRef.current, from);
-  }, [isPlaying, stopPlayback, restoreMic, playFrom]);
+  }, [isPlaying, stopPlayback, restoreMic, playFrom, scrubFracRef, sourceRef]);
 
   /** Flip between the imitation and the original. Playback follows: the two are
    * the same utterance, so the position carries over. */
@@ -493,11 +467,18 @@ export default function Home() {
     sourceRef.current = next;
     setSource(next);
     if (isPlaying) void playFrom(next, scrubFracRef.current);
-  }, [isPlaying, playFrom, original.loaded]);
+  }, [
+    isPlaying,
+    playFrom,
+    original.loaded,
+    scrubFracRef,
+    sourceRef,
+    setSource,
+  ]);
 
   const onScrub = useCallback(
     (frac: number) => {
-      updateFrac(frac);
+      setScrubFrac(frac);
       if (!scrubbingRef.current) {
         exitManual(); // the bar is about to drive the tract itself
         scrubbingRef.current = true;
@@ -515,7 +496,15 @@ export default function Home() {
       if (!response) return;
       trombone.scrub(response, frac);
     },
-    [trombone, updateFrac, original, exitManual, pauseMic],
+    [
+      trombone,
+      setScrubFrac,
+      original,
+      exitManual,
+      pauseMic,
+      sourceRef,
+      lastResponse,
+    ],
   );
 
   /** Letting go of the bar plays on from where you dropped it, whether or not
@@ -535,7 +524,15 @@ export default function Home() {
       return;
     }
     if (!busyRef.current) await restoreMic();
-  }, [trombone, original, restoreMic, playFrom]);
+  }, [
+    trombone,
+    original,
+    restoreMic,
+    playFrom,
+    scrubFracRef,
+    sourceRef,
+    lastResponse,
+  ]);
 
   // A drag on the voicebox pad, reported by the element (GlottisUI in the fork
   // dispatches it, having worked out the pitch and voicing from the pointer).
@@ -584,7 +581,7 @@ export default function Home() {
     voicingRef.current = true;
     trombone.startVoice();
     setStatus("speaking");
-  }, [exitManual, restoreMic, stopPlayback, trombone]);
+  }, [exitManual, restoreMic, stopPlayback, trombone, manualRef, setManual]);
 
   // "recording" only means the VAD currently hears *something* — a cough or a
   // door must not disable the buttons, or every other click gets swallowed
