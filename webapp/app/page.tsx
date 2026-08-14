@@ -40,14 +40,30 @@ type Section = "input" | "playback" | "tract";
 /** Faint box around a stage; the active one drops the outline and fills with the
  * accent wash instead, so only one thing at a time reads as raised. The border
  * stays declared but transparent when lit, or the box would shift a pixel.
- * Padding is left to the call site. */
+ * Padding is left to the call site.
+ *
+ * On a phone it's a full-bleed strip instead — no corners, and nothing at all
+ * until it lights up — which buys back the 26px of side padding and border the
+ * controls inside need to stay on one line, and reads as a stronger "you are
+ * here" than a small rounded box. The border is still declared there, just
+ * transparent, so lighting a strip can't change its height. Call sites pair
+ * this with STRIP for the bleed itself. */
 function sectionBox(active: boolean): string {
-  return `rounded-xl border transition-[color,background-color,border-color,filter] ${
-    active
-      ? "border-transparent bg-highlight-50/60"
-      : "border-neutral-200 bg-white"
+  return `border-y border-transparent transition-[color,background-color,border-color,filter] sm:rounded-xl sm:border ${
+    active ? "bg-highlight-50/60" : "bg-white sm:border-neutral-200"
   }`;
 }
+
+/** Escapes the column's own padding so a section reaches both screen edges, and
+ * re-inserts it inside so the contents stay in line with the prose above. Back
+ * to an inset box at `sm`, where "full width" would only mean the column's.
+ *
+ * `self-stretch` rather than `w-full`, and it has to be: the column is
+ * `items-start`, so a width of 100% would measure the column's *content* box
+ * and the negative margin would only slide that width leftwards, leaving the
+ * strip short by its own bleed at the right. Stretching sizes it against the
+ * margins instead, which is what reaches both edges. */
+const STRIP = "-mx-4 self-stretch px-4 py-3 sm:mx-0 sm:p-3";
 
 /** Which of the two audio sources the transport plays: the model's imitation,
  * or the audio it was made from. */
@@ -56,6 +72,11 @@ type Source = "samuel" | "original";
 /** Silence the VAD waits through before it calls an utterance finished. The
  * dots are typed out over this window, so the wait reads as a countdown. */
 const REDEMPTION_MS = 800;
+
+/** Ceiling on one utterance, measured from the VAD hearing speech. Past it the
+ * segment is cut and sent as it stands: the model takes about as long as the
+ * clip does, so an unbroken monologue would otherwise leave you waiting. */
+const MAX_SPEECH_MS = 30_000;
 
 /** Long enough that the dips between words don't strobe the meter, short
  * enough not to read as a countdown of its own — the dots do that. */
@@ -154,6 +175,48 @@ function LevelMeter({
         </span>
       )}
     </p>
+  );
+}
+
+/** The side of the square bitmap the element draws into. */
+const TRACT_PX = 600;
+
+/** Scales the drawing down to whatever width it's given, since the element
+ * itself only ever draws its fixed bitmap. A transform rather than a smaller
+ * canvas: both hit-tests measure getBoundingClientRect, so drags follow the
+ * scale for free. The wrapper carries the scaled height, or the page would
+ * reserve the full 600px under it. */
+function TractStage({ children }: { children: React.ReactNode }) {
+  const [scale, setScale] = useState(1);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const element = ref.current;
+    if (!element) return;
+    const observer = new ResizeObserver(([entry]) => {
+      setScale(Math.min(1, entry.contentRect.width / TRACT_PX));
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  return (
+    <div
+      ref={ref}
+      className="w-full overflow-hidden"
+      style={{ height: TRACT_PX * scale }}
+    >
+      <div
+        className="relative origin-top-left"
+        style={{
+          width: TRACT_PX,
+          height: TRACT_PX,
+          transform: `scale(${scale})`,
+        }}
+      >
+        {children}
+      </div>
+    </div>
   );
 }
 
@@ -302,7 +365,7 @@ function TextLink({
       rel={external ? "noreferrer" : undefined}
       className={
         muted
-          ? "text-inherit underline decoration-highlight-600 decoration-dotted underline-offset-2 hover:text-highlight-600"
+          ? MUTED_LINK
           : "text-highlight-600 underline decoration-dotted hover:text-highlight-700"
       }
     >
@@ -310,6 +373,11 @@ function TextLink({
     </a>
   );
 }
+
+/** TextLink's `muted` look, for the controls that read as links in the prose
+ * without being one. */
+const MUTED_LINK =
+  "text-inherit underline decoration-highlight-600 decoration-dotted underline-offset-2 hover:text-highlight-600";
 
 function SectionTitle({ children }: { children: React.ReactNode }) {
   return (
@@ -487,6 +555,9 @@ export default function Home() {
    * model has the only hands on them. */
   const [manual, setManual] = useState(false);
   const [debugOpen, setDebugOpen] = useState(false);
+  /** Is the intro past its first sentence showing? Only ever false below `sm`,
+   * where the fold is worth saving. */
+  const [introOpen, setIntroOpen] = useState(false);
   /** Why this origin can't run the app at all, or null. Read through
    * useSyncExternalStore because it is a client-only fact: the exported HTML is
    * built without an origin. */
@@ -524,6 +595,9 @@ export default function Home() {
   const micProcessingRef = useRef<MicProcessing>(MIC_PROCESSING_DEFAULTS);
   /** Mirror of `heard`, so the per-frame callback only re-renders on edges. */
   const heardRef = useRef(false);
+  /** When the in-flight utterance started, or 0 if there isn't one. Watched
+   * per frame against MAX_SPEECH_MS. */
+  const speechStartRef = useRef(0);
   const [levelStore] = useState(makeLevelStore);
 
   // Bring up the synth + tract visualization immediately; the AudioContext
@@ -566,6 +640,9 @@ export default function Home() {
   /** Resume VAD only if the user hasn't muted the mic. */
   const restoreMic = useCallback(async () => {
     if (scrubbingRef.current) return; // the scrub owns the synth until pointer-up
+    // A pause elsewhere (playback, a mic-processing toggle) discards whatever
+    // was in flight, so the clock can't carry over into the next utterance.
+    speechStartRef.current = 0;
     if (micOnRef.current) {
       await vadRef.current?.start();
       setStatus("listening");
@@ -742,6 +819,22 @@ export default function Home() {
     [playSamuel, restoreMic, original, remember],
   );
 
+  /** Cut an over-long utterance short and send what's been said. Pausing with
+   * submitUserSpeechOnPause is what ends the segment; onUtterance takes it from
+   * there and hands the mic back when it's done, so the restart here is only for
+   * the case where the VAD had nothing to give us after all. */
+  const cutUtterance = useCallback(async () => {
+    const vad = vadRef.current;
+    if (!vad) return;
+    speechStartRef.current = 0;
+    showHeard(false);
+    levelStore.set(0);
+    vad.setOptions({ submitUserSpeechOnPause: true });
+    await vad.pause();
+    vad.setOptions({ submitUserSpeechOnPause: false });
+    if (!busyRef.current) await restoreMic();
+  }, [restoreMic, showHeard, levelStore]);
+
   const startMic = useCallback(async () => {
     setError(null);
     exitManual(); // the mic and a hand on the pad both want the whole mouth
@@ -776,13 +869,16 @@ export default function Home() {
           positiveSpeechThreshold: POSITIVE_SPEECH_THRESHOLD,
           negativeSpeechThreshold: NEGATIVE_SPEECH_THRESHOLD,
           onSpeechStart: () => {
+            speechStartRef.current = performance.now();
             if (!busyRef.current && micOnRef.current) setStatus("recording");
           },
           onVADMisfire: () => {
+            speechStartRef.current = 0;
             levelStore.set(0);
             if (!busyRef.current && micOnRef.current) setStatus("listening");
           },
           onSpeechEnd: (audio) => {
+            speechStartRef.current = 0;
             showHeard(false);
             levelStore.set(0);
             void onUtterance(audio);
@@ -792,6 +888,12 @@ export default function Home() {
             if (isSpeech >= POSITIVE_SPEECH_THRESHOLD) showHeard(true);
             else if (isSpeech < NEGATIVE_SPEECH_THRESHOLD) showHeard(false);
             levelStore.set(levelToSlots(frame));
+            if (
+              speechStartRef.current &&
+              performance.now() - speechStartRef.current >= MAX_SPEECH_MS
+            ) {
+              void cutUtterance();
+            }
           },
         });
       }
@@ -805,7 +907,7 @@ export default function Home() {
       setMicOn(false);
       setStatus(vadRef.current ? "muted" : "idle");
     }
-  }, [trombone, onUtterance, showHeard, levelStore, exitManual]);
+  }, [trombone, onUtterance, showHeard, levelStore, exitManual, cutUtterance]);
 
   /** Turn the mic off. `submit` sends a half-spoken utterance rather than
    * binning it — true from the button, since people press it meaning "I'm
@@ -816,6 +918,7 @@ export default function Home() {
       setMicOn(false);
       showHeard(false);
       levelStore.set(0);
+      speechStartRef.current = 0;
       const vad = vadRef.current;
       // Scoped to this one pause: the others (playback starting, a
       // mic-processing toggle) must keep discarding, or the response would feed
@@ -1114,31 +1217,60 @@ export default function Home() {
           : "input";
 
   return (
-    <main className="flex flex-1 flex-wrap items-start gap-8 p-8">
-      {/* Left: everything you operate. Right: the thing you look at. */}
-      <div className="flex min-w-md max-w-md flex-1 flex-col items-start gap-4">
+    <main className="flex flex-1 flex-wrap items-start gap-6 py-4 sm:gap-8 sm:p-8">
+      {/* Left: everything you operate. Right: the thing you look at. On a phone
+          there is no "right", so both stack and the prose tightens up to leave
+          the drawing above the fold. The side padding lives here rather than on
+          `main`, so the sections inside can bleed back out of it — see STRIP.
+
+          Uncapped below `sm`, or a wide phone/narrow window would stop the
+          column at 28rem and the strips would bleed to *that* edge rather than
+          the screen's. The prose carries its own cap instead. */}
+      <div className="flex w-full min-w-0 flex-1 flex-col items-start gap-3 px-4 text-sm sm:max-w-md sm:min-w-md sm:gap-4 sm:px-0 sm:text-base">
         <header>
-          <h1 className="text-5xl font-bold text-highlight-600">Samuel</h1>
+          <h1 className="text-4xl font-bold text-highlight-600 sm:text-5xl">
+            Samuel
+          </h1>
         </header>
         {/* TODO: write the real intro. */}
-        <p className="text-neutral-600">
-          Samuel is a model that learns to control this silly mouth on the right
-          to mimic speech. Say something and it will parrot after you, or if
-          you&apos;re shy, try one of the pre-made clips.
+        {/* Below `sm` the intro is one sentence and a "more"; everything after
+            it is in the DOM the whole time and just hidden, so opening it is a
+            class flip and nothing has to be measured. At `sm` and up there is
+            no fold to save and it's all shown, with both controls gone. */}
+        <p className="max-w-md text-neutral-600">
+          Samuel is a model that learns to control this silly mouth to mimic
+          speech.{" "}
+          <span className={introOpen ? "" : "hidden sm:inline"}>
+            Say something and it will parrot after you, or if you&apos;re shy,
+            try one of the pre-made clips.
+          </span>
+          {!introOpen && (
+            <button
+              onClick={() => setIntroOpen(true)}
+              aria-expanded={false}
+              className={`sm:hidden ${MUTED_LINK}`}
+            >
+              more
+            </button>
+          )}
         </p>
-        <p className="text-neutral-600">
-          The mouth itself is Pink Trombone, a project originally by{" "}
+        <p
+          className={`max-w-md text-neutral-600 ${introOpen ? "" : "hidden sm:block"}`}
+        >
+          The mouth itself is{" "}
           <TextLink href="https://dood.al/pinktrombone/" muted>
-            Neil Thapen
+            Pink Trombone
           </TextLink>
-          , described by him as &quot;bare-handed speech synthesis&quot;.
-          It&apos;s the{" "}
+          , a project originally by Neil Thapen, described by him as
+          &quot;bare-handed speech synthesis&quot;. It&apos;s the{" "}
           <TextLink href="https://www.foddy.net/Athletics.html" muted>
             QWOP
           </TextLink>{" "}
           of speech synthesis.
         </p>
-        <p className="text-neutral-600">
+        <p
+          className={`max-w-md text-neutral-600 ${introOpen ? "" : "hidden sm:block"}`}
+        >
           Made by{" "}
           <TextLink href="https://vvolhejn.com">Václav Volhejn</TextLink>. Code{" "}
           <TextLink href="https://github.com/vvolhejn/samuel">
@@ -1146,11 +1278,20 @@ export default function Home() {
           </TextLink>
           .
         </p>
+        {introOpen && (
+          <button
+            onClick={() => setIntroOpen(false)}
+            aria-expanded
+            className={`text-neutral-600 sm:hidden ${MUTED_LINK}`}
+          >
+            less
+          </button>
+        )}
         {/* Both faces of the box share one grid cell, so it is always as tall
             as the taller of them and toggling the mic can't move the page. The
             hidden one is `invisible`, which still takes up space but drops out
             of hit-testing and the tab order. */}
-        <div className={`grid w-full p-3 ${sectionBox(section === "input")}`}>
+        <div className={`grid ${STRIP} ${sectionBox(section === "input")}`}>
           <div
             className={`col-start-1 row-start-1 flex flex-col justify-between gap-2 ${micOn ? "" : "invisible"}`}
             aria-hidden={!micOn}
@@ -1177,12 +1318,15 @@ export default function Home() {
           </div>
 
           {/* Two columns: talk to it on the left, or pick a canned clip on the
-              right. Wraps to one column when there isn't room for both. */}
+              right. They split the row evenly and are allowed to shrink under
+              their text, so what governs the width is the buttons (~110px each)
+              and the labels wrap over them — which is what keeps these side by
+              side down to a 320px screen instead of stacking. */}
           <div
-            className={`col-start-1 row-start-1 flex flex-wrap items-center justify-around gap-6 ${micOn ? "invisible" : ""}`}
+            className={`col-start-1 row-start-1 flex items-center gap-4 sm:gap-6 ${micOn ? "invisible" : ""}`}
             aria-hidden={micOn}
           >
-            <div className="flex min-w-0 flex-col items-center gap-1.5">
+            <div className="flex min-w-0 flex-1 flex-col items-center gap-1.5">
               <button
                 onClick={() => void startMic()}
                 disabled={insecure !== null}
@@ -1212,8 +1356,8 @@ export default function Home() {
               </span>
             </div>
 
-            <div className="flex shrink-0 flex-col gap-1.5">
-              <span className="text-sm text-neutral-500">
+            <div className="flex min-w-0 flex-1 flex-col items-center gap-1.5">
+              <span className="text-center text-sm text-neutral-500">
                 or use pre-recorded audio
               </span>
 
@@ -1253,7 +1397,7 @@ export default function Home() {
             together rather than each control needing its own dead colour. A
             live mic greys it too, since the mic holds the page until it's off. */}
         <div
-          className={`relative flex w-full flex-col gap-3 p-3 ${sectionBox(section === "playback")} ${
+          className={`relative flex flex-col gap-2 ${STRIP} ${sectionBox(section === "playback")} ${
             transportLive ? "" : "grayscale"
           }`}
         >
@@ -1266,10 +1410,13 @@ export default function Home() {
               onClick={() => void stopMic(true)}
               title="Turn the microphone off to play back what you said"
               aria-label="Turn the microphone off to use the playback controls"
-              className="absolute inset-0 z-10 rounded-xl"
+              className="absolute inset-0 z-10 sm:rounded-xl"
             />
           )}
-          <div className="flex items-center gap-4">
+          {/* Two rows: Play and the bar it drives, then the source switch under
+              them. Rows rather than a left column plus a bar, so the bar starts
+              right after Play instead of clearing the switch below it. */}
+          <div className="flex items-center gap-3">
             <button
               onClick={() => void togglePlay()}
               disabled={!canPlay && !isPlaying}
@@ -1278,56 +1425,56 @@ export default function Home() {
                   ? "Play the audio the model heard, at its recorded level"
                   : "Play the model's imitation from the scrub position"
               }
-              /* White, not accent-filled: the solid pill is the microphone's,
-                 and two of them made the transport shout for a click it doesn't
-                 need. Explicitly white rather than transparent so it keeps its
-                 own ground when the box around it lights up. */
-              className="w-24 shrink-0 rounded-full border border-highlight-300 bg-white py-1.5 text-sm font-medium text-highlight-700 hover:bg-highlight-50 disabled:opacity-40 disabled:hover:bg-white"
+              /* White, not accent-filled: the solid pill is the microphone's, and
+               two of them made the transport shout for a click it doesn't need.
+               Explicitly white rather than transparent so it keeps its own
+               ground when the box around it lights up. */
+              className="w-16 rounded-full border border-highlight-300 bg-white py-1.5 text-sm font-medium text-highlight-700 hover:bg-highlight-50 disabled:opacity-40 disabled:hover:bg-white"
             >
               {isPlaying ? "Pause" : "Play"}
             </button>
 
-            {/* Which of the two takes of the same utterance you're listening to.
-                Flipping it mid-playback carries the position across. */}
-            <div className="flex items-center gap-2">
-              <button
-                role="switch"
-                aria-checked={source === "original"}
-                aria-label="Play the original instead of the imitation"
-                onClick={toggleSource}
-                disabled={!original.loaded || !transportLive}
-                title="Switch between the model's imitation and the audio it heard"
-                className={`relative h-6 w-11 shrink-0 rounded-full transition-colors disabled:opacity-40 ${
-                  source === "original" ? "bg-neutral-500" : "bg-highlight-600"
-                }`}
-              >
-                <span
-                  aria-hidden
-                  className={`absolute top-0.5 left-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform ${
-                    source === "original" ? "translate-x-5" : "translate-x-0"
-                  }`}
-                />
-              </button>
-              <span className="text-sm text-neutral-600">
-                {source === "original" ? "Original" : "Imitated"}
-              </span>
-            </div>
+            <input
+              type="range"
+              min={0}
+              max={1000}
+              value={Math.round(scrubFrac * 1000)}
+              disabled={!canScrub}
+              aria-label="Scrub through the current audio"
+              onPointerDown={() => onScrub(scrubFrac)}
+              onChange={(e) => onScrub(Number(e.currentTarget.value) / 1000)}
+              onPointerUp={() => void onScrubEnd()}
+              onKeyUp={() => void onScrubEnd()}
+              onBlur={() => void onScrubEnd()}
+              className="min-w-0 flex-1 accent-highlight-600 disabled:opacity-40"
+            />
           </div>
 
-          <input
-            type="range"
-            min={0}
-            max={1000}
-            value={Math.round(scrubFrac * 1000)}
-            disabled={!canScrub}
-            aria-label="Scrub through the current audio"
-            onPointerDown={() => onScrub(scrubFrac)}
-            onChange={(e) => onScrub(Number(e.currentTarget.value) / 1000)}
-            onPointerUp={() => void onScrubEnd()}
-            onKeyUp={() => void onScrubEnd()}
-            onBlur={() => void onScrubEnd()}
-            className="w-full accent-highlight-600 disabled:opacity-40"
-          />
+          {/* Which of the two takes of the same utterance you're listening to.
+              Flipping it mid-playback carries the position across. */}
+          <div className="flex items-center gap-1.5">
+            <button
+              role="switch"
+              aria-checked={source === "original"}
+              aria-label="Play the original instead of the imitation"
+              onClick={toggleSource}
+              disabled={!original.loaded || !transportLive}
+              title="Switch between the model's imitation and the audio it heard"
+              className={`relative h-5 w-9 shrink-0 rounded-full transition-colors disabled:opacity-40 ${
+                source === "original" ? "bg-neutral-500" : "bg-highlight-600"
+              }`}
+            >
+              <span
+                aria-hidden
+                className={`absolute top-0.5 left-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform ${
+                  source === "original" ? "translate-x-4" : "translate-x-0"
+                }`}
+              />
+            </button>
+            <span className="text-xs text-neutral-600">
+              {source === "original" ? "Original" : "Imitated"}
+            </span>
+          </div>
         </div>
         {insecure && (
           <p className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">
@@ -1336,39 +1483,36 @@ export default function Home() {
         )}
         {error && <p className="text-sm text-red-600">{error}</p>}
         {/* Dev-only: inlined at build time, so the deployed bundle has no
-            debug UI at all. */}
+            debug UI at all. Never on a phone either — it's a development
+            affordance, and the screen is needed for the drawing. */}
         {process.env.NODE_ENV === "development" && (
-          <DebugPanel
-            open={debugOpen}
-            onToggle={() => setDebugOpen((v) => !v)}
-            health={health}
-            precomputed={precomputed}
-            response={viewResponse}
-            frac={scrubFrac}
-            micProcessing={micProcessing}
-            onToggleMicProcessing={(key) => void toggleMicProcessing(key)}
-            historyCount={historyCount}
-            onDownloadHistory={() => void downloadHistory()}
-          />
+          <div className="hidden sm:block">
+            <DebugPanel
+              open={debugOpen}
+              onToggle={() => setDebugOpen((v) => !v)}
+              health={health}
+              precomputed={precomputed}
+              response={viewResponse}
+              frac={scrubFrac}
+              micProcessing={micProcessing}
+              onToggleMicProcessing={(key) => void toggleMicProcessing(key)}
+              historyCount={historyCount}
+              onDownloadHistory={() => void downloadHistory()}
+            />
+          </div>
         )}
       </div>
 
-      {/* The element's canvases are a fixed 600×500 anchored top-left, so
-          size the host to match rather than letting it stretch. Left out
-          entirely on an insecure origin, where it would stay blank: the synth
-          it draws is never started there. No box of its own either: a tract
-          that's moving already announces itself, and the greyed-out state
-          covers the rest. */}
+      {/* The element draws a fixed 600×600 — the tract's 600×500 with the
+          voicebox strip under it, which is the original Pink Trombone's canvas
+          — so TractStage sizes the host to match and scales it down when the
+          window is narrower than that. Left out entirely on an insecure origin,
+          where it would stay blank: the synth it draws is never started there.
+          No box of its own either: a tract that's moving already announces
+          itself, and the greyed-out state covers the rest. */}
       {insecure === null && (
-        <div className="shrink-0 p-2">
-          {/* The element draws a fixed 600×600 — the tract's 600×500 with the
-              voicebox strip under it, which is the original Pink Trombone's
-              canvas — so size the host to match rather than letting it stretch.
-              Left out entirely on an insecure origin, where it would stay blank:
-              the synth it draws is never started there. No box of its own
-              either: a tract that's moving already announces itself, and the
-              greyed-out state covers the rest. */}
-          <div className="relative">
+        <div className="w-full max-w-[616px] p-2">
+          <TractStage>
             {/* Read-only unless the mouth is yours. The element's drags write
                 the same AudioParams our curves automate, and a `.value` write
                 doesn't cancel a scheduled curve — so an idle poke used to fight
@@ -1393,13 +1537,13 @@ export default function Home() {
                 </span>
               </div>
             )}
-          </div>
+          </TractStage>
 
           {/* A plain page control rather than one of the original's pills drawn
               into the canvas: it is chrome, not part of the picture, so it
               belongs to the page's own idiom (and stays focusable). Under the
               drawing, since what it hands you is the drawing. */}
-          <div className="flex justify-end px-1 pt-2">
+          <div className="flex flex-col items-end gap-1 px-1 pt-2">
             <button
               onClick={toggleManual}
               disabled={micOn}
@@ -1408,14 +1552,20 @@ export default function Home() {
                   ? "Turn the microphone off first"
                   : "Play the mouth yourself: drag the voicebox to pitch and voice it, and drag the tract to move the tongue"
               }
+              /* The border stays declared but transparent when lit, or the
+                 button loses 2px of height and drags the line below it up (the
+                 same reason sectionBox keeps its own). */
               className={
                 manual
-                  ? "shrink-0 rounded-full bg-highlight-600 px-4 py-1.5 text-sm font-semibold text-white hover:bg-highlight-700"
+                  ? "shrink-0 rounded-full border border-transparent bg-highlight-600 px-4 py-1.5 text-sm font-semibold text-white hover:bg-highlight-700"
                   : "shrink-0 rounded-full border border-neutral-300 bg-white px-4 py-1.5 text-sm font-medium text-neutral-600 hover:bg-neutral-50 disabled:opacity-40 disabled:hover:bg-white"
               }
             >
               Manual control
             </button>
+            <span className="text-xs text-neutral-500">
+              So that you see it&apos;s not easy.
+            </span>
           </div>
         </div>
       )}
