@@ -694,11 +694,7 @@ export default function Home() {
             Pink Trombone
           </TextLink>
           , a project originally by Neil Thapen, described by him as
-          &quot;bare-handed speech synthesis&quot;. It&apos;s the{" "}
-          <TextLink href="https://www.foddy.net/Athletics.html" muted>
-            QWOP
-          </TextLink>{" "}
-          of speech synthesis.
+          &quot;bare-handed speech synthesis&quot;.
         </p>
         <p
           className={`max-w-md text-neutral-600 ${introOpen ? "" : "hidden md:block"}`}
