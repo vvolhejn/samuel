@@ -25,7 +25,7 @@ import { usePinkTrombone } from "@/lib/usePinkTrombone";
 import { useOriginalAudio } from "@/lib/useOriginalAudio";
 import { useMicVad } from "@/lib/useMicVad";
 import { useMirroredState } from "@/lib/useMirroredState";
-import type { Status } from "@/lib/status";
+import type { Owner } from "@/lib/owner";
 import { MUTED_LINK, STRIP, TextLink, sectionBox } from "@/components/ui";
 import { LevelMeter } from "@/components/LevelMeter";
 import { TractStage } from "@/components/TractStage";
@@ -86,7 +86,9 @@ function fakeThinking(): Promise<void> {
 }
 
 export default function Home() {
-  const [status, setStatus] = useState<Status>("idle");
+  /** Who is driving the synth right now. The whole page hangs off this: what
+   * a new action has to stop, what the mic may do, and what the UI dims. */
+  const [owner, ownerRef, setOwner] = useMirroredState<Owner>("none");
   const [error, setError] = useState<string | null>(null);
   /** null until /api/health answers (or if the backend is down). */
   const [health, setHealth] = useState<HealthResponse | null>(null);
@@ -128,15 +130,17 @@ export default function Home() {
   /** Every utterance this session, for the debug panel's download. */
   const historyRef = useRef<Recording[]>([]);
   const [historyCount, setHistoryCount] = useState(0);
-  const busyRef = useRef(false); // ignore VAD events while processing/speaking
-  /** Waiting on the model — the one state nothing can interrupt. */
-  const processingRef = useRef(false);
-  const scrubbingRef = useRef(false); // pointer is down on the scrub bar
   /** Pointer is down on the voicebox pad, i.e. the synth is sounding by hand. */
   const voicingRef = useRef(false);
   /** Bumped whenever a playback starts or is cut short, so the completion of a
    * superseded one can't clear the new one's state out from under it. */
   const playIdRef = useRef(0);
+
+  /** Is the mouth taken by something the mic must not talk over? */
+  const isBusy = useCallback(
+    () => ownerRef.current !== "none" && ownerRef.current !== "mic",
+    [ownerRef],
+  );
 
   // The mic and everything downstream of it. Its callbacks are read through a
   // ref inside the hook, so the ones named here may be defined further down —
@@ -146,6 +150,7 @@ export default function Home() {
     micOn,
     micOnRef,
     heard,
+    recording,
     levelStore,
     micProcessing,
     startMic,
@@ -156,7 +161,6 @@ export default function Home() {
   } = useMicVad({
     onUtterance: (audio) => void onUtterance(audio),
     onBeforeStart: async () => {
-      exitManual(); // the mic and a hand on the pad both want the whole mouth
       const current = await fetchHealth();
       if (!current) {
         throw new Error(
@@ -166,9 +170,9 @@ export default function Home() {
       setHealth(current); // also picks up a checkpoint swap since page load
       await trombone.resume(); // we're in a user gesture
     },
-    isBusy: () => busyRef.current,
-    isScrubbing: () => scrubbingRef.current,
-    setStatus,
+    isBusy,
+    isScrubbing: () => ownerRef.current === "scrub",
+    setOwner,
     setError,
   });
 
@@ -216,8 +220,9 @@ export default function Home() {
   }, [endVoice, manualRef, setManual]);
 
   /** Silence whatever is playing and orphan its completion handler, leaving the
-   * scrub position where it stands. Every new playback starts here, which is
-   * what makes a second clip interrupt the first instead of being locked out. */
+   * scrub position where it stands. Called when something takes the mouth off a
+   * playback, which is what makes a second clip interrupt the first instead of
+   * being locked out. */
   const stopPlayback = useCallback(() => {
     playIdRef.current++;
     trombone.stop();
@@ -226,12 +231,42 @@ export default function Home() {
     setIsPlaying(false);
   }, [trombone, original]);
 
+  /** Take the mouth for `next`, and stop whoever had it. Keyed on the previous
+   * owner, so an entry point cannot forget one of the ways to let go.
+   *
+   * A scrub is the one exception: dragging the bar during a playback seeks that
+   * playback rather than stopping it, so the playback stays underneath and is
+   * stopped when the scrub itself ends. Waiting on the model is not stopped at
+   * all — the callers refuse to take the mouth off it. */
+  const claim = useCallback(
+    (next: Owner) => {
+      const prev = ownerRef.current;
+      if (prev === "manual") exitManual();
+      if (prev === "mic") void pauseMic();
+      if (prev === "scrub") {
+        trombone.endScrub();
+        original.stopGrain();
+      }
+      if (prev === "scrub" || (prev === "playback" && next !== "scrub"))
+        stopPlayback();
+      setOwner(next);
+    },
+    [
+      exitManual,
+      pauseMic,
+      stopPlayback,
+      trombone,
+      original,
+      ownerRef,
+      setOwner,
+    ],
+  );
+
   /** End of a playback that wasn't superseded: hand the mic back. */
   const finishPlayback = useCallback(
     async (id: number) => {
       if (playIdRef.current !== id) return;
       setIsPlaying(false);
-      busyRef.current = false;
       await restoreMic();
     },
     [restoreMic],
@@ -239,12 +274,9 @@ export default function Home() {
 
   const playSamuel = useCallback(
     async (response: SynthResponse, startFrac = 0) => {
-      stopPlayback();
+      claim("playback"); // stops the mic too, so the synth can't retrigger it
       const id = playIdRef.current;
-      busyRef.current = true;
-      setStatus("speaking");
       setIsPlaying(true);
-      await pauseMic(); // don't let the synth retrigger the mic
       try {
         await trombone.speak(response, {
           startFrac,
@@ -256,7 +288,7 @@ export default function Home() {
         await finishPlayback(id);
       }
     },
-    [trombone, stopPlayback, finishPlayback, setScrubFrac, pauseMic],
+    [trombone, claim, finishPlayback, setScrubFrac],
   );
 
   /** Play the audio the model heard — your trimmed recording, or the dataset
@@ -265,12 +297,9 @@ export default function Home() {
   const playOriginal = useCallback(
     async (startFrac = 0) => {
       if (!original.loaded) return;
-      stopPlayback();
+      claim("playback");
       const id = playIdRef.current;
-      busyRef.current = true;
-      setStatus("speaking");
       setIsPlaying(true);
-      await pauseMic();
       try {
         await original.play(startFrac);
       } catch (e) {
@@ -294,7 +323,7 @@ export default function Home() {
       };
       requestAnimationFrame(tick);
     },
-    [original, stopPlayback, finishPlayback, setScrubFrac, pauseMic],
+    [original, claim, finishPlayback, setScrubFrac],
   );
 
   const remember = useCallback((recording: Recording) => {
@@ -326,13 +355,11 @@ export default function Home() {
   }, []);
 
   /** One round trip through the model: send it some audio, keep what comes
-   * back, and play the imitation. `send` is whatever gets the answer — the
-   * caller has already taken the mouth off whoever had it. */
+   * back, and play the imitation. `send` is whatever gets the answer, and the
+   * wait for it is the one thing nothing else may interrupt. */
   const imitate = useCallback(
     async (kind: Recording["kind"], send: () => Promise<SynthRequest>) => {
-      busyRef.current = true;
-      processingRef.current = true;
-      setStatus("processing");
+      claim("model");
       try {
         const { response, inputUrl, inputBlob } = await send();
         setResponse(response);
@@ -344,27 +371,24 @@ export default function Home() {
             ? wavBlob(response.synth_audio_b64)
             : null,
         });
-        processingRef.current = false;
         // A fresh imitation is what you want to hear, whatever the toggle was
         // left on.
         setSource("samuel");
         await playSamuel(response);
       } catch (e) {
-        busyRef.current = false;
-        processingRef.current = false;
         setError(e instanceof Error ? e.message : String(e));
         await restoreMic();
       }
     },
-    [playSamuel, restoreMic, original, remember, setResponse, setSource],
+    [playSamuel, restoreMic, original, remember, setResponse, setSource, claim],
   );
 
   const onUtterance = useCallback(
     async (audio: Float32Array) => {
-      if (busyRef.current) return;
+      if (isBusy()) return;
       await imitate("mic", () => synthesizeUtterance(audio));
     },
-    [imitate],
+    [imitate, isBusy],
   );
 
   // Leaving shouldn't leave a live mic — or a held note — behind, and coming
@@ -383,7 +407,7 @@ export default function Home() {
       if (micOnRef.current) void stopMic();
       // Manual control sustains the synth indefinitely, which a tab you've
       // walked away from must not go on doing.
-      exitManual();
+      if (ownerRef.current === "manual") claim("none");
     };
     const onVisibility = () => {
       if (document.hidden) leave();
@@ -401,20 +425,16 @@ export default function Home() {
       window.removeEventListener("blur", onBlur);
       window.removeEventListener("focus", cancel);
     };
-  }, [stopMic, exitManual, micOnRef]);
+  }, [stopMic, claim, micOnRef, ownerRef]);
 
   /** Mimic one of the pre-recorded clips. Interrupts anything playing — only a
    * request already in flight to the model holds it off. */
   const playClip = useCallback(
     async (name: string) => {
       const clip = clips.find((c) => c.name === name);
-      if (!clip || processingRef.current) return;
-      exitManual();
-      stopPlayback();
-      busyRef.current = true; // claimed before the first await, not after it
+      if (!clip || ownerRef.current === "model") return;
       setError(null);
       setPlayedClip(name);
-      await pauseMic();
       await imitate("dataset", async () => {
         await trombone.resume(); // we're in a user gesture
         console.log(`${clip.name}: ${clip.source} @${clip.offset_s}s`);
@@ -428,36 +448,48 @@ export default function Home() {
         return answer;
       });
     },
-    [clips, health, trombone, stopPlayback, exitManual, pauseMic, imitate],
+    [clips, health, trombone, imitate, ownerRef],
   );
 
   /** Start whichever source is selected, from `frac`. */
   const playFrom = useCallback(
     async (which: Source, frac: number) => {
       setError(null);
-      exitManual();
       if (which === "original") {
         await playOriginal(frac);
       } else if (lastResponse.current) {
         await playSamuel(lastResponse.current, frac);
       }
     },
-    [playOriginal, playSamuel, exitManual, lastResponse],
+    [playOriginal, playSamuel, lastResponse],
   );
+
+  /** The mic wants the whole mouth, like everything else that makes a sound. */
+  const startListening = useCallback(() => {
+    claim("none");
+    void startMic();
+  }, [claim, startMic]);
 
   /** Play from the scrub position (or the start, if at the end); pause if
    * already playing. */
   const togglePlay = useCallback(async () => {
     if (isPlaying) {
-      stopPlayback();
-      busyRef.current = false;
+      claim("none");
       await restoreMic();
       return;
     }
-    if (processingRef.current) return;
+    if (ownerRef.current === "model") return;
     const from = scrubFracRef.current >= 0.995 ? 0 : scrubFracRef.current;
     await playFrom(sourceRef.current, from);
-  }, [isPlaying, stopPlayback, restoreMic, playFrom, scrubFracRef, sourceRef]);
+  }, [
+    isPlaying,
+    claim,
+    restoreMic,
+    playFrom,
+    scrubFracRef,
+    sourceRef,
+    ownerRef,
+  ]);
 
   /** Flip between the imitation and the original. Playback follows: the two are
    * the same utterance, so the position carries over. */
@@ -479,12 +511,9 @@ export default function Home() {
   const onScrub = useCallback(
     (frac: number) => {
       setScrubFrac(frac);
-      if (!scrubbingRef.current) {
-        exitManual(); // the bar is about to drive the tract itself
-        scrubbingRef.current = true;
-        void pauseMic(); // scrubbing makes sound; don't feed it back
-        setStatus("speaking");
-      }
+      // Takes the tract off whatever had it, but rides on a running playback:
+      // the bar seeks it rather than stopping it.
+      if (ownerRef.current !== "scrub") claim("scrub");
       if (sourceRef.current === "original") {
         original.seek(frac);
         // Mid-playback the element is already the sound, and dragging just
@@ -500,38 +529,40 @@ export default function Home() {
       trombone,
       setScrubFrac,
       original,
-      exitManual,
-      pauseMic,
+      claim,
       sourceRef,
       lastResponse,
+      ownerRef,
     ],
   );
 
   /** Letting go of the bar plays on from where you dropped it, whether or not
    * it was playing when you grabbed it — the scrub is a seek, not a stop. */
   const onScrubEnd = useCallback(async () => {
-    if (!scrubbingRef.current) return;
-    scrubbingRef.current = false;
-    trombone.endScrub();
-    original.stopGrain();
+    // Anything that took the mouth mid-drag (a clip, say) already released the
+    // scrub through `claim`, and owns what happens next.
+    if (ownerRef.current !== "scrub") return;
     const frac = scrubFracRef.current;
     const hasSource =
       sourceRef.current === "original"
         ? original.loaded
         : !!lastResponse.current;
-    if (!processingRef.current && hasSource && frac < 0.995) {
+    // playFrom claims the mouth, which is what ends the scrub in this branch.
+    if (hasSource && frac < 0.995) {
       await playFrom(sourceRef.current, frac);
       return;
     }
-    if (!busyRef.current) await restoreMic();
+    claim("none");
+    await restoreMic();
   }, [
-    trombone,
     original,
     restoreMic,
     playFrom,
+    claim,
     scrubFracRef,
     sourceRef,
     lastResponse,
+    ownerRef,
   ]);
 
   // A drag on the voicebox pad, reported by the element (GlottisUI in the fork
@@ -565,30 +596,27 @@ export default function Home() {
    * hearing. */
   const toggleManual = useCallback(() => {
     if (manualRef.current) {
-      exitManual();
-      void restoreMic(); // nothing to hand back to, so: muted or idle
+      claim("none");
+      void restoreMic(); // nothing to hand back to, so: nobody
       return;
     }
-    manualRef.current = true;
-    setManual(true);
-    // Silence the imitation but leave the tract in the pose it reached: that
+    // Silences the imitation but leaves the tract in the pose it reached: that
     // pose is the interesting starting point, and startVoice picks up the note
     // the playback left off on, so switching this on continues from wherever
     // the model got to rather than from some default.
-    stopPlayback();
-    busyRef.current = false;
+    claim("manual");
+    setManual(true);
     void trombone.resume(); // we're in a user gesture
     voicingRef.current = true;
     trombone.startVoice();
-    setStatus("speaking");
-  }, [exitManual, restoreMic, stopPlayback, trombone, manualRef, setManual]);
+  }, [claim, restoreMic, trombone, manualRef, setManual]);
 
   // "recording" only means the VAD currently hears *something* — a cough or a
   // door must not disable the buttons, or every other click gets swallowed
   // while it flaps. busyRef is the real guard, and starting a playback pauses
   // the VAD, which discards the in-flight segment. Playback is *not* a reason
   // to disable anything: every control below interrupts it cleanly.
-  const notBusy = insecure === null && status !== "processing";
+  const notBusy = insecure === null && owner !== "model";
   const hasSource =
     source === "original" ? original.loaded : viewResponse !== null;
   // Is there anything at all to play, on either source? Not `hasSource`:
@@ -602,10 +630,10 @@ export default function Home() {
   // A live mic and the transport are mutually exclusive: scrubbing sustains the
   // synth into your own microphone. Turning the mic off hands the page over.
   const canPlay = hasSource && notBusy && !micOn;
-  const canScrub = hasSource && status !== "processing" && !micOn;
+  const canScrub = hasSource && owner !== "model" && !micOn;
   // Mid-utterance but hearing nothing, i.e. the redemption window: "recording"
   // is set on speech start and cleared only when the segment ends or misfires.
-  const pending = status === "recording" && !heard;
+  const pending = recording && !heard;
   // The drawing is grey until something has a claim on it: the mic is on, a
   // pre-recorded clip has come back from the model, or you've taken it by hand.
   const tractActive = micOn || viewResponse !== null || manual;
@@ -615,7 +643,7 @@ export default function Home() {
   // input box. The original doesn't move the tract, so it stays on the
   // transport. "tract" lights nothing: the tract has no box, it just moves.
   const section: Section =
-    status === "processing" || (isPlaying && source === "samuel") || manual
+    owner === "model" || (isPlaying && source === "samuel") || manual
       ? "tract"
       : micOn
         ? "input"
@@ -738,7 +766,7 @@ export default function Home() {
           >
             <div className="flex min-w-0 flex-1 flex-col items-center gap-1.5">
               <button
-                onClick={() => void startMic()}
+                onClick={startListening}
                 disabled={insecure !== null}
                 title={
                   insecure
@@ -948,7 +976,7 @@ export default function Home() {
                 moment nothing else on the page moves, and tucked next to the
                 controls it was easy to miss. Bounded to the tract's own 500px so
                 it doesn't cover the voicebox. */}
-              {status === "processing" && (
+              {owner === "model" && (
                 <div className="absolute inset-x-0 top-0 z-10 flex h-[500px] items-center justify-center rounded-xl bg-white/70">
                   {/* Solid strip behind the words: the tract is all thin dark lines,
                     and the wash alone doesn't hide enough of them to read over. */}

@@ -4,7 +4,6 @@ import { levelToSlots, makeLevelStore } from "@/lib/levelStore";
 import { micErrorMessage } from "@/lib/secureContext";
 import { MicProcessing, MIC_PROCESSING_DEFAULTS } from "@/lib/micProcessing";
 import { useMirroredState } from "@/lib/useMirroredState";
-import type { Status } from "@/lib/status";
 
 /** Silence the VAD waits through before it calls an utterance finished. The
  * meter's dots are typed out over this window, so the wait reads as a
@@ -33,7 +32,8 @@ interface Options {
   isBusy: () => boolean;
   /** A pointer is down on the scrub bar, which owns the synth until it lifts. */
   isScrubbing: () => boolean;
-  setStatus: (status: Status) => void;
+  /** Take the mouth, or hand it back. The mic claims nothing else. */
+  setOwner: (owner: "mic" | "none") => void;
   setError: (message: string | null) => void;
 }
 
@@ -45,7 +45,7 @@ export function useMicVad({
   onBeforeStart,
   isBusy,
   isScrubbing,
-  setStatus,
+  setOwner,
   setError,
 }: Options) {
   const vadRef = useRef<MicVAD | null>(null);
@@ -53,12 +53,13 @@ export function useMicVad({
    * can't stand in for it (a dataset clip is "speaking" too). */
   const [micOn, micOnRef, setMicOn] = useMirroredState(false);
   /** Is the VAD hearing speech *this frame*? Drives the meter's colour, and
-   * nothing else — unlike status "recording" it flips tens of times a second,
-   * so it must never gate a control. */
+   * nothing else — unlike `recording` it flips tens of times a second, so it
+   * must never gate a control. */
   const [heard, heardRef, setHeard] = useMirroredState(false);
   /** When the in-flight utterance started, or 0 if there isn't one. Watched
-   * per frame against MAX_SPEECH_MS. */
-  const speechStartRef = useRef(0);
+   * per frame against MAX_SPEECH_MS, and the meter types its dots while it
+   * stands — an utterance is in flight but nothing is heard this instant. */
+  const [speechStart, speechStartRef, setSpeechStart] = useMirroredState(0);
   // The ref is read by getStream/resumeStream, which vad-web calls on every
   // start().
   const [micProcessing, micProcessingRef, setMicProcessing] =
@@ -73,7 +74,7 @@ export function useMicVad({
     onBeforeStart,
     isBusy,
     isScrubbing,
-    setStatus,
+    setOwner,
     setError,
   };
   const optionsRef = useRef(options);
@@ -104,18 +105,18 @@ export function useMicVad({
   /** Resume the VAD only if the user hasn't muted the mic. Everything that
    * takes the mouth hands it back this way. */
   const restoreMic = useCallback(async () => {
-    const { isScrubbing, setStatus } = optionsRef.current;
+    const { isScrubbing, setOwner } = optionsRef.current;
     if (isScrubbing()) return; // the scrub owns the synth until pointer-up
     // A pause elsewhere (playback, a mic-processing toggle) discards whatever
     // was in flight, so the clock can't carry over into the next utterance.
-    speechStartRef.current = 0;
+    setSpeechStart(0);
     if (micOnRef.current) {
       await vadRef.current?.start();
-      setStatus("listening");
+      setOwner("mic");
     } else {
-      setStatus(vadRef.current ? "muted" : "idle");
+      setOwner("none");
     }
-  }, [micOnRef]);
+  }, [micOnRef, setSpeechStart]);
 
   /** Cut an over-long utterance short and send what's been said. Pausing with
    * submitUserSpeechOnPause is what ends the segment; onUtterance takes it from
@@ -124,17 +125,17 @@ export function useMicVad({
   const cutUtterance = useCallback(async () => {
     const vad = vadRef.current;
     if (!vad) return;
-    speechStartRef.current = 0;
+    setSpeechStart(0);
     showHeard(false);
     levelStore.set(0);
     vad.setOptions({ submitUserSpeechOnPause: true });
     await vad.pause();
     vad.setOptions({ submitUserSpeechOnPause: false });
     if (!optionsRef.current.isBusy()) await restoreMic();
-  }, [restoreMic, showHeard, levelStore]);
+  }, [restoreMic, showHeard, levelStore, setSpeechStart]);
 
   const startMic = useCallback(async () => {
-    const { setStatus, setError } = optionsRef.current;
+    const { setOwner, setError } = optionsRef.current;
     setError(null);
     try {
       await optionsRef.current.onBeforeStart();
@@ -159,19 +160,13 @@ export function useMicVad({
           preSpeechPadMs: 150, // default 800ms puts noticeable silence before speech
           positiveSpeechThreshold: POSITIVE_SPEECH_THRESHOLD,
           negativeSpeechThreshold: NEGATIVE_SPEECH_THRESHOLD,
-          onSpeechStart: () => {
-            speechStartRef.current = performance.now();
-            if (!optionsRef.current.isBusy() && micOnRef.current)
-              setStatus("recording");
-          },
+          onSpeechStart: () => setSpeechStart(performance.now()),
           onVADMisfire: () => {
-            speechStartRef.current = 0;
+            setSpeechStart(0);
             levelStore.set(0);
-            if (!optionsRef.current.isBusy() && micOnRef.current)
-              setStatus("listening");
           },
           onSpeechEnd: (audio) => {
-            speechStartRef.current = 0;
+            setSpeechStart(0);
             showHeard(false);
             levelStore.set(0);
             optionsRef.current.onUtterance(audio);
@@ -192,11 +187,11 @@ export function useMicVad({
       }
       setMicOn(true);
       await vadRef.current.start();
-      setStatus("listening");
+      setOwner("mic");
     } catch (e) {
       setError(micErrorMessage(e));
       setMicOn(false);
-      setStatus(vadRef.current ? "muted" : "idle");
+      setOwner("none");
     }
   }, [
     showHeard,
@@ -205,6 +200,8 @@ export function useMicVad({
     micOnRef,
     setMicOn,
     micProcessingRef,
+    setSpeechStart,
+    speechStartRef,
   ]);
 
   /** Turn the mic off. `submit` sends a half-spoken utterance rather than
@@ -215,7 +212,7 @@ export function useMicVad({
       setMicOn(false);
       showHeard(false);
       levelStore.set(0);
-      speechStartRef.current = 0;
+      setSpeechStart(0);
       const vad = vadRef.current;
       // Scoped to this one pause: the others (playback starting, a
       // mic-processing toggle) must keep discarding, or the response would feed
@@ -223,11 +220,10 @@ export function useMicVad({
       if (submit) vad?.setOptions({ submitUserSpeechOnPause: true });
       await vad?.pause(); // fires onSpeechEnd synchronously if it had one
       if (submit) vad?.setOptions({ submitUserSpeechOnPause: false });
-      // onUtterance has already claimed the busy flag by now if something was
-      // sent.
-      if (!optionsRef.current.isBusy()) optionsRef.current.setStatus("muted");
+      // onUtterance has already taken the mouth by now if something was sent.
+      if (!optionsRef.current.isBusy()) optionsRef.current.setOwner("none");
     },
-    [showHeard, levelStore, setMicOn],
+    [showHeard, levelStore, setMicOn, setSpeechStart],
   );
 
   /** Flip one mic-processing flag. If we're listening right now, cycle the
@@ -267,6 +263,8 @@ export function useMicVad({
     micOn,
     micOnRef,
     heard,
+    /** An utterance is in flight: speech started and has not ended yet. */
+    recording: speechStart !== 0,
     levelStore,
     micProcessing,
     startMic,
