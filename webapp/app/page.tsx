@@ -491,22 +491,16 @@ export default function Home() {
     ownerRef,
   ]);
 
-  /** Flip between the imitation and the original. Playback follows: the two are
-   * the same utterance, so the position carries over. */
-  const toggleSource = useCallback(() => {
+  /** Play the other take of the same utterance. The switch and the playback are
+   * one action: this is offered as a link, and a link that says "play" has to
+   * play. The two are the same utterance, so the position carries over. */
+  const playOther = useCallback(async () => {
     const next: Source = sourceRef.current === "samuel" ? "original" : "samuel";
     if (next === "original" && !original.loaded) return;
-    sourceRef.current = next;
     setSource(next);
-    if (isPlaying) void playFrom(next, scrubFracRef.current);
-  }, [
-    isPlaying,
-    playFrom,
-    original.loaded,
-    scrubFracRef,
-    sourceRef,
-    setSource,
-  ]);
+    const from = scrubFracRef.current >= 0.995 ? 0 : scrubFracRef.current;
+    await playFrom(next, from);
+  }, [playFrom, original.loaded, sourceRef, setSource, scrubFracRef]);
 
   const onScrub = useCallback(
     (frac: number) => {
@@ -638,12 +632,12 @@ export default function Home() {
   // pre-recorded clip has come back from the model, or you've taken it by hand.
   const tractActive = micOn || viewResponse !== null || manual;
   // At most one box is lit, and it's wherever the interesting thing is: pick an
-  // input, watch the tract while it thinks and answers, then the transport
-  // takes over — unless the mic is still on, in which case it never left the
-  // input box. The original doesn't move the tract, so it stays on the
-  // transport. "tract" lights nothing: the tract has no box, it just moves.
+  // input, watch the tract while it thinks, then the transport takes over and
+  // keeps the light for as long as there is something to play — unless the mic
+  // is still on, in which case it never left the input box. "tract" lights
+  // nothing: the tract has no box, it just moves.
   const section: Section =
-    owner === "model" || (isPlaying && source === "samuel") || manual
+    owner === "model" || manual
       ? "tract"
       : micOn
         ? "input"
@@ -860,8 +854,8 @@ export default function Home() {
               disabled={!canPlay && !isPlaying}
               title={
                 source === "original"
-                  ? "Play the audio the model heard, at its recorded level"
-                  : "Play the model's imitation from the scrub position"
+                  ? "Play the audio the model heard"
+                  : "Play Samuel's imitation"
               }
               /* White, not accent-filled: the solid pill is the microphone's, and
                two of them made the transport shout for a click it doesn't need.
@@ -888,31 +882,23 @@ export default function Home() {
             />
           </div>
 
-          {/* Which of the two takes of the same utterance you're listening to.
-              Flipping it mid-playback carries the position across. */}
-          <div className="flex items-center gap-1.5">
+          {/* The other take of the same utterance, as an aside rather than a
+              switch: the imitation is what you came for, and a lit-up control
+              next to Play only competed with it. */}
+          <span className="text-xs text-neutral-500">
             <button
-              role="switch"
-              aria-checked={source === "original"}
-              aria-label="Play the original instead of the imitation"
-              onClick={toggleSource}
+              onClick={() => void playOther()}
               disabled={!original.loaded || !transportLive}
-              title="Switch between the model's imitation and the audio it heard"
-              className={`relative h-5 w-9 shrink-0 rounded-full transition-colors disabled:opacity-40 ${
-                source === "original" ? "bg-neutral-500" : "bg-highlight-600"
-              }`}
+              title={
+                source === "samuel"
+                  ? "Play the audio the model heard, at its recorded level"
+                  : "Play the model's imitation again"
+              }
+              className={`${MUTED_LINK} disabled:opacity-50 disabled:hover:text-inherit`}
             >
-              <span
-                aria-hidden
-                className={`absolute top-0.5 left-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform ${
-                  source === "original" ? "translate-x-4" : "translate-x-0"
-                }`}
-              />
+              {source === "samuel" ? "Play original" : "Play imitated"}
             </button>
-            <span className="text-xs text-neutral-600">
-              {source === "original" ? "Original" : "Imitated"}
-            </span>
-          </div>
+          </span>
         </div>
         {insecure && (
           <p className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">
