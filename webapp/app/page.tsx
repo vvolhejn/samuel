@@ -49,21 +49,21 @@ type Section = "input" | "playback" | "tract";
  * transparent, so lighting a strip can't change its height. Call sites pair
  * this with STRIP for the bleed itself. */
 function sectionBox(active: boolean): string {
-  return `border-y border-transparent transition-[color,background-color,border-color,filter] sm:rounded-xl sm:border ${
-    active ? "bg-highlight-50/60" : "bg-white sm:border-neutral-200"
+  return `border-y border-transparent transition-[color,background-color,border-color,filter] md:rounded-xl md:border ${
+    active ? "bg-highlight-50/60" : "bg-white md:border-neutral-200"
   }`;
 }
 
 /** Escapes the column's own padding so a section reaches both screen edges, and
  * re-inserts it inside so the contents stay in line with the prose above. Back
- * to an inset box at `sm`, where "full width" would only mean the column's.
+ * to an inset box at `md`, where "full width" would only mean the column's.
  *
  * `self-stretch` rather than `w-full`, and it has to be: the column is
  * `items-start`, so a width of 100% would measure the column's *content* box
  * and the negative margin would only slide that width leftwards, leaving the
  * strip short by its own bleed at the right. Stretching sizes it against the
  * margins instead, which is what reaches both edges. */
-const STRIP = "-mx-4 self-stretch px-4 py-3 sm:mx-0 sm:p-3";
+const STRIP = "-mx-4 self-stretch px-4 py-3 md:mx-0 md:p-3";
 
 /** Which of the two audio sources the transport plays: the model's imitation,
  * or the audio it was made from. */
@@ -555,7 +555,7 @@ export default function Home() {
    * model has the only hands on them. */
   const [manual, setManual] = useState(false);
   const [debugOpen, setDebugOpen] = useState(false);
-  /** Is the intro past its first sentence showing? Only ever false below `sm`,
+  /** Is the intro past its first sentence showing? Only ever false below `md`,
    * where the fold is worth saving. */
   const [introOpen, setIntroOpen] = useState(false);
   /** Why this origin can't run the app at all, or null. Read through
@@ -1217,30 +1217,33 @@ export default function Home() {
           : "input";
 
   return (
-    <main className="flex flex-1 flex-wrap items-start gap-6 py-4 sm:gap-8 sm:p-8">
-      {/* Left: everything you operate. Right: the thing you look at. On a phone
+    <main className="flex flex-1 flex-wrap items-start gap-6 py-4 md:gap-8 md:p-8">
+      {/* Left: everything you operate. Right: the thing you look at. Below `md`
           there is no "right", so both stack and the prose tightens up to leave
           the drawing above the fold. The side padding lives here rather than on
           `main`, so the sections inside can bleed back out of it — see STRIP.
 
-          Uncapped below `sm`, or a wide phone/narrow window would stop the
-          column at 28rem and the strips would bleed to *that* edge rather than
-          the screen's. The prose carries its own cap instead. */}
-      <div className="flex w-full min-w-0 flex-1 flex-col items-start gap-3 px-4 text-sm sm:max-w-md sm:min-w-md sm:gap-4 sm:px-0 sm:text-base">
+          Uncapped while stacked, or a wide phone would stop the column at 28rem
+          and the strips would bleed to *that* edge rather than the screen's;
+          the prose carries its own cap instead. From `md` it is a fixed 24rem
+          and gives up its share of the row, which is what lets the drawing sit
+          beside it at every width past the breakpoint rather than only once
+          both are at full size. */}
+      <div className="flex w-full min-w-0 flex-1 flex-col items-start gap-3 px-4 text-sm md:w-96 md:flex-none md:gap-4 md:px-0 md:text-base">
         <header>
-          <h1 className="text-4xl font-bold text-highlight-600 sm:text-5xl">
+          <h1 className="text-4xl font-bold text-highlight-600 md:text-5xl">
             Samuel
           </h1>
         </header>
         {/* TODO: write the real intro. */}
-        {/* Below `sm` the intro is one sentence and a "more"; everything after
+        {/* Below `md` the intro is one sentence and a "more"; everything after
             it is in the DOM the whole time and just hidden, so opening it is a
-            class flip and nothing has to be measured. At `sm` and up there is
+            class flip and nothing has to be measured. At `md` and up there is
             no fold to save and it's all shown, with both controls gone. */}
         <p className="max-w-md text-neutral-600">
           Samuel is a model that learns to control this silly mouth to mimic
           speech.{" "}
-          <span className={introOpen ? "" : "hidden sm:inline"}>
+          <span className={introOpen ? "" : "hidden md:inline"}>
             Say something and it will parrot after you, or if you&apos;re shy,
             try one of the pre-made clips.
           </span>
@@ -1248,14 +1251,14 @@ export default function Home() {
             <button
               onClick={() => setIntroOpen(true)}
               aria-expanded={false}
-              className={`sm:hidden ${MUTED_LINK}`}
+              className={`md:hidden ${MUTED_LINK}`}
             >
               more
             </button>
           )}
         </p>
         <p
-          className={`max-w-md text-neutral-600 ${introOpen ? "" : "hidden sm:block"}`}
+          className={`max-w-md text-neutral-600 ${introOpen ? "" : "hidden md:block"}`}
         >
           The mouth itself is{" "}
           <TextLink href="https://dood.al/pinktrombone/" muted>
@@ -1269,7 +1272,7 @@ export default function Home() {
           of speech synthesis.
         </p>
         <p
-          className={`max-w-md text-neutral-600 ${introOpen ? "" : "hidden sm:block"}`}
+          className={`max-w-md text-neutral-600 ${introOpen ? "" : "hidden md:block"}`}
         >
           Made by{" "}
           <TextLink href="https://vvolhejn.com">Václav Volhejn</TextLink>. Code{" "}
@@ -1282,7 +1285,7 @@ export default function Home() {
           <button
             onClick={() => setIntroOpen(false)}
             aria-expanded
-            className={`text-neutral-600 sm:hidden ${MUTED_LINK}`}
+            className={`text-neutral-600 md:hidden ${MUTED_LINK}`}
           >
             less
           </button>
@@ -1323,7 +1326,7 @@ export default function Home() {
               and the labels wrap over them — which is what keeps these side by
               side down to a 320px screen instead of stacking. */}
           <div
-            className={`col-start-1 row-start-1 flex items-center gap-4 sm:gap-6 ${micOn ? "invisible" : ""}`}
+            className={`col-start-1 row-start-1 flex items-center gap-4 md:gap-6 ${micOn ? "invisible" : ""}`}
             aria-hidden={micOn}
           >
             <div className="flex min-w-0 flex-1 flex-col items-center gap-1.5">
@@ -1410,7 +1413,7 @@ export default function Home() {
               onClick={() => void stopMic(true)}
               title="Turn the microphone off to play back what you said"
               aria-label="Turn the microphone off to use the playback controls"
-              className="absolute inset-0 z-10 sm:rounded-xl"
+              className="absolute inset-0 z-10 md:rounded-xl"
             />
           )}
           {/* Two rows: Play and the bar it drives, then the source switch under
@@ -1486,7 +1489,7 @@ export default function Home() {
             debug UI at all. Never on a phone either — it's a development
             affordance, and the screen is needed for the drawing. */}
         {process.env.NODE_ENV === "development" && (
-          <div className="hidden sm:block">
+          <div className="hidden md:block">
             <DebugPanel
               open={debugOpen}
               onToggle={() => setDebugOpen((v) => !v)}
@@ -1509,63 +1512,75 @@ export default function Home() {
           window is narrower than that. Left out entirely on an insecure origin,
           where it would stay blank: the synth it draws is never started there.
           No box of its own either: a tract that's moving already announces
-          itself, and the greyed-out state covers the rest. */}
+          itself, and the greyed-out state covers the rest.
+
+          The cap belongs on the inner wrapper, not this one: flexbox breaks
+          lines on a size that `max-width` has already clamped, so a 616px cap
+          out here is narrow enough to sit beside the column on a ~900px window
+          — which squeezes the controls into a strip nobody asked for. Full
+          width claims the whole line while stacked, and from `md` this takes
+          whatever the fixed column leaves and the drawing scales into it. */}
       {insecure === null && (
-        <div className="w-full max-w-[616px] p-2">
-          <TractStage>
-            {/* Read-only unless the mouth is yours. The element's drags write
+        <div className="w-full p-2 md:min-w-0 md:flex-1">
+          {/* The drawing never usefully exceeds its own bitmap, so cap it here.
+              Left-aligned, not centred: on a wide screen the whole page sits to
+              the left and the empty space goes at the end of it. */}
+          <div className="w-full max-w-[600px]">
+            <TractStage>
+              {/* Read-only unless the mouth is yours. The element's drags write
                 the same AudioParams our curves automate, and a `.value` write
                 doesn't cancel a scheduled curve — so an idle poke used to fight
                 the imitation and win for as long as your finger was down. */}
-            <pink-trombone
-              className="block h-[600px] w-[600px]"
-              inactive={tractActive ? undefined : "true"}
-              interactive={manual ? undefined : "false"}
-            />
+              <pink-trombone
+                className="block h-[600px] w-[600px]"
+                inactive={tractActive ? undefined : "true"}
+                interactive={manual ? undefined : "false"}
+              />
 
-            {/* Over the tract rather than beside the buttons: the wait is the one
+              {/* Over the tract rather than beside the buttons: the wait is the one
                 moment nothing else on the page moves, and tucked next to the
                 controls it was easy to miss. Bounded to the tract's own 500px so
                 it doesn't cover the voicebox. */}
-            {status === "processing" && (
-              <div className="absolute inset-x-0 top-0 z-10 flex h-[500px] items-center justify-center rounded-xl bg-white/70">
-                {/* Solid strip behind the words: the tract is all thin dark lines,
+              {status === "processing" && (
+                <div className="absolute inset-x-0 top-0 z-10 flex h-[500px] items-center justify-center rounded-xl bg-white/70">
+                  {/* Solid strip behind the words: the tract is all thin dark lines,
                     and the wash alone doesn't hide enough of them to read over. */}
-                <span className="w-full bg-white py-2 text-center text-2xl text-neutral-600">
-                  Thinking
-                  <Ellipsis />
-                </span>
-              </div>
-            )}
-          </TractStage>
+                  <span className="w-full bg-white py-2 text-center text-2xl text-neutral-600">
+                    Thinking
+                    <Ellipsis />
+                  </span>
+                </div>
+              )}
+            </TractStage>
 
-          {/* A plain page control rather than one of the original's pills drawn
+            {/* A plain page control rather than one of the original's pills drawn
               into the canvas: it is chrome, not part of the picture, so it
               belongs to the page's own idiom (and stays focusable). Under the
               drawing, since what it hands you is the drawing. */}
-          <div className="flex flex-col items-end gap-1 px-1 pt-2">
-            <button
-              onClick={toggleManual}
-              disabled={micOn}
-              title={
-                micOn
-                  ? "Turn the microphone off first"
-                  : "Play the mouth yourself: drag the voicebox to pitch and voice it, and drag the tract to move the tongue"
-              }
-              /* The border stays declared but transparent when lit, or the
+            <div className="flex flex-col items-end gap-1 px-1 pt-2">
+              <button
+                onClick={toggleManual}
+                disabled={micOn}
+                title={
+                  micOn
+                    ? "Turn the microphone off first"
+                    : "Play the mouth yourself: drag the voicebox to pitch and voice it, and drag the tract to move the tongue"
+                }
+                /* The border stays declared but transparent when lit, or the
                  button loses 2px of height and drags the line below it up (the
                  same reason sectionBox keeps its own). */
-              className={
-                manual
-                  ? "shrink-0 rounded-full border border-transparent bg-highlight-600 px-4 py-1.5 text-sm font-semibold text-white hover:bg-highlight-700"
-                  : "shrink-0 rounded-full border border-neutral-300 bg-white px-4 py-1.5 text-sm font-medium text-neutral-600 hover:bg-neutral-50 disabled:opacity-40 disabled:hover:bg-white"
-              }
-            >
-              Manual control
-            </button>
-            <span className="text-xs text-neutral-500">
-              So that you see it&apos;s not easy.
-            </span>
+                className={
+                  manual
+                    ? "shrink-0 rounded-full border border-transparent bg-highlight-600 px-4 py-1.5 text-sm font-semibold text-white hover:bg-highlight-700"
+                    : "shrink-0 rounded-full border border-neutral-300 bg-white px-4 py-1.5 text-sm font-medium text-neutral-600 hover:bg-neutral-50 disabled:opacity-40 disabled:hover:bg-white"
+                }
+              >
+                Manual control
+              </button>
+              <span className="text-xs text-neutral-500">
+                So that you see it&apos;s not easy.
+              </span>
+            </div>
           </div>
         </div>
       )}
