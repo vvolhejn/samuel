@@ -12,7 +12,6 @@ import {
   fetchDatasetClips,
   fetchHealth,
   fetchPrecomputedIndex,
-  precomputedMatches,
   synthesizeDatasetClip,
   synthesizeUtterance,
   wavBlob,
@@ -25,6 +24,15 @@ import { insecureContextMessage, micErrorMessage } from "@/lib/secureContext";
 import { downloadBlob, makeZip } from "@/lib/zip";
 import { usePinkTrombone } from "@/lib/usePinkTrombone";
 import { useOriginalAudio } from "@/lib/useOriginalAudio";
+import { MicProcessing, MIC_PROCESSING_DEFAULTS } from "@/lib/micProcessing";
+import { MUTED_LINK, STRIP, TextLink, sectionBox } from "@/components/ui";
+import {
+  LevelMeter,
+  levelToSlots,
+  makeLevelStore,
+} from "@/components/LevelMeter";
+import { TractStage } from "@/components/TractStage";
+import { DebugPanel } from "@/components/DebugPanel";
 import type {
   PinkTromboneElement,
   VoiceboxEventDetail,
@@ -36,34 +44,6 @@ type Status =
 /** The three stages of the page, in the order you use them. Exactly one is
  * highlighted at a time, which is how the eye gets handed along. */
 type Section = "input" | "playback" | "tract";
-
-/** Faint box around a stage; the active one drops the outline and fills with the
- * accent wash instead, so only one thing at a time reads as raised. The border
- * stays declared but transparent when lit, or the box would shift a pixel.
- * Padding is left to the call site.
- *
- * On a phone it's a full-bleed strip instead — no corners, and nothing at all
- * until it lights up — which buys back the 26px of side padding and border the
- * controls inside need to stay on one line, and reads as a stronger "you are
- * here" than a small rounded box. The border is still declared there, just
- * transparent, so lighting a strip can't change its height. Call sites pair
- * this with STRIP for the bleed itself. */
-function sectionBox(active: boolean): string {
-  return `border-y border-transparent transition-[color,background-color,border-color,filter] md:rounded-xl md:border ${
-    active ? "bg-highlight-50/60" : "bg-white md:border-neutral-200"
-  }`;
-}
-
-/** Escapes the column's own padding so a section reaches both screen edges, and
- * re-inserts it inside so the contents stay in line with the prose above. Back
- * to an inset box at `md`, where "full width" would only mean the column's.
- *
- * `self-stretch` rather than `w-full`, and it has to be: the column is
- * `items-start`, so a width of 100% would measure the column's *content* box
- * and the negative margin would only slide that width leftwards, leaving the
- * strip short by its own bleed at the right. Stretching sizes it against the
- * margins instead, which is what reaches both edges. */
-const STRIP = "-mx-4 self-stretch px-4 py-3 md:mx-0 md:p-3";
 
 /** Which of the two audio sources the transport plays: the model's imitation,
  * or the audio it was made from. */
@@ -78,10 +58,6 @@ const REDEMPTION_MS = 800;
  * clip does, so an unbroken monologue would otherwise leave you waiting. */
 const MAX_SPEECH_MS = 30_000;
 
-/** Long enough that the dips between words don't strobe the meter, short
- * enough not to read as a countdown of its own — the dots do that. */
-const METER_FADE_MS = 150;
-
 /** vad-web's hysteresis, restated so the meter watches the same edges it does:
  * speech starts above the first, ends below the second. */
 const POSITIVE_SPEECH_THRESHOLD = 0.3;
@@ -90,135 +66,6 @@ const NEGATIVE_SPEECH_THRESHOLD = 0.25;
 /** Grace period before an unfocused window mutes its mic. A hidden tab doesn't
  * get it — that one mutes immediately. */
 const BLUR_MUTE_MS = 60_000;
-
-/** Pipes in the level meter. Unlit ones stay on screen, greyed. */
-const METER_SLOTS = 14;
-
-/** Dots typed out after the meter during the redemption window. */
-const METER_DOTS = 3;
-
-/** RMS range spanned by the meter, in dBFS: under a quiet room to under a
- * shout, so ordinary speech lands mid-scale. */
-const METER_FLOOR_DB = -55;
-const METER_CEIL_DB = -18;
-
-function levelToSlots(frame: Float32Array): number {
-  let sum = 0;
-  for (const sample of frame) sum += sample * sample;
-  const rms = Math.sqrt(sum / frame.length);
-  if (rms <= 0) return 0;
-  const db = 20 * Math.log10(rms);
-  const frac = (db - METER_FLOOR_DB) / (METER_CEIL_DB - METER_FLOOR_DB);
-  return Math.max(0, Math.min(METER_SLOTS, Math.round(frac * METER_SLOTS)));
-}
-
-/** Publishes the mic level outside React, so the ~31 frames a second repaint
- * the meter rather than the whole page. Quantised to a slot count, so most
- * frames don't notify at all. */
-function makeLevelStore() {
-  let slots = 0;
-  const listeners = new Set<() => void>();
-  return {
-    set(next: number) {
-      if (next === slots) return;
-      slots = next;
-      for (const listener of listeners) listener();
-    },
-    subscribe(listener: () => void) {
-      listeners.add(listener);
-      return () => {
-        listeners.delete(listener);
-      };
-    },
-    get: () => slots,
-  };
-}
-
-type LevelStore = ReturnType<typeof makeLevelStore>;
-
-/** Mic level as a line of text. Lit pipes are pink while `active` and grey
- * otherwise, unlit ones fainter still, with dots typed out through `pending`. */
-function LevelMeter({
-  store,
-  active,
-  pending,
-}: {
-  store: LevelStore;
-  active: boolean;
-  pending: boolean;
-}) {
-  const slots = useSyncExternalStore(store.subscribe, store.get, () => 0);
-  return (
-    // Tracked out because `|` has almost no side bearing: packed tight, the
-    // antialiased stems bleed into each other and the colours look mixed.
-    <p aria-hidden className="tracking-[0.2em] text-neutral-200">
-      <span
-        className="ease-linear"
-        style={{
-          color: active
-            ? "var(--color-highlight-600)"
-            : "var(--color-neutral-400)",
-          transitionProperty: "color",
-          transitionDuration: `${METER_FADE_MS}ms`,
-        }}
-      >
-        {"|".repeat(slots)}
-      </span>
-      {"|".repeat(METER_SLOTS - slots)}
-      {/* Staggered in CSS, so mounting starts the animation and unmounting
-          wipes it. */}
-      {pending && (
-        <span className="meter-dots text-neutral-400">
-          {Array.from({ length: METER_DOTS }, (_, i) => (
-            <span key={i}>.</span>
-          ))}
-        </span>
-      )}
-    </p>
-  );
-}
-
-/** The side of the square bitmap the element draws into. */
-const TRACT_PX = 600;
-
-/** Scales the drawing down to whatever width it's given, since the element
- * itself only ever draws its fixed bitmap. A transform rather than a smaller
- * canvas: both hit-tests measure getBoundingClientRect, so drags follow the
- * scale for free. The wrapper carries the scaled height, or the page would
- * reserve the full 600px under it. */
-function TractStage({ children }: { children: React.ReactNode }) {
-  const [scale, setScale] = useState(1);
-  const ref = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    const element = ref.current;
-    if (!element) return;
-    const observer = new ResizeObserver(([entry]) => {
-      setScale(Math.min(1, entry.contentRect.width / TRACT_PX));
-    });
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, []);
-
-  return (
-    <div
-      ref={ref}
-      className="w-full overflow-hidden"
-      style={{ height: TRACT_PX * scale }}
-    >
-      <div
-        className="relative origin-top-left"
-        style={{
-          width: TRACT_PX,
-          height: TRACT_PX,
-          transform: `scale(${scale})`,
-        }}
-      >
-        {children}
-      </div>
-    </div>
-  );
-}
 
 /** Nothing ever invalidates the secure-context snapshot. */
 const subscribeNever = () => () => {};
@@ -248,278 +95,6 @@ const sleep = (ms: number) =>
 function fakeThinking(): Promise<void> {
   const [lo, hi] = FAKE_THINKING_MS;
   return sleep(lo + Math.random() * (hi - lo));
-}
-
-/** Browser mic processing, toggleable so we can A/B it against training audio,
- * which has none of it. vad-web hardcodes all three on; we pass our own
- * getStream/resumeStream instead (see startMic). */
-type MicProcessing = {
-  echoCancellation: boolean;
-  autoGainControl: boolean;
-  noiseSuppression: boolean;
-};
-
-const MIC_PROCESSING_DEFAULTS: MicProcessing = {
-  echoCancellation: true,
-  autoGainControl: true,
-  noiseSuppression: true,
-};
-
-const MIC_PROCESSING_LABELS: Array<{
-  key: keyof MicProcessing;
-  label: string;
-}> = [
-  { key: "echoCancellation", label: "echo cancellation" },
-  { key: "autoGainControl", label: "auto gain control" },
-  { key: "noiseSuppression", label: "noise suppression" },
-];
-
-const PANEL_PARAMS: Array<{ key: string; label: string; digits: number }> = [
-  { key: "frequency", label: "frequency (Hz)", digits: 1 },
-  { key: "voiceness", label: "voiceness", digits: 3 },
-  { key: "intensity", label: "intensity", digits: 3 },
-  { key: "tongueIndex", label: "tongue index", digits: 2 },
-  { key: "tongueDiameter", label: "tongue diameter", digits: 2 },
-  { key: "constrictionIndex", label: "constriction index", digits: 2 },
-  { key: "constrictionDiameter", label: "constriction diameter", digits: 2 },
-  { key: "lipDiameter", label: "lip diameter", digits: 2 },
-];
-
-/** Exact model-output values at the current playback/scrub position. */
-function ModelOutput({
-  response,
-  frac,
-}: {
-  response: SynthResponse | null;
-  frac: number;
-}) {
-  const nFrames = response?.n_frames ?? 0;
-  const frame = response
-    ? Math.min(nFrames - 1, Math.max(0, Math.round(frac * (nFrames - 1))))
-    : 0;
-  const row = (label: string, value: string) => (
-    <div key={label} className="flex items-baseline justify-between gap-3">
-      <dt className="text-neutral-500">{label}</dt>
-      <dd className="font-mono tabular-nums text-neutral-800">{value}</dd>
-    </div>
-  );
-  return (
-    <section>
-      <div className="mb-2 flex items-baseline justify-between">
-        <SectionTitle>model output</SectionTitle>
-        <span className="tabular-nums text-neutral-400">
-          {response ? `frame ${frame + 1}/${nFrames}` : "no clip"}
-        </span>
-      </div>
-      <dl className="space-y-1.5">
-        {PANEL_PARAMS.map(({ key, label, digits }) =>
-          // Older checkpoints predate some params (e.g. lipDiameter).
-          row(
-            label,
-            response?.params[key]
-              ? response.params[key][frame].toFixed(digits)
-              : "–",
-          ),
-        )}
-        {row(
-          "voiced (pyin)",
-          response ? (response.voiced[frame] ? "yes" : "no") : "–",
-        )}
-      </dl>
-    </section>
-  );
-}
-
-/** ".", "..", "..." on a loop. The dots are always laid out and only fade in and
- * out, so the label after them never shifts. */
-function Ellipsis() {
-  return (
-    <span aria-hidden className="ellipsis">
-      <span>.</span>
-      <span>.</span>
-      <span>.</span>
-    </span>
-  );
-}
-
-/** A link in the prose. Anything off-origin opens in a new tab — which, as it
- * stands, is every link here.
- *
- * `muted` is for asides nobody needs to follow (the QWOP joke, the credit for
- * the original): the pink underline still says "link", but the text stays the
- * colour of the sentence around it so it doesn't ask for the click. */
-function TextLink({
-  href,
-  muted,
-  children,
-}: {
-  href: string;
-  muted?: boolean;
-  children: React.ReactNode;
-}) {
-  const external = /^(https?:)?\/\//.test(href);
-  return (
-    <a
-      href={href}
-      target={external ? "_blank" : undefined}
-      rel={external ? "noreferrer" : undefined}
-      className={
-        muted
-          ? MUTED_LINK
-          : "text-highlight-600 underline decoration-dotted hover:text-highlight-700"
-      }
-    >
-      {children}
-    </a>
-  );
-}
-
-/** TextLink's `muted` look, for the controls that read as links in the prose
- * without being one. */
-const MUTED_LINK =
-  "text-inherit underline decoration-highlight-600 decoration-dotted underline-offset-2 hover:text-highlight-600";
-
-function SectionTitle({ children }: { children: React.ReactNode }) {
-  return (
-    <span className="font-semibold tracking-wide text-neutral-600 uppercase">
-      {children}
-    </span>
-  );
-}
-
-/** Everything that is useful while developing but noise while using the thing:
- * which checkpoint is loaded, the live parameter trajectories, and the mic
- * capture settings. Collapsed to a tab on the right by default. */
-function DebugPanel({
-  open,
-  onToggle,
-  health,
-  precomputed,
-  response,
-  frac,
-  micProcessing,
-  onToggleMicProcessing,
-  historyCount,
-  onDownloadHistory,
-}: {
-  open: boolean;
-  onToggle: () => void;
-  health: HealthResponse | null;
-  precomputed: PrecomputedIndex | null;
-  response: SynthResponse | null;
-  frac: number;
-  micProcessing: MicProcessing;
-  onToggleMicProcessing: (key: keyof MicProcessing) => void;
-  historyCount: number;
-  onDownloadHistory: () => void;
-}) {
-  if (!open) {
-    return (
-      <button
-        onClick={onToggle}
-        title="Show the debug panel"
-        className="rounded-full border border-neutral-300 px-4 py-1.5 text-sm font-medium text-neutral-600 hover:bg-neutral-50"
-      >
-        Debug
-      </button>
-    );
-  }
-  return (
-    <aside className="w-full max-w-md space-y-4 rounded-lg border border-neutral-200 bg-neutral-50 p-3 text-xs">
-      <div className="flex items-baseline justify-between">
-        <SectionTitle>debug</SectionTitle>
-        <button
-          onClick={onToggle}
-          title="Hide the debug panel"
-          className="text-neutral-400 hover:text-highlight-600"
-        >
-          hide
-        </button>
-      </div>
-
-      <section>
-        <div className="mb-1">
-          <SectionTitle>checkpoint</SectionTitle>
-        </div>
-        {health ? (
-          <p className="font-mono break-all text-neutral-500">
-            {health.checkpoint.startsWith("https://") ? (
-              <a
-                href={health.checkpoint}
-                target="_blank"
-                rel="noreferrer"
-                className="underline decoration-dotted hover:text-highlight-600"
-              >
-                {health.checkpoint}
-              </a>
-            ) : (
-              health.checkpoint
-            )}
-          </p>
-        ) : (
-          <p className="text-neutral-400">backend unreachable</p>
-        )}
-      </section>
-
-      <section>
-        <div className="mb-1">
-          <SectionTitle>precomputed clips</SectionTitle>
-        </div>
-        {!precomputed ? (
-          <p className="text-neutral-500">
-            none committed — every clip goes to the backend
-          </p>
-        ) : precomputedMatches(precomputed, health?.model_fingerprint) ? (
-          <p className="font-mono text-neutral-500">
-            {precomputed.clips.length} clip(s), {precomputed.model_fingerprint}
-          </p>
-        ) : (
-          <p className="text-red-600">
-            stale: made by {precomputed.model_fingerprint}, backend serves{" "}
-            {health?.model_fingerprint}. Falling back to the backend — re-run{" "}
-            <code>scripts/precompute_clip_responses.py</code>.
-          </p>
-        )}
-      </section>
-
-      <ModelOutput response={response} frac={frac} />
-
-      <section title="Browser mic processing. Training audio has none of it; the server RMS-normalises either way, so these change the shape of the input, not its level.">
-        <div className="mb-1">
-          <SectionTitle>mic processing</SectionTitle>
-        </div>
-        <div className="space-y-1 text-neutral-600">
-          {MIC_PROCESSING_LABELS.map(({ key, label }) => (
-            <label key={key} className="flex items-center gap-1.5">
-              <input
-                type="checkbox"
-                checked={micProcessing[key]}
-                onChange={() => onToggleMicProcessing(key)}
-                className="accent-highlight-600"
-              />
-              {label}
-            </label>
-          ))}
-        </div>
-      </section>
-
-      <section>
-        <div className="mb-1">
-          <SectionTitle>session audio</SectionTitle>
-        </div>
-        <button
-          onClick={onDownloadHistory}
-          disabled={historyCount === 0}
-          title="Zip of every utterance this session: what the model heard and what it said back"
-          className="rounded-full border border-neutral-300 px-3 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 disabled:opacity-40 disabled:hover:bg-transparent"
-        >
-          {historyCount === 0
-            ? "nothing recorded yet"
-            : `download ${historyCount} utterance${historyCount === 1 ? "" : "s"}`}
-        </button>
-      </section>
-    </aside>
-  );
 }
 
 export default function Home() {
@@ -1546,8 +1121,7 @@ export default function Home() {
                   {/* Solid strip behind the words: the tract is all thin dark lines,
                     and the wash alone doesn't hide enough of them to read over. */}
                   <span className="w-full bg-white py-2 text-center text-2xl text-neutral-600">
-                    Thinking
-                    <Ellipsis />
+                    Thinking...
                   </span>
                 </div>
               )}
