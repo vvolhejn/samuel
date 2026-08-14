@@ -104,6 +104,7 @@ class GlottisUI {
     this._inactive = false;
     this._colors = COLOR_SCHEMES.active;
     this._interactive = true;
+    this._container.style.touchAction = "none";
     this._didDrawBackground = false;
 
     // Last values read back off the AudioParams — where the handle sits when
@@ -136,23 +137,29 @@ class GlottisUI {
       this._endEvent(event, -1);
     });
 
-    // Touch EventListeners
+    // Touch EventListeners. preventDefault is what keeps a drag here from
+    // scrolling the page instead, so it is called only for touches actually
+    // driving the voicebox: read-only, the gesture is left alone and the page
+    // scrolls, which on a phone is the only way past the drawing above.
     this._container.addEventListener("touchstart", (event) => {
+      if (!this._interactive) return;
       event.preventDefault();
       Array.from(event.changedTouches).forEach((touch) => this._startEvent(touch, touch.identifier));
     });
     this._container.addEventListener("touchmove", (event) => {
+      const touches = Array.from(event.changedTouches).filter((touch) => this._isDragging(touch));
+      if (touches.length === 0) return;
       event.preventDefault();
-      Array.from(event.changedTouches).forEach((touch) => this._moveEvent(touch, touch.identifier));
+      touches.forEach((touch) => this._moveEvent(touch, touch.identifier));
     });
-    this._container.addEventListener("touchend", (event) => {
+    const onTouchEnd = (event) => {
+      const touches = Array.from(event.changedTouches).filter((touch) => this._isDragging(touch));
+      if (touches.length === 0) return;
       event.preventDefault();
-      Array.from(event.changedTouches).forEach((touch) => this._endEvent(touch, touch.identifier));
-    });
-    this._container.addEventListener("touchcancel", (event) => {
-      event.preventDefault();
-      Array.from(event.changedTouches).forEach((touch) => this._endEvent(touch, touch.identifier));
-    });
+      touches.forEach((touch) => this._endEvent(touch, touch.identifier));
+    };
+    this._container.addEventListener("touchend", onTouchEnd);
+    this._container.addEventListener("touchcancel", onTouchEnd);
 
     // The original's "always voice" toggle, relayed by PinkTromboneUI.
     this._container.addEventListener("message", (event) => {
@@ -232,7 +239,15 @@ class GlottisUI {
   }
   set interactive(interactive) {
     this._interactive = Boolean(interactive);
+    // See the touch listeners: without this a browser may hand the gesture to
+    // the scroller before the drag is recognised.
+    this._container.style.touchAction = this._interactive ? "none" : "";
     if (!this._interactive && this._touchIdentifier !== null) this._release();
+  }
+
+  /** Is this touch the one dragging the voicebox? */
+  _isDragging(touch) {
+    return this._touchIdentifier === touch.identifier;
   }
 
   // ---- drawing -------------------------------------------------------------

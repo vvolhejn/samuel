@@ -9,7 +9,9 @@
                   scheme for when the page has no audio input selected
       2026-08-14  move the palette to colors.js (shared with the voicebox);
                   gate pointer input on the new `interactive` flag, so a page
-                  that automates the tract can stop drags fighting its curves
+                  that automates the tract can stop drags fighting its curves;
+                  hit-test drags off getBoundingClientRect, which works when the
+                  canvas isn't at the document origin (see _getEventPosition)
 
     TODO
         throttle value setter
@@ -56,8 +58,6 @@ class TractUI {
       radius: 298,
       scale: 60,
 
-      scalar: 1,
-
       angle: {
         scale: 0.64,
         offset: -0.25,
@@ -71,6 +71,7 @@ class TractUI {
     // Whether a drag on the tract may move the tongue / add constrictions.
     // Defaults to the original's behaviour: it always could.
     this._interactive = true;
+    this._canvases.tract.style.touchAction = "none";
 
     this._touchConstrictionIndices = [];
 
@@ -132,23 +133,30 @@ class TractUI {
       this._endEvent(event);
     });
 
-    // Touch EventListeners
+    // Touch EventListeners. preventDefault is what stops a drag on the tract
+    // from scrolling the page instead — so it is called only for touches that
+    // are actually driving the tract. Read-only (or a touch that began
+    // elsewhere), the gesture is left alone and the page scrolls, which on a
+    // phone is the only way past a 600px-tall drawing.
     this._canvases.tract.addEventListener("touchstart", (event) => {
+      if (!this._interactive) return;
       event.preventDefault();
       Array.from(event.changedTouches).forEach((touch) => this._startEvent(touch));
     });
     this._canvases.tract.addEventListener("touchmove", (event) => {
+      const touches = Array.from(event.changedTouches).filter((touch) => this._isDragging(touch));
+      if (touches.length === 0) return;
       event.preventDefault();
-      Array.from(event.changedTouches).forEach((touch) => this._moveEvent(touch));
+      touches.forEach((touch) => this._moveEvent(touch));
     });
-    this._canvases.tract.addEventListener("touchend", (event) => {
+    const onTouchEnd = (event) => {
+      const touches = Array.from(event.changedTouches).filter((touch) => this._isDragging(touch));
+      if (touches.length === 0) return;
       event.preventDefault();
-      Array.from(event.changedTouches).forEach((touch) => this._endEvent(touch));
-    });
-    this._canvases.tract.addEventListener("touchcancel", (event) => {
-      event.preventDefault();
-      Array.from(event.changedTouches).forEach((touch) => this._endEvent(touch));
-    });
+      touches.forEach((touch) => this._endEvent(touch));
+    };
+    this._canvases.tract.addEventListener("touchend", onTouchEnd);
+    this._canvases.tract.addEventListener("touchcancel", onTouchEnd);
 
     // Constriction EventLiteners
     this._canvases.tract.addEventListener("didNewConstriction", (event) => {
@@ -187,6 +195,15 @@ class TractUI {
   }
   set interactive(interactive) {
     this._interactive = Boolean(interactive);
+    // Belt and braces with the preventDefault gating in the touch handlers: with
+    // this unset, a browser is free to hand the gesture to the scroller before
+    // the drag has been recognised.
+    this._canvases.tract.style.touchAction = this._interactive ? "none" : "";
+  }
+
+  /** Is this touch one we're already dragging with? */
+  _isDragging(touch) {
+    return this._touchConstrictionIndices[touch.identifier] !== undefined;
   }
 
   get width() {
@@ -197,7 +214,6 @@ class TractUI {
   }
 
   _resize() {
-    this._tract.scalar = this._canvases.tract.width / this._canvases.tract.offsetWidth;
     this._resizeCanvases();
   }
 
@@ -577,18 +593,21 @@ class TractUI {
     return isTongue;
   }
 
-  _getEventX(event) {
-    const x = (event.pageX - event.target.offsetLeft) * this._tract.scalar - this._tract.origin.x;
-    return x;
-  }
-  _getEventY(event) {
-    const y = (event.pageY - event.target.offsetTop) * this._tract.scalar - this._tract.origin.y;
-    return y;
-  }
-
+  // Pointer position in canvas pixels, relative to the tract's origin.
+  //
+  // Was `event.pageX - event.target.offsetLeft`, carried over from the original,
+  // where the canvas is the whole page: pageX is measured from the document but
+  // offsetLeft only from the offsetParent, so the two only cancel when the canvas
+  // sits at the document origin. Anywhere else on a page — the samuel webapp puts
+  // the tract in a column beside its controls — every drag landed hundreds of
+  // pixels away and hit nothing. getBoundingClientRect is measured from the
+  // viewport, like clientX, so it also subsumes the CSS-to-bitmap ratio (the
+  // `scalar` this used to keep) and survives scrolling.
   _getEventPosition(event) {
-    const x = this._getEventX(event);
-    const y = this._getEventY(event);
+    const canvas = this._canvases.tract;
+    const box = canvas.getBoundingClientRect();
+    const x = ((event.clientX - box.left) * canvas.width) / box.width - this._tract.origin.x;
+    const y = ((event.clientY - box.top) * canvas.height) / box.height - this._tract.origin.y;
 
     return {
       index: this._getIndex(x, y),
