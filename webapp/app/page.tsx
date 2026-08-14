@@ -7,7 +7,6 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
-import type { MicVAD } from "@ricky0123/vad-web";
 import {
   fetchDatasetClips,
   fetchHealth,
@@ -20,26 +19,20 @@ import {
   PrecomputedIndex,
   SynthResponse,
 } from "@/lib/audio";
-import { insecureContextMessage, micErrorMessage } from "@/lib/secureContext";
+import { insecureContextMessage } from "@/lib/secureContext";
 import { downloadBlob, makeZip } from "@/lib/zip";
 import { usePinkTrombone } from "@/lib/usePinkTrombone";
 import { useOriginalAudio } from "@/lib/useOriginalAudio";
-import { MicProcessing, MIC_PROCESSING_DEFAULTS } from "@/lib/micProcessing";
+import { useMicVad } from "@/lib/useMicVad";
+import type { Status } from "@/lib/status";
 import { MUTED_LINK, STRIP, TextLink, sectionBox } from "@/components/ui";
-import {
-  LevelMeter,
-  levelToSlots,
-  makeLevelStore,
-} from "@/components/LevelMeter";
+import { LevelMeter } from "@/components/LevelMeter";
 import { TractStage } from "@/components/TractStage";
 import { DebugPanel } from "@/components/DebugPanel";
 import type {
   PinkTromboneElement,
   VoiceboxEventDetail,
 } from "@/types/pink-trombone";
-
-type Status =
-  "idle" | "listening" | "recording" | "processing" | "speaking" | "muted";
 
 /** The three stages of the page, in the order you use them. Exactly one is
  * highlighted at a time, which is how the eye gets handed along. */
@@ -48,20 +41,6 @@ type Section = "input" | "playback" | "tract";
 /** Which of the two audio sources the transport plays: the model's imitation,
  * or the audio it was made from. */
 type Source = "samuel" | "original";
-
-/** Silence the VAD waits through before it calls an utterance finished. The
- * dots are typed out over this window, so the wait reads as a countdown. */
-const REDEMPTION_MS = 800;
-
-/** Ceiling on one utterance, measured from the VAD hearing speech. Past it the
- * segment is cut and sent as it stands: the model takes about as long as the
- * clip does, so an unbroken monologue would otherwise leave you waiting. */
-const MAX_SPEECH_MS = 30_000;
-
-/** vad-web's hysteresis, restated so the meter watches the same edges it does:
- * speech starts above the first, ends below the second. */
-const POSITIVE_SPEECH_THRESHOLD = 0.3;
-const NEGATIVE_SPEECH_THRESHOLD = 0.25;
 
 /** Grace period before an unfocused window mutes its mic. A hidden tab doesn't
  * get it — that one mutes immediately. */
@@ -109,16 +88,6 @@ export default function Home() {
   const [source, setSource] = useState<Source>("samuel");
   /** Playback/scrub position within the current source, in [0, 1]. */
   const [scrubFrac, setScrubFrac] = useState(0);
-  const [micProcessing, setMicProcessing] = useState<MicProcessing>(
-    MIC_PROCESSING_DEFAULTS,
-  );
-  /** User-intended mic state — the Record/Stop toggle. Mirrors micOnRef; the
-   * status alone can't stand in for it (a dataset clip is "speaking" too). */
-  const [micOn, setMicOn] = useState(false);
-  /** Is the VAD hearing speech *this frame*? Drives the ring around the
-   * recording panel, and nothing else — unlike status "recording" it flips tens
-   * of times a second, so it must never gate a control. */
-  const [heard, setHeard] = useState(false);
   /** Pre-recorded clips shipped with the app, and the last one played (which
    * is the button left filled in). */
   const [clips, setClips] = useState<DatasetClip[]>([]);
@@ -145,7 +114,6 @@ export default function Home() {
   const trombone = usePinkTrombone();
   /** The audio the model heard, and everything that plays or previews it. */
   const original = useOriginalAudio(trombone);
-  const vadRef = useRef<MicVAD | null>(null);
   const lastResponse = useRef<SynthResponse | null>(null);
   /** Every utterance this session, for the debug panel's download. */
   const historyRef = useRef<Recording[]>([]);
@@ -153,7 +121,6 @@ export default function Home() {
   const busyRef = useRef(false); // ignore VAD events while processing/speaking
   /** Waiting on the model — the one state nothing can interrupt. */
   const processingRef = useRef(false);
-  const micOnRef = useRef(false); // user-intended mic state (start/mute toggle)
   const scrubbingRef = useRef(false); // pointer is down on the scrub bar
   /** Mirror of `manual`, for the callbacks that hand the mouth back. */
   const manualRef = useRef(false);
@@ -166,14 +133,40 @@ export default function Home() {
    * progress tick. */
   const scrubFracRef = useRef(0);
   const sourceRef = useRef<Source>("samuel");
-  // Read by getStream/resumeStream, which vad-web calls on every start().
-  const micProcessingRef = useRef<MicProcessing>(MIC_PROCESSING_DEFAULTS);
-  /** Mirror of `heard`, so the per-frame callback only re-renders on edges. */
-  const heardRef = useRef(false);
-  /** When the in-flight utterance started, or 0 if there isn't one. Watched
-   * per frame against MAX_SPEECH_MS. */
-  const speechStartRef = useRef(0);
-  const [levelStore] = useState(makeLevelStore);
+
+  // The mic and everything downstream of it. Its callbacks are read through a
+  // ref inside the hook, so the ones named here may be defined further down —
+  // which is what lets the mic hand an utterance to a playback that in turn
+  // hands the mic back.
+  const {
+    micOn,
+    micOnRef,
+    heard,
+    levelStore,
+    micProcessing,
+    startMic,
+    stopMic,
+    pauseMic,
+    restoreMic,
+    toggleMicProcessing,
+  } = useMicVad({
+    onUtterance: (audio) => void onUtterance(audio),
+    onBeforeStart: async () => {
+      exitManual(); // the mic and a hand on the pad both want the whole mouth
+      const current = await fetchHealth();
+      if (!current) {
+        throw new Error(
+          "Model backend unreachable — run: uv run --extra server uvicorn samuel.server:app --port 8000",
+        );
+      }
+      setHealth(current); // also picks up a checkpoint swap since page load
+      await trombone.resume(); // we're in a user gesture
+    },
+    isBusy: () => busyRef.current,
+    isScrubbing: () => scrubbingRef.current,
+    setStatus,
+    setError,
+  });
 
   // Bring up the synth + tract visualization immediately; the AudioContext
   // stays suspended until the first user gesture (Start).
@@ -188,10 +181,6 @@ export default function Home() {
         setError(e instanceof Error ? e.message : String(e));
       });
     }
-    return () => {
-      vadRef.current?.destroy();
-      vadRef.current = null;
-    };
   }, [trombone]);
 
   // Which checkpoint the backend is serving (shown under the title).
@@ -203,27 +192,6 @@ export default function Home() {
   useEffect(() => {
     void fetchDatasetClips().then(setClips);
     void fetchPrecomputedIndex().then(setPrecomputed);
-  }, []);
-
-  /** Edge-triggered setter for the meter's colour. */
-  const showHeard = useCallback((value: boolean) => {
-    if (heardRef.current === value) return;
-    heardRef.current = value;
-    setHeard(value);
-  }, []);
-
-  /** Resume VAD only if the user hasn't muted the mic. */
-  const restoreMic = useCallback(async () => {
-    if (scrubbingRef.current) return; // the scrub owns the synth until pointer-up
-    // A pause elsewhere (playback, a mic-processing toggle) discards whatever
-    // was in flight, so the clock can't carry over into the next utterance.
-    speechStartRef.current = 0;
-    if (micOnRef.current) {
-      await vadRef.current?.start();
-      setStatus("listening");
-    } else {
-      setStatus(vadRef.current ? "muted" : "idle");
-    }
   }, []);
 
   const updateFrac = useCallback((frac: number) => {
@@ -278,7 +246,7 @@ export default function Home() {
       busyRef.current = true;
       setStatus("speaking");
       setIsPlaying(true);
-      await vadRef.current?.pause(); // don't let the synth retrigger the mic
+      await pauseMic(); // don't let the synth retrigger the mic
       try {
         await trombone.speak(response, {
           startFrac,
@@ -290,7 +258,7 @@ export default function Home() {
         await finishPlayback(id);
       }
     },
-    [trombone, stopPlayback, finishPlayback, updateFrac],
+    [trombone, stopPlayback, finishPlayback, updateFrac, pauseMic],
   );
 
   /** Play the audio the model heard — your trimmed recording, or the dataset
@@ -304,7 +272,7 @@ export default function Home() {
       busyRef.current = true;
       setStatus("speaking");
       setIsPlaying(true);
-      await vadRef.current?.pause();
+      await pauseMic();
       try {
         await original.play(startFrac);
       } catch (e) {
@@ -328,7 +296,7 @@ export default function Home() {
       };
       requestAnimationFrame(tick);
     },
-    [original, stopPlayback, finishPlayback, updateFrac],
+    [original, stopPlayback, finishPlayback, updateFrac, pauseMic],
   );
 
   const remember = useCallback((recording: Recording) => {
@@ -394,119 +362,6 @@ export default function Home() {
     [playSamuel, restoreMic, original, remember],
   );
 
-  /** Cut an over-long utterance short and send what's been said. Pausing with
-   * submitUserSpeechOnPause is what ends the segment; onUtterance takes it from
-   * there and hands the mic back when it's done, so the restart here is only for
-   * the case where the VAD had nothing to give us after all. */
-  const cutUtterance = useCallback(async () => {
-    const vad = vadRef.current;
-    if (!vad) return;
-    speechStartRef.current = 0;
-    showHeard(false);
-    levelStore.set(0);
-    vad.setOptions({ submitUserSpeechOnPause: true });
-    await vad.pause();
-    vad.setOptions({ submitUserSpeechOnPause: false });
-    if (!busyRef.current) await restoreMic();
-  }, [restoreMic, showHeard, levelStore]);
-
-  const startMic = useCallback(async () => {
-    setError(null);
-    exitManual(); // the mic and a hand on the pad both want the whole mouth
-    try {
-      const current = await fetchHealth();
-      if (!current) {
-        throw new Error(
-          "Model backend unreachable — run: uv run --extra server uvicorn samuel.server:app --port 8000",
-        );
-      }
-      setHealth(current); // also picks up a checkpoint swap since page load
-      await trombone.resume(); // we're in a user gesture
-
-      if (!vadRef.current) {
-        const { MicVAD } = await import("@ricky0123/vad-web");
-        // vad-web's default getStream/resumeStream hardcode all three
-        // processing flags on; ours re-read the ref, and since pause() stops
-        // the tracks and start() re-acquires, a toggle lands on the next
-        // listening cycle without rebuilding the VAD.
-        const getStream = () =>
-          navigator.mediaDevices.getUserMedia({
-            audio: { channelCount: 1, ...micProcessingRef.current },
-          });
-        vadRef.current = await MicVAD.new({
-          model: "v5",
-          baseAssetPath: "/vad/",
-          onnxWASMBasePath: "/vad/",
-          getStream,
-          resumeStream: getStream,
-          redemptionMs: REDEMPTION_MS,
-          preSpeechPadMs: 150, // default 800ms puts noticeable silence before speech
-          positiveSpeechThreshold: POSITIVE_SPEECH_THRESHOLD,
-          negativeSpeechThreshold: NEGATIVE_SPEECH_THRESHOLD,
-          onSpeechStart: () => {
-            speechStartRef.current = performance.now();
-            if (!busyRef.current && micOnRef.current) setStatus("recording");
-          },
-          onVADMisfire: () => {
-            speechStartRef.current = 0;
-            levelStore.set(0);
-            if (!busyRef.current && micOnRef.current) setStatus("listening");
-          },
-          onSpeechEnd: (audio) => {
-            speechStartRef.current = 0;
-            showHeard(false);
-            levelStore.set(0);
-            void onUtterance(audio);
-          },
-          onFrameProcessed: ({ isSpeech }, frame) => {
-            if (busyRef.current || !micOnRef.current) return;
-            if (isSpeech >= POSITIVE_SPEECH_THRESHOLD) showHeard(true);
-            else if (isSpeech < NEGATIVE_SPEECH_THRESHOLD) showHeard(false);
-            levelStore.set(levelToSlots(frame));
-            if (
-              speechStartRef.current &&
-              performance.now() - speechStartRef.current >= MAX_SPEECH_MS
-            ) {
-              void cutUtterance();
-            }
-          },
-        });
-      }
-      micOnRef.current = true;
-      setMicOn(true);
-      await vadRef.current.start();
-      setStatus("listening");
-    } catch (e) {
-      setError(micErrorMessage(e));
-      micOnRef.current = false;
-      setMicOn(false);
-      setStatus(vadRef.current ? "muted" : "idle");
-    }
-  }, [trombone, onUtterance, showHeard, levelStore, exitManual, cutUtterance]);
-
-  /** Turn the mic off. `submit` sends a half-spoken utterance rather than
-   * binning it — true from the button, since people press it meaning "I'm
-   * done"; false when the tab is left, where an unasked-for answer is worse. */
-  const stopMic = useCallback(
-    async (submit = false) => {
-      micOnRef.current = false;
-      setMicOn(false);
-      showHeard(false);
-      levelStore.set(0);
-      speechStartRef.current = 0;
-      const vad = vadRef.current;
-      // Scoped to this one pause: the others (playback starting, a
-      // mic-processing toggle) must keep discarding, or the response would feed
-      // itself back in as a new utterance.
-      if (submit) vad?.setOptions({ submitUserSpeechOnPause: true });
-      await vad?.pause(); // fires onSpeechEnd synchronously if it had one
-      if (submit) vad?.setOptions({ submitUserSpeechOnPause: false });
-      // onUtterance has already claimed busyRef by now if something was sent.
-      if (!busyRef.current) setStatus("muted");
-    },
-    [showHeard, levelStore],
-  );
-
   // Leaving shouldn't leave a live mic — or a held note — behind, and coming
   // back is always an explicit gesture: nothing auto-resumes. A hidden tab is
   // gone for good, so it mutes at once; merely losing focus gets BLUR_MUTE_MS of
@@ -541,28 +396,7 @@ export default function Home() {
       window.removeEventListener("blur", onBlur);
       window.removeEventListener("focus", cancel);
     };
-  }, [stopMic, exitManual]);
-
-  /** Flip one mic-processing flag. If we're listening right now, cycle the
-   * stream so it takes effect immediately rather than after the next
-   * utterance. */
-  const toggleMicProcessing = useCallback(async (key: keyof MicProcessing) => {
-    const next = {
-      ...micProcessingRef.current,
-      [key]: !micProcessingRef.current[key],
-    };
-    micProcessingRef.current = next;
-    setMicProcessing(next);
-
-    const vad = vadRef.current;
-    if (!vad || busyRef.current || !micOnRef.current || !vad.listening) return;
-    try {
-      await vad.pause();
-      await vad.start();
-    } catch (e) {
-      setError(micErrorMessage(e));
-    }
-  }, []);
+  }, [stopMic, exitManual, micOnRef]);
 
   /** Mimic one of the pre-recorded clips. Interrupts anything playing — only a
    * request already in flight to the model holds it off. */
@@ -577,7 +411,7 @@ export default function Home() {
       setError(null);
       setPlayedClip(name);
       setStatus("processing");
-      await vadRef.current?.pause();
+      await pauseMic();
       try {
         await trombone.resume(); // we're in a user gesture
         console.log(`${clip.name}: ${clip.source} @${clip.offset_s}s`);
@@ -619,6 +453,7 @@ export default function Home() {
       original,
       remember,
       exitManual,
+      pauseMic,
     ],
   );
 
@@ -666,7 +501,7 @@ export default function Home() {
       if (!scrubbingRef.current) {
         exitManual(); // the bar is about to drive the tract itself
         scrubbingRef.current = true;
-        void vadRef.current?.pause(); // scrubbing makes sound; don't feed it back
+        void pauseMic(); // scrubbing makes sound; don't feed it back
         setStatus("speaking");
       }
       if (sourceRef.current === "original") {
@@ -680,7 +515,7 @@ export default function Home() {
       if (!response) return;
       trombone.scrub(response, frac);
     },
-    [trombone, updateFrac, original, exitManual],
+    [trombone, updateFrac, original, exitManual, pauseMic],
   );
 
   /** Letting go of the bar plays on from where you dropped it, whether or not

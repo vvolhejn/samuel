@@ -32,7 +32,7 @@ body {
 }
 
 /* Dots typed out after the mic level meter during the VAD's redemption window.
-   Delays must stay in step with REDEMPTION_MS in page.tsx. */
+   Delays must stay in step with REDEMPTION_MS in lib/useMicVad.ts. */
 .meter-dots > span {
   opacity: 0;
   animation: meter-dot 1ms linear forwards;
