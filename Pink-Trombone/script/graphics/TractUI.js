@@ -124,13 +124,13 @@ class TractUI {
 
     // Mouse EventListeners
     this._canvases.tract.addEventListener("mousedown", (event) => {
-      this._startEvent(event);
+      this._startEvent(event, -1);
     });
     this._canvases.tract.addEventListener("mousemove", (event) => {
-      this._moveEvent(event);
+      this._moveEvent(event, -1);
     });
     this._canvases.tract.addEventListener("mouseup", (event) => {
-      this._endEvent(event);
+      this._endEvent(event, -1);
     });
 
     // Touch EventListeners. preventDefault is what stops a drag on the tract
@@ -141,19 +141,21 @@ class TractUI {
     this._canvases.tract.addEventListener("touchstart", (event) => {
       if (!this._interactive) return;
       event.preventDefault();
-      Array.from(event.changedTouches).forEach((touch) => this._startEvent(touch));
+      Array.from(event.changedTouches).forEach((touch) =>
+        this._startEvent(touch, touch.identifier)
+      );
     });
     this._canvases.tract.addEventListener("touchmove", (event) => {
       const touches = Array.from(event.changedTouches).filter((touch) => this._isDragging(touch));
       if (touches.length === 0) return;
       event.preventDefault();
-      touches.forEach((touch) => this._moveEvent(touch));
+      touches.forEach((touch) => this._moveEvent(touch, touch.identifier));
     });
     const onTouchEnd = (event) => {
       const touches = Array.from(event.changedTouches).filter((touch) => this._isDragging(touch));
       if (touches.length === 0) return;
       event.preventDefault();
-      touches.forEach((touch) => this._endEvent(touch));
+      touches.forEach((touch) => this._endEvent(touch, touch.identifier));
     };
     this._canvases.tract.addEventListener("touchend", onTouchEnd);
     this._canvases.tract.addEventListener("touchcancel", onTouchEnd);
@@ -629,11 +631,10 @@ class TractUI {
     });
   }
 
-  _startEvent(event) {
+  _startEvent(event, touchIdentifier) {
     if (!this._interactive) return; // read-only: no drag is ever begun, so
     // _moveEvent/_endEvent find nothing in _touchConstrictionIndices and fall
     // through on their own.
-    const touchIdentifier = event instanceof Touch ? event.identifier : -1;
     if (this._touchConstrictionIndices[touchIdentifier] == undefined) {
       const position = this._getEventPosition(event);
       const isNearTongue = this._isNearTongue(position.index, position.diameter);
@@ -654,9 +655,7 @@ class TractUI {
       }
     }
   }
-  _moveEvent(event) {
-    const touchIdentifier = event instanceof Touch ? event.identifier : -1;
-
+  _moveEvent(event, touchIdentifier) {
     if (this._touchConstrictionIndices[touchIdentifier] !== undefined) {
       const position = this._getEventPosition(event);
       const constrictionIndex = this._touchConstrictionIndices[touchIdentifier];
@@ -678,9 +677,7 @@ class TractUI {
       }
     }
   }
-  _endEvent(event) {
-    const touchIdentifier = event instanceof Touch ? event.identifier : -1;
-
+  _endEvent(event, touchIdentifier) {
     if (this._touchConstrictionIndices[touchIdentifier] !== undefined) {
       const constrictionIndex = this._touchConstrictionIndices[touchIdentifier];
       const isTongue = constrictionIndex == -1;
