@@ -385,6 +385,9 @@ export default function Home() {
   const onUtterance = useCallback(
     async (audio: Float32Array) => {
       if (isBusy()) return;
+      // Your own voice is now what the transport holds, so no clip button stays
+      // filled in and no clip is credited under the bar.
+      setPlayedClip("");
       await imitate("mic", () => synthesizeUtterance(audio));
     },
     [imitate, isBusy],
@@ -626,6 +629,8 @@ export default function Home() {
   // synth into your own microphone. Turning the mic off hands the page over.
   const canPlay = hasSource && notBusy && !micOn;
   const canScrub = hasSource && owner !== "model" && !micOn;
+  // Who read the audio the transport holds, or null while it holds your voice.
+  const clipCredit = clips.find((c) => c.name === playedClip)?.librivox ?? null;
   // The drawing is grey until something has a claim on it: the mic is on, a
   // pre-recorded clip has come back from the model, or you've taken it by hand.
   const tractActive = micOn || viewResponse !== null || manual;
@@ -856,16 +861,32 @@ export default function Home() {
 
           {/* The other take of the same utterance, as an aside rather than a
               switch: the imitation is what you came for, and a lit-up control
-              next to Play only competed with it. */}
-          <span className="text-xs text-neutral-500">
+              next to Play only competed with it. The clip's credit shares this
+              row, pushed to the far end, so crediting costs no height — and it
+              sits under the bar it belongs to rather than by the buttons, since
+              what it names is the audio now loaded, not the button you pressed. */}
+          <div className="flex items-start justify-between gap-3 text-xs text-neutral-500">
             <button
               onClick={() => void playOther()}
               disabled={!original.loaded || !transportLive}
-              className={`${MUTED_LINK} disabled:opacity-50 disabled:hover:text-inherit`}
+              className={`${MUTED_LINK} shrink-0 disabled:opacity-50 disabled:hover:text-inherit`}
             >
               {source === "samuel" ? "Play original" : "Play imitated"}
             </button>
-          </span>
+
+            {clipCredit && (
+              <span className="min-w-0 text-right">
+                <TextLink href={clipCredit.url} muted>
+                  {clipCredit.title}
+                </TextLink>{" "}
+                by {clipCredit.author}, read by {clipCredit.reader} (
+                <TextLink href="https://librivox.org/" muted>
+                  LibriVox
+                </TextLink>
+                )
+              </span>
+            )}
+          </div>
         </div>
         {insecure && (
           <p className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">

@@ -20,6 +20,16 @@ export function wavBlob(b64: string): Blob {
   return new Blob([bytes], { type: "audio/wav" });
 }
 
+/** Who to credit for a clip: the LibriVox recording the dataset took it from.
+ * `url` is the book's LibriVox page, `file_url` the section itself. */
+export interface LibrivoxCredit {
+  title: string;
+  author: string;
+  reader: string;
+  url: string;
+  file_url: string;
+}
+
 /** One pre-recorded clip under public/clips, as listed in sources.json. That
  * file is also the recipe the WAVs are cut from — see
  * scripts/build_webapp_clips.py — hence the dataset fields, which the UI does
@@ -29,6 +39,7 @@ export interface DatasetClip {
   source: string;
   offset_s: number;
   duration_s: number;
+  librivox?: LibrivoxCredit;
 }
 
 let clipIndex: Promise<DatasetClip[]> | null = null;
