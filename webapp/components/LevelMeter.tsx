@@ -1,23 +1,17 @@
 import { useSyncExternalStore } from "react";
 import { METER_SLOTS, LevelStore } from "@/lib/levelStore";
 
-/** Dots typed out after the meter during the redemption window. */
-const METER_DOTS = 3;
-
-/** Long enough that the dips between words don't strobe the meter, short
- * enough not to read as a countdown of its own — the dots do that. */
+/** Long enough that the dips between words don't strobe the meter. */
 const METER_FADE_MS = 150;
 
-/** Mic level as a line of text. Lit pipes are pink while `active` and grey
- * otherwise, unlit ones fainter still, with dots typed out through `pending`. */
+/** Mic level as a line of text. Lit pipes are pink while `active` — the VAD
+ * hears speech — and grey otherwise, unlit ones fainter still. */
 export function LevelMeter({
   store,
   active,
-  pending,
 }: {
   store: LevelStore;
   active: boolean;
-  pending: boolean;
 }) {
   const slots = useSyncExternalStore(store.subscribe, store.get, () => 0);
   return (
@@ -37,15 +31,6 @@ export function LevelMeter({
         {"|".repeat(slots)}
       </span>
       {"|".repeat(METER_SLOTS - slots)}
-      {/* Staggered in CSS, so mounting starts the animation and unmounting
-          wipes it. */}
-      {pending && (
-        <span className="meter-dots text-neutral-400">
-          {Array.from({ length: METER_DOTS }, (_, i) => (
-            <span key={i}>.</span>
-          ))}
-        </span>
-      )}
     </p>
   );
 }

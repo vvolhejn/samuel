@@ -150,7 +150,6 @@ export default function Home() {
     micOn,
     micOnRef,
     heard,
-    recording,
     levelStore,
     micProcessing,
     startMic,
@@ -164,7 +163,7 @@ export default function Home() {
       const current = await fetchHealth();
       if (!current) {
         throw new Error(
-          "Model backend unreachable — run: uv run --extra server uvicorn samuel.server:app --port 8000",
+          "Model backend unreachable — run: uv run --extra server python -m samuel.server --no-frontend",
         );
       }
       setHealth(current); // also picks up a checkpoint swap since page load
@@ -464,11 +463,16 @@ export default function Home() {
     [playOriginal, playSamuel, lastResponse],
   );
 
-  /** The mic wants the whole mouth, like everything else that makes a sound. */
-  const startListening = useCallback(() => {
+  /** The Microphone/Stop button. Starting takes the whole mouth, like everything
+   * else that makes a sound; stopping sends what you said. */
+  const toggleMic = useCallback(() => {
+    if (micOnRef.current) {
+      void stopMic(true);
+      return;
+    }
     claim("none");
     void startMic();
-  }, [claim, startMic]);
+  }, [claim, startMic, stopMic, micOnRef]);
 
   /** Play from the scrub position (or the start, if at the end); pause if
    * already playing. */
@@ -605,11 +609,8 @@ export default function Home() {
     trombone.startVoice();
   }, [claim, restoreMic, trombone, manualRef, setManual]);
 
-  // "recording" only means the VAD currently hears *something* — a cough or a
-  // door must not disable the buttons, or every other click gets swallowed
-  // while it flaps. busyRef is the real guard, and starting a playback pauses
-  // the VAD, which discards the in-flight segment. Playback is *not* a reason
-  // to disable anything: every control below interrupts it cleanly.
+  // Playback is *not* a reason to disable anything: every control below
+  // interrupts it cleanly. Waiting on the model is.
   const notBusy = insecure === null && owner !== "model";
   const hasSource =
     source === "original" ? original.loaded : viewResponse !== null;
@@ -625,9 +626,6 @@ export default function Home() {
   // synth into your own microphone. Turning the mic off hands the page over.
   const canPlay = hasSource && notBusy && !micOn;
   const canScrub = hasSource && owner !== "model" && !micOn;
-  // Mid-utterance but hearing nothing, i.e. the redemption window: "recording"
-  // is set on speech start and cleared only when the segment ends or misfires.
-  const pending = recording && !heard;
   // The drawing is grey until something has a claim on it: the mic is on, a
   // pre-recorded clip has come back from the model, or you've taken it by hand.
   const tractActive = micOn || viewResponse !== null || manual;
@@ -715,65 +713,52 @@ export default function Home() {
             less
           </button>
         )}
-        {/* Both faces of the box share one grid cell, so it is always as tall
-            as the taller of them and toggling the mic can't move the page. The
-            hidden one is `invisible`, which still takes up space but drops out
-            of hit-testing and the tab order. */}
-        <div className={`grid ${STRIP} ${sectionBox(section === "input")}`}>
-          <div
-            className={`col-start-1 row-start-1 flex flex-col justify-between gap-2 ${micOn ? "" : "invisible"}`}
-            aria-hidden={!micOn}
-          >
-            <span className="flex min-w-0 items-center gap-2 text-neutral-500">
-              <span
-                aria-hidden
-                className="h-2.5 w-2.5 shrink-0 rounded-full bg-highlight-600"
-              />
-              Speak now, Samuel answers after you pause
-            </span>
+        {/* Two columns: talk to it on the left, or pick a canned clip on the
+            right. They split the row evenly and are allowed to shrink under
+            their text, so what governs the width is the buttons (~130px each)
+            and the labels wrap over them — which is what keeps these side by
+            side down to a 320px screen instead of stacking. */}
+        <div
+          className={`flex items-center gap-4 md:gap-6 ${STRIP} ${sectionBox(section === "input")}`}
+        >
+          <div className="flex min-w-0 flex-1 flex-col items-center gap-1.5">
+            {/* One button, two labels: it is the same thing you press to start
+                and to be done, so it stays in one place and says which. */}
+            <button
+              onClick={toggleMic}
+              disabled={insecure !== null}
+              title={insecure ? "Unavailable on an insecure origin" : undefined}
+              /* Fixed width so the two labels don't resize it, and outlined
+                 while recording: the filled pill is an invitation, and there is
+                 nothing left to invite once you're being listened to. Both
+                 declare a border, or the outlined one would stand 2px taller. */
+              className={`w-32 rounded-full border py-1.5 text-sm ${
+                micOn
+                  ? "border-highlight-300 bg-white font-medium text-highlight-700 hover:bg-highlight-50"
+                  : "border-transparent bg-highlight-600 font-semibold text-white hover:bg-highlight-700 disabled:opacity-40 disabled:hover:bg-highlight-600"
+              }`}
+            >
+              {micOn ? "Stop" : "Microphone"}
+            </button>
 
-            <div className="flex items-end justify-between gap-4">
-              <LevelMeter store={levelStore} active={heard} pending={pending} />
-
-              <button
-                onClick={() => void stopMic(true)}
-                title="Stop listening and hand the page back to the playback controls"
-                className="rounded-full border border-highlight-300 px-4 py-1.5 text-sm font-medium text-highlight-700 hover:bg-highlight-50"
+            {/* Both faces share one grid cell, so the column is always as tall
+                as the taller of them and toggling the mic can't move the page.
+                The hidden one is `invisible`, which still takes up space but
+                drops out of hit-testing and the tab order. */}
+            <div className="grid w-full">
+              <div
+                className={`col-start-1 row-start-1 flex items-center justify-center ${micOn ? "" : "invisible"}`}
+                aria-hidden={!micOn}
               >
-                Turn off
-              </button>
-            </div>
-          </div>
-
-          {/* Two columns: talk to it on the left, or pick a canned clip on the
-              right. They split the row evenly and are allowed to shrink under
-              their text, so what governs the width is the buttons (~110px each)
-              and the labels wrap over them — which is what keeps these side by
-              side down to a 320px screen instead of stacking. */}
-          <div
-            className={`col-start-1 row-start-1 flex items-center gap-4 md:gap-6 ${micOn ? "invisible" : ""}`}
-            aria-hidden={micOn}
-          >
-            <div className="flex min-w-0 flex-1 flex-col items-center gap-1.5">
-              <button
-                onClick={startListening}
-                disabled={insecure !== null}
-                title={
-                  insecure
-                    ? "Unavailable on an insecure origin"
-                    : "Listen continuously and mimic every utterance"
-                }
-                className="rounded-full bg-highlight-600 px-4 py-1.5 text-sm font-semibold text-white hover:bg-highlight-700 disabled:opacity-40 disabled:hover:bg-highlight-600"
-              >
-                Microphone
-              </button>
+                <LevelMeter store={levelStore} active={heard} />
+              </div>
 
               {/* Reassurance, not an action: recordings go to the server only
-                    to be mimicked back, and nothing is written to disk there.
-                    Only the "self-host" escape hatch is clickable. */}
+                  to be mimicked back, and nothing is written to disk there.
+                  Only the "self-host" escape hatch is clickable. */}
               <span
-                className="text-center text-xs text-neutral-500"
-                title="Recordings are sent to the server only to be mimicked back; they are never written to disk."
+                className={`col-start-1 row-start-1 text-center text-xs text-neutral-500 ${micOn ? "invisible" : ""}`}
+                aria-hidden={micOn}
               >
                 Your audio is not stored.
                 <br />
@@ -783,39 +768,36 @@ export default function Home() {
                 if you don&apos;t trust me
               </span>
             </div>
+          </div>
 
-            <div className="flex min-w-0 flex-1 flex-col items-center gap-1.5">
-              <span className="text-center text-sm text-neutral-500">
-                or use pre-recorded audio
-              </span>
+          <div className="flex min-w-0 flex-1 flex-col items-center gap-1.5">
+            <span className="text-center text-sm text-neutral-500">
+              or use pre-recorded audio
+            </span>
 
-              {/* One button per committed clip, numbered rather than named:
-                    which recording is which only matters once you've heard
-                    them. */}
-              <div className="grid grid-cols-3 gap-1.5">
-                {clips.map((clip, i) => (
-                  <button
-                    key={clip.name}
-                    onClick={() => void playClip(clip.name)}
-                    disabled={!notBusy}
-                    title={
-                      insecure
-                        ? "Unavailable on an insecure origin"
-                        : `Mimic ${clip.duration_s.toFixed(0)}s of held-out speech`
-                    }
-                    className={
-                      clip.name === playedClip
-                        ? "rounded-md bg-highlight-600 px-3 py-1 text-sm font-semibold text-white disabled:opacity-40"
-                        : /* White like the Play pill, not transparent: these
-                             keep their own ground when the box behind them
-                             lights up. */
-                          "rounded-md border border-highlight-300 bg-white px-3 py-1 text-sm font-medium text-highlight-700 hover:bg-highlight-50 disabled:opacity-40 disabled:hover:bg-white"
-                    }
-                  >
-                    {i + 1}
-                  </button>
-                ))}
-              </div>
+            {/* One button per committed clip, numbered rather than named: which
+                recording is which only matters once you've heard them. */}
+            <div className="grid grid-cols-3 gap-1.5">
+              {clips.map((clip, i) => (
+                <button
+                  key={clip.name}
+                  onClick={() => void playClip(clip.name)}
+                  disabled={!notBusy || micOn}
+                  title={
+                    insecure ? "Unavailable on an insecure origin" : undefined
+                  }
+                  className={
+                    clip.name === playedClip
+                      ? "rounded-md bg-highlight-600 px-3 py-1 text-sm font-semibold text-white disabled:opacity-40"
+                      : /* White like the Play pill, not transparent: these keep
+                           their own ground when the box behind them lights
+                           up. */
+                        "rounded-md border border-highlight-300 bg-white px-3 py-1 text-sm font-medium text-highlight-700 hover:bg-highlight-50 disabled:opacity-40 disabled:hover:bg-white"
+                  }
+                >
+                  {i + 1}
+                </button>
+              ))}
             </div>
           </div>
         </div>
@@ -830,14 +812,13 @@ export default function Home() {
           }`}
         >
           {/* Reaching for a dead transport says you're done talking, so treat
-              it as the "Turn off" button. Has to be an overlay rather than a
-              click handler on the box: the controls underneath are disabled,
-              and a disabled control swallows the click instead of bubbling. */}
+              it as the Stop button. Has to be an overlay rather than a click
+              handler on the box: the controls underneath are disabled, and a
+              disabled control swallows the click instead of bubbling. */}
           {micOn && (
             <button
               onClick={() => void stopMic(true)}
-              title="Turn the microphone off to play back what you said"
-              aria-label="Turn the microphone off to use the playback controls"
+              aria-label="Stop recording to use the playback controls"
               className="absolute inset-0 z-10 md:rounded-xl"
             />
           )}
@@ -848,11 +829,6 @@ export default function Home() {
             <button
               onClick={() => void togglePlay()}
               disabled={!canPlay && !isPlaying}
-              title={
-                source === "original"
-                  ? "Play the audio the model heard"
-                  : "Play Samuel's imitation"
-              }
               /* White, not accent-filled: the solid pill is the microphone's, and
                two of them made the transport shout for a click it doesn't need.
                Explicitly white rather than transparent so it keeps its own
@@ -885,11 +861,6 @@ export default function Home() {
             <button
               onClick={() => void playOther()}
               disabled={!original.loaded || !transportLive}
-              title={
-                source === "samuel"
-                  ? "Play the audio the model heard, at its recorded level"
-                  : "Play the model's imitation again"
-              }
               className={`${MUTED_LINK} disabled:opacity-50 disabled:hover:text-inherit`}
             >
               {source === "samuel" ? "Play original" : "Play imitated"}

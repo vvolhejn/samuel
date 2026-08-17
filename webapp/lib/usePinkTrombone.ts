@@ -10,6 +10,8 @@ const LEAD_S = 0.15;
 const FADE_OUT_S = 0.05;
 /** Smoothing for direct (scrub/stop) parameter jumps. */
 const SCRUB_TAU_S = 0.02;
+/** Diameter at which a constriction stops pinching the tract. */
+const OPEN_DIAMETER = 3;
 /** Headroom when re-scheduling mid-utterance (setPlaybackSpeed). Short enough
  * to feel instant, long enough that the audio thread hasn't rendered past it. */
 const RESCHEDULE_LEAD_S = 0.05;
@@ -111,7 +113,7 @@ function curveValues(response: SynthResponse): Float32Array[] {
     // Older checkpoints predate the lip constriction; leave it open then.
     params.lipDiameter
       ? Float32Array.from(params.lipDiameter)
-      : new Float32Array(params.voiceness.length).fill(3),
+      : new Float32Array(params.voiceness.length).fill(OPEN_DIAMETER),
     Float32Array.from(params.intensity),
   ];
 }
@@ -186,9 +188,9 @@ export function usePinkTrombone(): PinkTromboneHandle {
     // Two persistent constriction slots driven by the model trajectories:
     // the tongue-tip constriction (movable index) and the lip constriction
     // (fixed at the last tract index, mirrors _LIP_INDEX in pink_trombone.py).
-    // Start fully open (diameter 3 ≈ no constriction).
-    const constriction = element.newConstriction(33, 3);
-    const lipConstriction = element.newConstriction(43, 3);
+    // Start fully open.
+    const constriction = element.newConstriction(33, OPEN_DIAMETER);
+    const lipConstriction = element.newConstriction(43, OPEN_DIAMETER);
     // newConstriction() hands out the first slot it considers free, so a
     // regression there would silently give both trajectories the same
     // AudioParams (the second setValueCurveAtTime then overwrites the first).
@@ -474,8 +476,16 @@ export function usePinkTrombone(): PinkTromboneHandle {
    * playback left the voice — the same values the pad's handle is drawn at. */
   const startVoice = useCallback(() => {
     const element = elementRef.current;
-    if (!element) return;
+    const constriction = constrictionRef.current;
+    const lipConstriction = lipConstrictionRef.current;
+    if (!element || !constriction || !lipConstriction) return;
     voice(element.frequency.value, element.tenseness.value);
+    // The model's two constrictions belong to playback. By hand the tract is
+    // shaped by dragging it, and a constriction left pinched by the last
+    // utterance would keep muffling every pose you drag to.
+    const now = element.audioContext.currentTime;
+    constriction.diameter.setTargetAtTime(OPEN_DIAMETER, now, SCRUB_TAU_S);
+    lipConstriction.diameter.setTargetAtTime(OPEN_DIAMETER, now, SCRUB_TAU_S);
   }, [voice]);
 
   /** Fade the voicing out, leaving every param where it stands. Shared by the

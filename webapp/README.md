@@ -2,8 +2,9 @@
 
 **Note to humans: slop below, refer to main README**
 
-Records your voice in the browser, detects end-of-utterance with Silero VAD,
-sends the audio to a Python backend running the trained controller
+Records your voice in the browser (press Microphone, press Stop; Silero VAD
+only trims the recording to the speech in it), sends the audio to a Python
+backend running the trained controller
 (`onset-off_20260527-193518` / wandb `i30dfe0t`), and plays the predicted
 parameter trajectories through the vendored Pink Trombone synth — the tract
 visualization animates along.
@@ -49,10 +50,12 @@ from `out/`, and the backend as a container on the same origin. See
 
 ## How it works
 
-- `app/page.tsx` — state machine `idle → listening → recording → processing →
-  speaking`; mic + Silero VAD via `@ricky0123/vad-web` (assets self-hosted
-  under `public/vad/`).
-- `lib/audio.ts` — encodes the 16 kHz VAD segment as WAV, POSTs to
+- `app/page.tsx` — owns the synth: who has it (`lib/owner.ts`) and what the
+  page shows for it.
+- `lib/useMicVad.ts` — the mic: recording runs from Microphone to Stop, and
+  Silero VAD via `@ricky0123/vad-web` (assets self-hosted under `public/vad/`)
+  is used only to trim the recording to the frames it heard speech in.
+- `lib/audio.ts` — encodes the 16 kHz recording as WAV, POSTs to
   `/api/synthesize`.
 - `src/samuel/server.py` (repo root) — resamples to 44.1 kHz, extracts pyin
   f0 (the model's external `frequency` input), runs the checkpoint, returns

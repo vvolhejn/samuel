@@ -93,7 +93,6 @@ export function DebugPanel({
     return (
       <button
         onClick={onToggle}
-        title="Show the debug panel"
         className="rounded-full border border-neutral-300 px-4 py-1.5 text-sm font-medium text-neutral-600 hover:bg-neutral-50"
       >
         Debug
@@ -106,7 +105,6 @@ export function DebugPanel({
         <SectionTitle>debug</SectionTitle>
         <button
           onClick={onToggle}
-          title="Hide the debug panel"
           className="text-neutral-400 hover:text-highlight-600"
         >
           hide
@@ -186,7 +184,6 @@ export function DebugPanel({
         <button
           onClick={onDownloadHistory}
           disabled={historyCount === 0}
-          title="Zip of every utterance this session: what the model heard and what it said back"
           className="rounded-full border border-neutral-300 px-3 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 disabled:opacity-40 disabled:hover:bg-transparent"
         >
           {historyCount === 0

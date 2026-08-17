@@ -5,23 +5,69 @@ import { micErrorMessage } from "@/lib/secureContext";
 import { MicProcessing, MIC_PROCESSING_DEFAULTS } from "@/lib/micProcessing";
 import { useMirroredState } from "@/lib/useMirroredState";
 
-/** Silence the VAD waits through before it calls an utterance finished. The
- * meter's dots are typed out over this window, so the wait reads as a
- * countdown — their delays in globals.css follow this number. */
-const REDEMPTION_MS = 800;
+/** Ceiling on one recording. Past it we stop and send what was said: the model
+ * takes about as long as the clip does, so an unbroken monologue would otherwise
+ * leave you waiting. */
+const MAX_RECORDING_MS = 30_000;
 
-/** Ceiling on one utterance, measured from the VAD hearing speech. Past it the
- * segment is cut and sent as it stands: the model takes about as long as the
- * clip does, so an unbroken monologue would otherwise leave you waiting. */
-const MAX_SPEECH_MS = 30_000;
-
-/** vad-web's hysteresis, restated so the meter watches the same edges it does:
- * speech starts above the first, ends below the second. */
+/** vad-web's hysteresis, which is all we use it for: a frame above the first is
+ * speech, one below the second isn't, and in between we hold the last answer. */
 const POSITIVE_SPEECH_THRESHOLD = 0.3;
 const NEGATIVE_SPEECH_THRESHOLD = 0.25;
 
+/** Kept either side of the speech we found. The model hears the attack of the
+ * first word and the tail of the last, both of which sit under the thresholds. */
+const PAD_MS = 150;
+
+/** One 16 kHz frame off the VAD, and how much of it the model thought was
+ * speech. */
+interface Frame {
+  audio: Float32Array;
+  isSpeech: number;
+}
+
+/** The recording, trimmed to the speech in it. Null if there wasn't any —
+ * silence is not worth a round trip. */
+function trimToSpeech(frames: Frame[]): Float32Array | null {
+  let first = -1;
+  let last = -1;
+  for (const [i, frame] of frames.entries()) {
+    if (frame.isSpeech < POSITIVE_SPEECH_THRESHOLD) continue;
+    if (first === -1) first = i;
+    last = i;
+  }
+  if (first === -1) return null;
+
+  // Widen over the frames the model is unsure about before padding: quiet
+  // consonants at either end of a word land between the two thresholds.
+  while (first > 0 && frames[first - 1].isSpeech >= NEGATIVE_SPEECH_THRESHOLD)
+    first--;
+  while (
+    last + 1 < frames.length &&
+    frames[last + 1].isSpeech >= NEGATIVE_SPEECH_THRESHOLD
+  )
+    last++;
+
+  const msPerFrame = frames[0].audio.length / 16; // 16 samples per ms at 16 kHz
+  const pad = Math.round(PAD_MS / msPerFrame);
+  const kept = frames.slice(
+    Math.max(0, first - pad),
+    Math.min(frames.length, last + 1 + pad),
+  );
+
+  const audio = new Float32Array(
+    kept.reduce((total, frame) => total + frame.audio.length, 0),
+  );
+  let offset = 0;
+  for (const frame of kept) {
+    audio.set(frame.audio, offset);
+    offset += frame.audio.length;
+  }
+  return audio;
+}
+
 interface Options {
-  /** A finished utterance, ready for the model. */
+  /** A finished recording, trimmed and ready for the model. */
   onUtterance: (audio: Float32Array) => void;
   /** Ran inside the Microphone click, before anything is opened: whatever else
    * has to let go of the mouth, plus the checks that make starting pointless if
@@ -37,9 +83,10 @@ interface Options {
   setError: (message: string | null) => void;
 }
 
-/** The microphone half of the page: the VAD, what it hears, and who has the
- * mouth when it stops. Owns nothing of the playback side — it asks for the mic
- * back through `restoreMic` and is paused by everything that makes sound. */
+/** The microphone half of the page: press to record, press again to send. The
+ * VAD is not what decides when you're done — it only says which frames were
+ * speech, so the recording can be trimmed to them before it goes off. Owns
+ * nothing of the playback side, and is paused by everything that makes sound. */
 export function useMicVad({
   onUtterance,
   onBeforeStart,
@@ -49,17 +96,16 @@ export function useMicVad({
   setError,
 }: Options) {
   const vadRef = useRef<MicVAD | null>(null);
-  /** User-intended mic state — the Microphone/Turn off toggle. The status alone
-   * can't stand in for it (a dataset clip is "speaking" too). */
+  /** User-intended mic state — the Microphone/Stop toggle, and so also "a
+   * recording is in progress". */
   const [micOn, micOnRef, setMicOn] = useMirroredState(false);
   /** Is the VAD hearing speech *this frame*? Drives the meter's colour, and
-   * nothing else — unlike `recording` it flips tens of times a second, so it
-   * must never gate a control. */
+   * nothing else — it flips tens of times a second, so it must never gate a
+   * control. */
   const [heard, heardRef, setHeard] = useMirroredState(false);
-  /** When the in-flight utterance started, or 0 if there isn't one. Watched
-   * per frame against MAX_SPEECH_MS, and the meter types its dots while it
-   * stands — an utterance is in flight but nothing is heard this instant. */
-  const [speechStart, speechStartRef, setSpeechStart] = useMirroredState(0);
+  /** The recording so far. A ref, not state: it grows ~31 times a second and
+   * nothing renders from it. */
+  const framesRef = useRef<Frame[]>([]);
   // The ref is read by getStream/resumeStream, which vad-web calls on every
   // start().
   const [micProcessing, micProcessingRef, setMicProcessing] =
@@ -102,37 +148,27 @@ export function useMicVad({
     [heardRef, setHeard],
   );
 
-  /** Resume the VAD only if the user hasn't muted the mic. Everything that
-   * takes the mouth hands it back this way. */
-  const restoreMic = useCallback(async () => {
-    const { isScrubbing, setOwner } = optionsRef.current;
-    if (isScrubbing()) return; // the scrub owns the synth until pointer-up
-    // A pause elsewhere (playback, a mic-processing toggle) discards whatever
-    // was in flight, so the clock can't carry over into the next utterance.
-    setSpeechStart(0);
-    if (micOnRef.current) {
-      await vadRef.current?.start();
-      setOwner("mic");
-    } else {
-      setOwner("none");
-    }
-  }, [micOnRef, setSpeechStart]);
-
-  /** Cut an over-long utterance short and send what's been said. Pausing with
-   * submitUserSpeechOnPause is what ends the segment; onUtterance takes it from
-   * there and hands the mic back when it's done, so the restart here is only for
-   * the case where the VAD had nothing to give us after all. */
-  const cutUtterance = useCallback(async () => {
-    const vad = vadRef.current;
-    if (!vad) return;
-    setSpeechStart(0);
-    showHeard(false);
-    levelStore.set(0);
-    vad.setOptions({ submitUserSpeechOnPause: true });
-    await vad.pause();
-    vad.setOptions({ submitUserSpeechOnPause: false });
-    if (!optionsRef.current.isBusy()) await restoreMic();
-  }, [restoreMic, showHeard, levelStore, setSpeechStart]);
+  /** Turn the mic off. `submit` sends what was recorded rather than binning it —
+   * true from the Stop button, since that is what it's for; false when the tab
+   * is left, where an unasked-for answer is worse. */
+  const stopMic = useCallback(
+    async (submit = false) => {
+      setMicOn(false);
+      showHeard(false);
+      levelStore.set(0);
+      const frames = framesRef.current;
+      framesRef.current = [];
+      await vadRef.current?.pause();
+      if (submit) {
+        const audio = trimToSpeech(frames);
+        if (audio) optionsRef.current.onUtterance(audio);
+        else optionsRef.current.setError("Didn't hear any speech.");
+      }
+      // onUtterance has already taken the mouth by now if something was sent.
+      if (!optionsRef.current.isBusy()) optionsRef.current.setOwner("none");
+    },
+    [showHeard, levelStore, setMicOn],
+  );
 
   const startMic = useCallback(async () => {
     const { setOwner, setError } = optionsRef.current;
@@ -150,41 +186,29 @@ export function useMicVad({
           navigator.mediaDevices.getUserMedia({
             audio: { channelCount: 1, ...micProcessingRef.current },
           });
+        // No onSpeechStart/onSpeechEnd: the VAD's own segmenting decides
+        // nothing here, and the audio we send is the one we assemble below.
         vadRef.current = await MicVAD.new({
           model: "v5",
           baseAssetPath: "/vad/",
           onnxWASMBasePath: "/vad/",
           getStream,
           resumeStream: getStream,
-          redemptionMs: REDEMPTION_MS,
-          preSpeechPadMs: 150, // default 800ms puts noticeable silence before speech
           positiveSpeechThreshold: POSITIVE_SPEECH_THRESHOLD,
           negativeSpeechThreshold: NEGATIVE_SPEECH_THRESHOLD,
-          onSpeechStart: () => setSpeechStart(performance.now()),
-          onVADMisfire: () => {
-            setSpeechStart(0);
-            levelStore.set(0);
-          },
-          onSpeechEnd: (audio) => {
-            setSpeechStart(0);
-            showHeard(false);
-            levelStore.set(0);
-            optionsRef.current.onUtterance(audio);
-          },
           onFrameProcessed: ({ isSpeech }, frame) => {
             if (optionsRef.current.isBusy() || !micOnRef.current) return;
             if (isSpeech >= POSITIVE_SPEECH_THRESHOLD) showHeard(true);
             else if (isSpeech < NEGATIVE_SPEECH_THRESHOLD) showHeard(false);
             levelStore.set(levelToSlots(frame));
-            if (
-              speechStartRef.current &&
-              performance.now() - speechStartRef.current >= MAX_SPEECH_MS
-            ) {
-              void cutUtterance();
-            }
+            const frames = framesRef.current;
+            frames.push({ audio: frame, isSpeech });
+            const ms = frames.length * (frame.length / 16);
+            if (ms >= MAX_RECORDING_MS) void stopMic(true);
           },
         });
       }
+      framesRef.current = [];
       setMicOn(true);
       await vadRef.current.start();
       setOwner("mic");
@@ -193,42 +217,27 @@ export function useMicVad({
       setMicOn(false);
       setOwner("none");
     }
-  }, [
-    showHeard,
-    levelStore,
-    cutUtterance,
-    micOnRef,
-    setMicOn,
-    micProcessingRef,
-    setSpeechStart,
-    speechStartRef,
-  ]);
+  }, [showHeard, levelStore, stopMic, micOnRef, setMicOn, micProcessingRef]);
 
-  /** Turn the mic off. `submit` sends a half-spoken utterance rather than
-   * binning it — true from the button, since people press it meaning "I'm
-   * done"; false when the tab is left, where an unasked-for answer is worse. */
-  const stopMic = useCallback(
-    async (submit = false) => {
-      setMicOn(false);
-      showHeard(false);
-      levelStore.set(0);
-      setSpeechStart(0);
-      const vad = vadRef.current;
-      // Scoped to this one pause: the others (playback starting, a
-      // mic-processing toggle) must keep discarding, or the response would feed
-      // itself back in as a new utterance.
-      if (submit) vad?.setOptions({ submitUserSpeechOnPause: true });
-      await vad?.pause(); // fires onSpeechEnd synchronously if it had one
-      if (submit) vad?.setOptions({ submitUserSpeechOnPause: false });
-      // onUtterance has already taken the mouth by now if something was sent.
-      if (!optionsRef.current.isBusy()) optionsRef.current.setOwner("none");
-    },
-    [showHeard, levelStore, setMicOn, setSpeechStart],
-  );
+  /** Resume the VAD only if the user hasn't turned the mic off. Everything that
+   * takes the mouth hands it back this way. */
+  const restoreMic = useCallback(async () => {
+    const { isScrubbing, setOwner } = optionsRef.current;
+    if (isScrubbing()) return; // the scrub owns the synth until pointer-up
+    if (micOnRef.current) {
+      // Whatever took the mouth (a playback, a mic-processing toggle) has been
+      // making sound into the recording; start the take over rather than send a
+      // recording with a hole in it.
+      framesRef.current = [];
+      await vadRef.current?.start();
+      setOwner("mic");
+    } else {
+      setOwner("none");
+    }
+  }, [micOnRef]);
 
-  /** Flip one mic-processing flag. If we're listening right now, cycle the
-   * stream so it takes effect immediately rather than after the next
-   * utterance. */
+  /** Flip one mic-processing flag. If we're recording right now, cycle the
+   * stream so it takes effect immediately. */
   const toggleMicProcessing = useCallback(
     async (key: keyof MicProcessing) => {
       const next = {
@@ -247,6 +256,7 @@ export function useMicVad({
         return;
       try {
         await vad.pause();
+        framesRef.current = [];
         await vad.start();
       } catch (e) {
         optionsRef.current.setError(micErrorMessage(e));
@@ -263,8 +273,6 @@ export function useMicVad({
     micOn,
     micOnRef,
     heard,
-    /** An utterance is in flight: speech started and has not ended yet. */
-    recording: speechStart !== 0,
     levelStore,
     micProcessing,
     startMic,

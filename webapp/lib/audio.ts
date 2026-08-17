@@ -43,23 +43,22 @@ export function fetchDatasetClips(): Promise<DatasetClip[]> {
 }
 
 /**
- * Trim trailing near-silence from a VAD utterance.
+ * Trim near-silence from both ends of a recording.
  *
- * `FrameProcessor.endSegment` in @ricky0123/vad-web appends the *entire*
- * redemption window to the emitted audio (see redemptionMs in page.tsx) —
- * up to ~800ms of post-speech silence gets sent to the model every time.
- * The controller was never trained on trailing silence and audibly loses
- * the plot during it, so cut back to the last frame louder than
- * `silenceThresholdDb` below the utterance peak, plus a small release pad.
+ * The VAD trim in lib/useMicVad.ts works in whole 32ms frames and pads either
+ * end, so some silence always survives it. The controller was never trained on
+ * silence and audibly loses the plot during it, so cut back to the outermost
+ * frames louder than `silenceThresholdDb` below the recording's peak, plus a
+ * small pad so the first and last words keep their attack and tail.
  */
-export function trimTrailingSilence(
+export function trimSilence(
   audio: Float32Array,
   sampleRate = 16000,
   {
     frameMs = 30,
     silenceThresholdDb = 30,
-    releasePadMs = 100,
-  }: { frameMs?: number; silenceThresholdDb?: number; releasePadMs?: number } = {},
+    padMs = 100,
+  }: { frameMs?: number; silenceThresholdDb?: number; padMs?: number } = {},
 ): Float32Array {
   const frameLen = Math.max(1, Math.round((sampleRate * frameMs) / 1000));
   const frameCount = Math.ceil(audio.length / frameLen);
@@ -79,13 +78,14 @@ export function trimTrailingSilence(
   let lastVoiced = frameCount - 1;
   while (lastVoiced >= 0 && rms[lastVoiced] < threshold) lastVoiced--;
   if (lastVoiced < 0) return audio; // never exceeded threshold; leave as-is
+  let firstVoiced = 0;
+  while (rms[firstVoiced] < threshold) firstVoiced++;
 
-  const releasePadSamples = Math.round((sampleRate * releasePadMs) / 1000);
-  const cut = Math.min(
-    audio.length,
-    (lastVoiced + 1) * frameLen + releasePadSamples,
+  const pad = Math.round((sampleRate * padMs) / 1000);
+  return audio.subarray(
+    Math.max(0, firstVoiced * frameLen - pad),
+    Math.min(audio.length, (lastVoiced + 1) * frameLen + pad),
   );
-  return audio.subarray(0, cut);
 }
 
 export interface UtteranceResult {
@@ -125,7 +125,7 @@ export function synthesizeUtterance(
   audio: Float32Array,
 ): Promise<UtteranceResult> {
   // defaults: 32-bit float WAV, 16 kHz mono — matches what MicVAD emits
-  const wav = utils.encodeWAV(trimTrailingSilence(audio));
+  const wav = utils.encodeWAV(trimSilence(audio));
   return synthesizeBlob(new Blob([wav], { type: "audio/wav" }));
 }
 
