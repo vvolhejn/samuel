@@ -8,7 +8,22 @@ The mouth itself is [Pink Trombone](https://dood.al/pinktrombone/), a project or
 
 [**Try it here**](https://samuel.vvolhejn.com/)
 
-## How it works
+## How to run it
+
+To just run the code as-is (requires [`uv`](https://docs.astral.sh/uv/getting-started/installation/) and [`pnpm`](https://pnpm.io/installation)):
+```bash
+uv run --extra server python -m samuel.server
+```
+
+For development, run these two in separate processes:
+```bash
+# from webapp/
+pnpm dev
+# from repo root
+uv run --extra server python -m samuel.server --no-frontend --port 8471
+```
+
+## How it was trained
 
 Details on how this model was trained will be published soon.
 For now, feel free to poke around the codebase.
