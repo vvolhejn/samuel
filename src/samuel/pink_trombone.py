@@ -213,7 +213,9 @@ _GLOTTIS_PARAMS = (
 
 
 def _upsample_params(
-    params: Tensor, samples_per_frame: int = SAMPLES_PER_FRAME
+    params: Tensor,
+    samples_per_frame: int = SAMPLES_PER_FRAME,
+    legacy: bool = False,
 ) -> Tensor:
     """[B, T, P] at control rate -> [B, T_samples, P] at SAMPLE_RATE.
 
@@ -229,6 +231,14 @@ def _upsample_params(
     B, T, P = params.shape
     if T == 1:
         return params.expand(B, samples_per_frame, P)
+    if legacy:
+        up = F.interpolate(
+            params.transpose(1, 2),
+            size=T * samples_per_frame,
+            mode="linear",
+            align_corners=True,
+        )
+        return up.transpose(1, 2)
     nxt = torch.cat([params[:, 1:], params[:, -1:]], dim=1)  # [B, T, P]
     ramp = (
         torch.arange(samples_per_frame, device=params.device, dtype=params.dtype)
@@ -870,6 +880,8 @@ def _tract_ola(
     lip_diameter: Tensor,  # [B, T]
     ir_length: int = 4096,
     samples_per_frame: int = SAMPLES_PER_FRAME,
+    legacy_param_interp: bool = False,
+    legacy_tract_ir: bool = False,
 ) -> Tensor:  # [B, S]
     """One FIR per control frame; frame ``t``'s filter comes from frame ``t``.
 
@@ -889,6 +901,18 @@ def _tract_ola(
 
     ti_f, td_f = tongue_index, tongue_diameter  # [B, T]
     ci_f, cd_f, ld_f = constriction_index, constriction_diameter, lip_diameter
+    # The turbulence gains are per-sample gains on the noise, so they always
+    # come from the control-rate params, never from the IR path's resampling.
+    ci_turb, cd_turb, ld_turb = ci_f, cd_f, ld_f
+    if legacy_tract_ir:
+        # Round trip to sample rate and back, sampling at frame midpoints.
+        up = _upsample_params(
+            torch.stack([ti_f, td_f, ci_f, cd_f, ld_f], dim=-1),
+            hop,
+            legacy=legacy_param_interp,
+        )
+        mid = torch.arange(T, device=device) * hop + hop // 2
+        ti_f, td_f, ci_f, cd_f, ld_f = (up[:, mid, i] for i in range(5))
 
     # Oral reflection coefficients [B, T, N]
     diameter_f = _compute_diameter_profile(ti_f, td_f, ci_f, cd_f, ld_f, N)
@@ -917,7 +941,11 @@ def _tract_ola(
     # --- Turbulence source at full sample rate ---
     # These are per-sample gains on the noise, not filter coefficients, so they
     # do get the sample-rate ramp (a step at every frame boundary would click).
-    turb_up = _upsample_params(torch.stack([ci_f, cd_f, ld_f], dim=-1), hop)
+    turb_up = _upsample_params(
+        torch.stack([ci_turb, cd_turb, ld_turb], dim=-1),
+        hop,
+        legacy=legacy_param_interp,
+    )
     ci_s, cd_s, ld_s = turb_up[..., 0], turb_up[..., 1], turb_up[..., 2]
 
     thinness = torch.clamp(8 * (0.7 - cd_s), 0.0, 1.0)
@@ -1047,6 +1075,8 @@ def pink_trombone_ola(
     seed: int | Tensor | None = None,
     ir_length: int = 4096,
     control_rate: float = CONTROL_RATE,
+    legacy_param_interp: bool = False,
+    legacy_tract_ir: bool = False,
 ) -> Tensor:
     """OLA FIR approximation of the Pink Trombone vocal synthesizer.
 
@@ -1081,7 +1111,11 @@ def pink_trombone_ola(
     p = {name: params[..., i] for i, name in enumerate(PARAM_NAMES)}
     # Only the glottis runs per sample; the tract keeps its params at control
     # rate (see _tract_ola).
-    g = _upsample_params(torch.stack([p[n] for n in _GLOTTIS_PARAMS], dim=-1), spf)
+    g = _upsample_params(
+        torch.stack([p[n] for n in _GLOTTIS_PARAMS], dim=-1),
+        spf,
+        legacy=legacy_param_interp,
+    )
 
     glottis_out, noise_mod = glottis(
         frequency=g[..., 0],
@@ -1103,4 +1137,6 @@ def pink_trombone_ola(
         lip_diameter=p["lipDiameter"],
         ir_length=ir_length,
         samples_per_frame=spf,
+        legacy_param_interp=legacy_param_interp,
+        legacy_tract_ir=legacy_tract_ir,
     )

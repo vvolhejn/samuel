@@ -73,6 +73,15 @@ class SynthConfig(BaseModel):
     # frame_rate is the parameter control rate; lives on the model config
     # (it drives T_ctrl) but the synth path reads it from the same field.
 
+    # Pre-causal synth behaviour, kept switchable so a run can be compared
+    # against the recipe that produced vvolhejn/samuel without editing source.
+    # legacy_param_interp: interpolate the whole trajectory with
+    # align_corners=True (mapping depends on clip length, so unstreamable).
+    # legacy_tract_ir: derive each frame's FIR from the sample-rate params at
+    # the frame midpoint, which blends frame t ~55/45 with frame t+1.
+    legacy_param_interp: bool = False
+    legacy_tract_ir: bool = False
+
 
 class LogConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")

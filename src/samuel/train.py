@@ -707,6 +707,8 @@ def _run_eval_batched(
             seed=fixed_seed,
             ir_length=cfg.synth.ir_length,
             control_rate=frame_rate,
+            legacy_param_interp=cfg.synth.legacy_param_interp,
+            legacy_tract_ir=cfg.synth.legacy_tract_ir,
         )
         params_all.append(params)
         ola_all.append(ola)
@@ -1026,6 +1028,7 @@ def main(hydra_cfg: DictConfig) -> None:
             f"[eval] step={step} "
             f"loss={metrics.get('eval/loss', float('nan')):.4f} "
             f"wer={metrics.get('eval/wer', float('nan')):.3f} "
+            f"pvar={metrics.get('eval/param_variation', float('nan')):.5f} "
             f"in {metrics.get('eval/duration_s', float('nan')):.1f}s"
         )
 
@@ -1069,6 +1072,8 @@ def main(hydra_cfg: DictConfig) -> None:
             params,
             ir_length=cfg.synth.ir_length,
             control_rate=frame_rate,
+            legacy_param_interp=cfg.synth.legacy_param_interp,
+            legacy_tract_ir=cfg.synth.legacy_tract_ir,
         )
         S = min(pred.shape[-1], target.shape[-1])
         pred_norm = pred[..., :S]
@@ -1167,6 +1172,7 @@ def main(hydra_cfg: DictConfig) -> None:
                 f"[eval] step={step} "
                 f"loss={metrics.get('eval/loss', float('nan')):.4f} "
                 f"wer={metrics.get('eval/wer', float('nan')):.3f} "
+                f"pvar={metrics.get('eval/param_variation', float('nan')):.5f} "
                 f"in {metrics.get('eval/duration_s', float('nan')):.1f}s"
             )
 

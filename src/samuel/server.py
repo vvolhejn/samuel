@@ -324,6 +324,16 @@ def _pitch_track(
     return fill_unvoiced(f0, voiced, PYIN_FMIN, PYIN_FMAX), voiced
 
 
+def _legacy_synth_flags() -> dict:
+    """``synth.legacy_*`` for the loaded checkpoint, defaulting to off for
+    checkpoints trained before those flags existed."""
+    synth = _run_config().get("synth", {})
+    return {
+        "legacy_param_interp": bool(synth.get("legacy_param_interp", False)),
+        "legacy_tract_ir": bool(synth.get("legacy_tract_ir", False)),
+    }
+
+
 def _target_rms() -> float:
     """``data.target_rms`` for the loaded checkpoint, so inference matches training."""
     return float(_run_config()["data"]["target_rms"])
@@ -498,6 +508,7 @@ def _mimic(audio: np.ndarray) -> dict:
                 seed=0,
                 ir_length=IR_LENGTH,
                 control_rate=_model.config.frame_rate,
+                **_legacy_synth_flags(),
             )[0]
             .cpu()
             .numpy()
