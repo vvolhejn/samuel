@@ -4,7 +4,8 @@ model:
     dimension: 128
     n_filters: 32
     n_residual_layers: 3
-    ratios: [8, 5, 4, 2]
+    # prod = 512 = samples_per_frame, so no latent resampling is needed
+    ratios: [8, 4, 4, 4]
     kernel_size: 7
     last_kernel_size: 7
     residual_kernel_size: 3
@@ -19,6 +20,23 @@ model:
   # Straight-through (one-hot) Gumbel-softmax during training instead of the
   # soft expectation over bucket centers. Eval always snaps to argmax.
   gumbel_hard: false
+
+  # Control frames of future input the controller may see. 0 keeps the total
+  # algorithmic delay at one frame (11.6 ms), which the glottis ramp needs
+  # anyway; raise it to trade latency for context.
+  lookahead_frames: 0
+
+  # Predict pitch causally instead of receiving the pyin track, which is
+  # Viterbi-decoded over the whole utterance and so cannot be streamed. The
+  # cache stays on as the training label (loss.f0 / loss.voiced).
+  f0:
+    enabled: false
+    # Centers sit on the equal-tempered grid anchored at A4 = 440 Hz; 2 per
+    # semitone = quarter-tones, 50 cents apart. The grid is snapped outward to
+    # cover [fmin, fmax], which must bracket the pyin cache's range.
+    buckets_per_semitone: 2
+    fmin: 70.0
+    fmax: 500.0
 
   # (lo, hi, init) per trainable parameter. ``frequency`` is supplied
   # externally from the pyin cache. ``intensity`` is trainable: the synth

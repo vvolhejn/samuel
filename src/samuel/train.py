@@ -301,6 +301,118 @@ def _acceleration_loss(
     )
 
 
+def _rest_targets_norm(
+    module: PinkTromboneController, targets: dict[str, float]
+) -> torch.Tensor:
+    """Rest targets, given in raw units, rescaled to the trajectories' [0, 1]."""
+    lo = module.bucket_centers[:, 0]
+    hi = module.bucket_centers[:, -1]
+    tgt = torch.tensor(
+        [targets.get(n, 0.0) for n in module.trainable_names_],
+        dtype=lo.dtype,
+        device=lo.device,
+    )
+    return (tgt - lo) / (hi - lo).clamp_min(1e-8)
+
+
+def _rest_pose_distance(
+    params: torch.Tensor,
+    module: PinkTromboneController,
+    targets: dict[str, float],
+) -> torch.Tensor:
+    """Per-param mean ``|p_norm - target_norm|``; ``[n_trainable]``, unweighted."""
+    tgt_norm = _rest_targets_norm(module, targets)
+    mask = torch.tensor(
+        [1.0 if n in targets else 0.0 for n in module.trainable_names_],
+        dtype=tgt_norm.dtype,
+        device=tgt_norm.device,
+    )
+    p_norm = _normalized_trainable_params(params, module)
+    return (p_norm - tgt_norm.view(1, 1, -1)).abs().mean(dim=(0, 1)) * mask
+
+
+def _rest_pose_loss(
+    params: torch.Tensor,
+    module: PinkTromboneController,
+    targets: dict[str, float],
+    weights: dict[str, float],
+) -> torch.Tensor:
+    """``sum_p w_p * mean |p_norm - target_norm|``; see LossConfig.rest."""
+    dist = _rest_pose_distance(params, module, targets)
+    coeffs = torch.tensor(
+        [weights.get(n, 1.0) for n in module.trainable_names_],
+        dtype=dist.dtype,
+        device=dist.device,
+    )
+    return (dist * coeffs).sum()
+
+
+@torch.no_grad()
+def _silent_frame_rest_metrics(
+    params: torch.Tensor,
+    module: PinkTromboneController,
+    target: torch.Tensor,
+    cfg: TrainConfig,
+    silence_db: float = -20.0,
+) -> dict[str, float]:
+    """Rest-pose distance on frames quieter than ``silence_db`` re. target_rms."""
+    spf = module.samples_per_frame
+    T = params.shape[1]
+    S = T * spf
+    tgt = F.pad(target, (0, max(0, S - target.shape[-1])))[:, :S]
+    frame_rms = tgt.view(tgt.shape[0], T, spf).pow(2).mean(-1).sqrt()  # [N, T]
+    silent = frame_rms < cfg.data.target_rms * 10 ** (silence_db / 20.0)
+    out = {"eval/silent_frac": float(silent.float().mean())}
+    if not bool(silent.any()):
+        return out
+
+    names = module.trainable_names_
+    targets = cfg.loss.rest_targets
+    tgt_norm = _rest_targets_norm(module, targets)
+    p_norm = _normalized_trainable_params(params, module)
+    dist = (p_norm - tgt_norm.view(1, 1, -1)).abs()[silent]  # [n_silent, n_t]
+    per_param = dist.mean(dim=0)
+    total = 0.0
+    for name, v in zip(names, per_param.tolist()):
+        if name in targets:
+            out[f"eval/rest_dist_silent/{name}"] = v
+            total += v
+    out["eval/rest_loss_silent"] = total
+    return out
+
+
+def _f0_losses(
+    aux: dict[str, torch.Tensor],
+    module: PinkTromboneController,
+    f0_label: torch.Tensor,
+    voiced: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    """(f0 cross-entropy, voiced BCE, readouts) for the causal pitch head.
+
+    The f0 term is taken on voiced frames only: elsewhere the pyin label is
+    ``fill_unvoiced``'s interpolation, not a measurement. Returns a zero f0
+    term for a batch with no voiced frame at all.
+    """
+    targets = module.f0_bucket_targets(f0_label)  # [B, T]
+    per_frame = F.cross_entropy(
+        aux["f0_logits"].flatten(0, 1), targets.flatten(), reduction="none"
+    ).view_as(targets)
+    n_voiced = voiced.sum()
+    f0_loss = (per_frame * voiced).sum() / n_voiced.clamp_min(1.0)
+    voiced_loss = F.binary_cross_entropy_with_logits(aux["voiced_logits"], voiced)
+
+    with torch.no_grad():
+        cents = (aux["f0_hz"] / f0_label.clamp_min(1e-3)).log2() * 1200.0
+        mae = (cents.abs() * voiced).sum() / n_voiced.clamp_min(1.0)
+        acc = ((aux["voiced_logits"] > 0).float() == voiced).float().mean()
+    readouts = {
+        "f0_mae_cents": float(mae) if n_voiced > 0 else float("nan"),
+        "voiced_acc": float(acc),
+        "voiced_frac": float(voiced.mean()),
+    }
+    return f0_loss, voiced_loss, readouts
+
+
 @torch.no_grad()
 def _reversal_rate(params: torch.Tensor, module: PinkTromboneController) -> float:
     """Fraction of moving frames whose direction flips.
@@ -401,6 +513,7 @@ class EvalSetup:
 
     val_wavs: torch.Tensor  # [N_eval, S] float32, CPU
     val_f0: torch.Tensor  # [N_eval, T_ctrl] float32, CPU
+    val_voiced: torch.Tensor  # [N_eval, T_ctrl] float32, CPU
     val_names: list[str]  # caption per clip
     # (index_in_manifest, chunk_start_sample) per clip — stable key for the
     # Whisper target cache. The chunk_start component keeps keys distinct if
@@ -437,12 +550,20 @@ def _eval_setup(
     pitch = _load_pitch_cache(
         cfg.data.pitch_cache_path, cfg.data.sample_rate, samples_per_frame
     )
+    f0_cfg = cfg.model.f0
+    if f0_cfg.enabled and (f0_cfg.fmin > pitch.fmin or f0_cfg.fmax < pitch.fmax):
+        raise ValueError(
+            f"model.f0 buckets span [{f0_cfg.fmin}, {f0_cfg.fmax}] Hz but the "
+            f"pitch cache holds [{pitch.fmin}, {pitch.fmax}] Hz — labels "
+            f"outside the head's range would all collapse onto its end buckets"
+        )
 
     n_eval = min(cfg.log.n_eval_clips, len(val_files))
     selected = val_files[:n_eval]
 
     wavs: list[torch.Tensor] = []
     f0s: list[torch.Tensor] = []
+    voiceds: list[torch.Tensor] = []
     names: list[str] = []
     target_keys: list[tuple[int, int]] = []
     # Eval always takes the first chunk of each file; if that ever changes,
@@ -465,6 +586,7 @@ def _eval_setup(
 
         wavs.append(torch.from_numpy(audio))
         f0s.append(torch.from_numpy(f0_filled))
+        voiceds.append(torch.from_numpy(voiced_chunk.astype(np.float32)))
         names.append(df.path.name)
         target_keys.append((df.index_in_manifest, chunk_start))
 
@@ -478,6 +600,7 @@ def _eval_setup(
     return EvalSetup(
         val_wavs=torch.stack(wavs),
         val_f0=torch.stack(f0s),
+        val_voiced=torch.stack(voiceds),
         val_names=names,
         val_target_keys=target_keys,
         chunk_samples=chunk_samples,
@@ -567,16 +690,17 @@ def _run_eval_batched(
     f0s: torch.Tensor,  # [N, T_ctrl] on device
     cfg: TrainConfig,
     frame_rate: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Forward + OLA synth in chunks. Returns (params, ola)."""
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """Forward + OLA synth in chunks. Returns (params, ola, aux)."""
     N = wavs.shape[0]
     params_all: list[torch.Tensor] = []
     ola_all: list[torch.Tensor] = []
+    aux_all: list[dict[str, torch.Tensor]] = []
     for start in range(0, N, _EVAL_BATCH):
         end = min(start + _EVAL_BATCH, N)
         wav = wavs[start:end].unsqueeze(1)  # [B, 1, S]
         f0 = f0s[start:end]
-        params = model(wav, f0)
+        params, aux = model(wav, f0, return_aux=True)
         fixed_seed = torch.arange(start, end, dtype=torch.long)
         ola = pink_trombone_ola(
             params,
@@ -586,7 +710,13 @@ def _run_eval_batched(
         )
         params_all.append(params)
         ola_all.append(ola)
-    return torch.cat(params_all, dim=0), torch.cat(ola_all, dim=0)
+        aux_all.append(aux)
+    # ``z`` is the only aux entry whose frame count can differ per chunk; it is
+    # unused here, so concatenating the rest keeps this cheap.
+    aux_cat = {
+        k: torch.cat([a[k] for a in aux_all], dim=0) for k in aux_all[0] if k != "z"
+    }
+    return torch.cat(params_all, dim=0), torch.cat(ola_all, dim=0), aux_cat
 
 
 @torch.no_grad()
@@ -618,7 +748,7 @@ def _evaluate(
     f0 = eval_setup.val_f0.to(device)  # [N, T_ctrl]
     frame_rate = model.config.frame_rate
 
-    params, pred_ola = _run_eval_batched(model, target, f0, cfg, frame_rate)
+    params, pred_ola, eval_aux = _run_eval_batched(model, target, f0, cfg, frame_rate)
 
     # Synth output used as-is: the model is scored on hitting target_rms.
     S = min(pred_ola.shape[-1], target.shape[-1])
@@ -641,6 +771,22 @@ def _evaluate(
         "eval/param_accel": float(_normalized_trainable_accels(params, model).mean()),
         "eval/reversal_rate": _reversal_rate(params, model),
     }
+    if model.config.f0.enabled:
+        voiced = eval_setup.val_voiced.to(device)
+        f0_loss, voiced_loss, readouts = _f0_losses(eval_aux, model, f0, voiced)
+        out["eval/f0_loss"] = f0_loss.item()
+        out["eval/voiced_loss"] = voiced_loss.item()
+        out.update({f"eval/{k}": v for k, v in readouts.items()})
+    if cfg.loss.rest_targets:
+        rest_dist = _rest_pose_distance(params, model, cfg.loss.rest_targets)
+        out["eval/rest_loss"] = _rest_pose_loss(
+            params, model, cfg.loss.rest_targets, cfg.loss.rest_weights
+        ).item()
+        for name, v in zip(model.trainable_names_, rest_dist.tolist()):
+            if name in cfg.loss.rest_targets:
+                out[f"eval/rest_dist/{name}"] = v
+        out.update(_silent_frame_rest_metrics(params, model, target, cfg))
+
     # Per-param variation too: the scalar mean hides which param is jittery,
     # which is exactly what the smoothing/rate-limit experiments turn on.
     per_param = _normalized_trainable_diffs(params, model).mean(dim=(0, 1))
@@ -760,11 +906,17 @@ def main(hydra_cfg: DictConfig) -> None:
 
     # Model
     model = PinkTromboneController(cfg.model).to(device)
-    for field in ("smooth_weights", "accel_weights"):
+    for field in ("smooth_weights", "accel_weights", "rest_targets", "rest_weights"):
         unknown = set(getattr(cfg.loss, field)) - set(model.trainable_names_)
         if unknown:
             raise ValueError(
                 f"loss.{field} names non-trainable params: {sorted(unknown)}"
+            )
+    for name, value in cfg.loss.rest_targets.items():
+        lo, hi = cfg.model.param_spec[name][:2]
+        if not lo <= value <= hi:
+            raise ValueError(
+                f"loss.rest_targets[{name}]={value} outside param range [{lo}, {hi}]"
             )
     frame_rate = cfg.model.frame_rate
     samples_per_frame = cfg.model.samples_per_frame
@@ -888,6 +1040,7 @@ def main(hydra_cfg: DictConfig) -> None:
 
         wav = batch["audio"].to(device, non_blocking=True)  # [B, S]
         f0 = batch["pitch"].to(device, non_blocking=True)  # [B, T_ctrl]
+        voiced = batch["voiced"].to(device, non_blocking=True)  # [B, T_ctrl]
         # One canonical loudness for both what the model hears and what it is
         # scored against; the synth output is not gain-matched below.
         wav = _rms_normalize(wav, cfg.data.target_rms)
@@ -939,12 +1092,23 @@ def main(hydra_cfg: DictConfig) -> None:
         # runs; contributes to the gradient only when weighted.
         smooth_loss = _smoothness_loss(params, module, cfg.loss.smooth_weights)
         accel_loss = _acceleration_loss(params, module, cfg.loss.accel_weights)
+        rest_loss = _rest_pose_loss(
+            params, module, cfg.loss.rest_targets, cfg.loss.rest_weights
+        )
         loss = (
             recon_loss
             + cfg.loss.entropy * entropy_penalty
             + cfg.loss.smooth * smooth_loss
             + cfg.loss.accel * accel_loss
+            + cfg.loss.rest * rest_loss
         )
+
+        f0_readouts: dict[str, float] = {}
+        if module.config.f0.enabled:
+            f0_loss, voiced_loss, f0_readouts = _f0_losses(aux, module, f0, voiced)
+            loss = loss + cfg.loss.f0 * f0_loss + cfg.loss.voiced * voiced_loss
+            f0_readouts["f0_loss"] = f0_loss.item()
+            f0_readouts["voiced_loss"] = voiced_loss.item()
 
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -973,6 +1137,8 @@ def main(hydra_cfg: DictConfig) -> None:
                 "train/entropy_penalty": entropy_penalty.item(),
                 "train/smooth_loss": smooth_loss.item(),
                 "train/accel_loss": accel_loss.item(),
+                **{f"train/{k}": v for k, v in f0_readouts.items()},
+                "train/rest_loss": rest_loss.item(),
                 "train/lr": optimizer.param_groups[0]["lr"],
                 "train/tau": tau,
                 "train/grad_norm": float(grad_norm),

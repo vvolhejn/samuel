@@ -258,6 +258,9 @@ class LibriLightChunks(IterableDataset):
                 yield {
                     "audio": torch.from_numpy(chunk),
                     "pitch": torch.from_numpy(f0_filled),
+                    # The f0 head is only supervised where pyin actually found
+                    # a pitch; see LossConfig.f0.
+                    "voiced": torch.from_numpy(voiced_chunk.astype(np.float32)),
                 }
 
 

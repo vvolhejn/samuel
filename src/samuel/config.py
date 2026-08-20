@@ -143,17 +143,16 @@ class LossConfig(BaseModel):
     # control trajectories, computed on range-normalised params (each trainable
     # param rescaled to [0, 1]. Contribution to the training loss:
     #   smooth * sum_p smooth_weights[p] * mean_{batch,time} |Δp_norm|
-    # Off in favour of ``accel``: penalising displacement cannot tell a fast
-    # gesture apart from jitter, so this either leaves the jitter in place or
-    # freezes the parameter.
-    smooth: float = 0.0
+    smooth: float = 0.3
     smooth_weights: dict[str, float] = Field(
         default_factory=lambda: {
             "tongueIndex": 1.0,
-            "tongueDiameter": 0.3,
             "constrictionIndex": 1.0,
-            "constrictionDiameter": 0.1,
-            "lipDiameter": 0.1,
+            "tongueDiameter": 0.3,
+            "constrictionDiameter": 0.3,
+            "lipDiameter": 0.3,
+            "voiceness": 0.1,
+            "intensity": 0.1,
         }
     )
 
@@ -167,12 +166,57 @@ class LossConfig(BaseModel):
     accel_weights: dict[str, float] = Field(
         default_factory=lambda: {
             "tongueIndex": 1.0,
-            "tongueDiameter": 0.3,
             "constrictionIndex": 1.0,
-            "constrictionDiameter": 0.1,
-            "lipDiameter": 0.1,
+            "tongueDiameter": 0.3,
+            "constrictionDiameter": 0.3,
+            "lipDiameter": 0.3,
+            "voiceness": 0.1,
+            "intensity": 0.1,
         }
     )
+
+    # Rest-posture prior: a small constant L1 pull of each control trajectory
+    # toward a fixed "closed mouth" posture,
+    #   rest * sum_p rest_weights[p] * mean_{batch,time} |p_norm - target_p|
+    # on the same range-normalised params as ``smooth``/``accel``. Params
+    # absent from ``rest_targets`` are unpenalised.
+    #
+    # The point is the frames where the reconstruction loss has no opinion:
+    # during silence nothing pins the tongue, so it parks wherever it happens
+    # to be. L1 makes the pull a constant force regardless of distance, so it
+    # is a fixed small offset to the recon gradient -- negligible where that
+    # gradient is strong (speech), decisive where it is weak or just noise
+    # (silence). It has to stay small: these gradients are heavy-tailed, large
+    # only in the frames where an articulator does its work, so a force even a
+    # few percent above this wins in the low-gradient majority of frames and
+    # the parameter stops being used at all.
+    rest: float = 0.01
+    # Target values in *raw* parameter units (same scale as model.param_spec),
+    # normalised internally by the same [lo, hi] range. Empty disables the term.
+    rest_targets: dict[str, float] = Field(
+        default_factory=lambda: {
+            "lipDiameter": 0.3,  # top of the [0, 0.3] closure band: almost closed
+            "tongueDiameter": 3.5,  # max of [1.5, 3.5]: tongue body down
+            "constrictionDiameter": 3.0,  # max of [-2, 3]: no tip constriction
+        }
+    )
+    # Per-param multipliers; params absent here default to 1.0. The recon
+    # gradient differs ~5x across these params, so a flat weight would bias the
+    # lips far harder than the tongue.
+    rest_weights: dict[str, float] = Field(
+        default_factory=lambda: {
+            "lipDiameter": 0.3,
+            "tongueDiameter": 1.0,
+            "constrictionDiameter": 1.0,
+        }
+    )
+
+    # Supervision for the causal pitch head (model.f0.enabled). Both are
+    # ignored when it is off. The f0 cross-entropy is taken on voiced frames
+    # only -- in unvoiced frames the pyin label is an interpolation artifact,
+    # so the only thing that should shape pitch there is the recon loss.
+    f0: float = 1.0
+    voiced: float = 1.0
 
     # SSL feature-matching (perceptual) loss on a frozen speech encoder.
     # L1 distance between the encoder's hidden states for pred vs. target audio.

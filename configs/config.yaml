@@ -22,7 +22,8 @@ optim:
   betas: [0.9, 0.95]
   weight_decay: 0.0
   grad_clip: 1.0
-  max_steps: 10000
+  # The released checkpoint (vvolhejn/samuel) was trained for 100k steps.
+  max_steps: 100000
   warmup_steps: 800
   # Constant by default: a 0.5/1.0/2.0 sweep at 20k steps found intelligibility
   # monotone in temperature (WER 0.34/0.25/0.24), and constant 2.0 matched the
@@ -44,24 +45,38 @@ loss:
   # Temporal smoothness: L1 on per-frame changes of range-normalised control
   # trajectories, sum_p smooth_weights[p] * mean|Δp_norm|. Params not listed
   # in smooth_weights are unpenalised. See LossConfig for details.
-  # Off in favour of loss.accel below.
-  smooth: 0.0
+  smooth: 0.3
   smooth_weights:
     tongueIndex: 1.0
-    tongueDiameter: 0.3
     constrictionIndex: 1.0
-    constrictionDiameter: 0.1
-    lipDiameter: 0.1
+    tongueDiameter: 0.3
+    constrictionDiameter: 0.3
+    lipDiameter: 0.3
+    voiceness: 0.1
+    intensity: 0.1
   # Same L1 on the *second* difference: penalises direction changes rather
   # than movement, so a fast steady gesture is free and only zigzag is
   # charged. See LossConfig.accel.
   accel: 0.3
   accel_weights:
     tongueIndex: 1.0
-    tongueDiameter: 0.3
     constrictionIndex: 1.0
-    constrictionDiameter: 0.1
-    lipDiameter: 0.1
+    tongueDiameter: 0.3
+    constrictionDiameter: 0.3
+    lipDiameter: 0.3
+    voiceness: 0.1
+    intensity: 0.1
+  # Rest posture: lips almost closed, tongue body down, tongue tip down.
+  # A constant (L1) pull toward this pose. See LossConfig.rest.
+  rest: 0.01
+  rest_targets:
+    lipDiameter: 0.3          # top of the [0, 0.3] closure band: almost closed
+    tongueDiameter: 3.5       # max of [1.5, 3.5]: tongue body down
+    constrictionDiameter: 3.0 # max of [-2, 3]: no tongue-tip constriction
+  rest_weights:
+    lipDiameter: 0.3
+    tongueDiameter: 1.0
+    constrictionDiameter: 1.0
   # SSL feature-matching (perceptual) loss. On by default: it is what makes the
   # controller intelligible, MFCC alone is not enough.
   ssl: 1.0

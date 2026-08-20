@@ -472,18 +472,26 @@ def _mimic(audio: np.ndarray) -> dict:
         raise HTTPException(status_code=400, detail="audio too short")
 
     t_ctrl = _model.t_ctrl_for(len(audio))
-    f0, voiced = _pitch_track(audio, _model.samples_per_frame, t_ctrl)
+    # A checkpoint with a pitch head does not need pyin, which is the point of
+    # having one: it Viterbi-decodes the whole utterance and cannot be streamed.
+    predicts_f0 = _model.config.f0.enabled
+    f0_t = None
+    if not predicts_f0:
+        f0, voiced = _pitch_track(audio, _model.samples_per_frame, t_ctrl)
 
     # The model was trained on RMS-normalised input, so normalise here too.
     audio_in = _rms_normalize(audio, _target_rms())
 
     device = next(_model.parameters()).device
     wav = torch.from_numpy(audio_in).to(device)[None, None, :]
-    f0_t = torch.from_numpy(f0).to(device)[None, :]
+    if not predicts_f0:
+        f0_t = torch.from_numpy(f0).to(device)[None, :]
     with torch.no_grad():
         # Reference resynthesis with the Python synth (for A/B debugging),
         # mirroring the eval loop.
-        params = _model(wav, f0_t)  # [1, T_ctrl, N_PARAMS]
+        params, aux = _model(wav, f0_t, return_aux=True)  # [1, T_ctrl, N_PARAMS]
+        if predicts_f0:
+            voiced = (aux["voiced_logits"][0] > 0).cpu().numpy()
         synth = (
             pink_trombone_ola(
                 params,
@@ -529,6 +537,7 @@ async def synthesize(request: Request) -> dict:
 # Uncommon default port (avoids clashing with the usual 8000/8080/3000). The
 # dev proxy in webapp/next.config.ts points here too — keep them in sync.
 DEFAULT_PORT = 8471
+
 
 def _parse_args() -> None:
     """Turn CLI flags into the env vars the app reads.
