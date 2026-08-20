@@ -16,6 +16,12 @@ data:
 
 synth:
   ir_length: 256
+  # Restore the pre-causal synth: whole-trajectory align_corners param
+  # interpolation, and per-frame FIRs taken from the sample-rate params at the
+  # frame midpoint. Both on == bit-identical to the recipe behind
+  # vvolhejn/samuel. See SynthConfig.
+  legacy_param_interp: false
+  legacy_tract_ir: false
 
 optim:
   lr: 3.0e-4
