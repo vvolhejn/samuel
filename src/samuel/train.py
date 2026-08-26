@@ -32,10 +32,10 @@ from tqdm import tqdm
 import wandb
 from samuel.config import TrainConfig
 from samuel.data import (
+    _fill_chunk,
     _load_pitch_cache,
     _load_resampled,
     build_dataloader,
-    fill_unvoiced,
     load_manifest,
     split_train_val,
 )
@@ -515,7 +515,10 @@ def _eval_setup(
             "data.pitch_cache_path is required (eval needs precomputed f0)"
         )
     pitch = _load_pitch_cache(
-        cfg.data.pitch_cache_path, cfg.data.sample_rate, samples_per_frame
+        cfg.data.pitch_cache_path,
+        cfg.data.sample_rate,
+        samples_per_frame,
+        cfg.data.pitch_source,
     )
 
     n_eval = min(cfg.log.n_eval_clips, len(val_files))
@@ -541,7 +544,7 @@ def _eval_setup(
         if have > 0:
             f0_chunk[:have] = f0_full[:have]
             voiced_chunk[:have] = voiced_full[:have]
-        f0_filled = fill_unvoiced(f0_chunk, voiced_chunk, pitch.fmin, pitch.fmax)
+        f0_filled = _fill_chunk(f0_chunk, voiced_chunk, pitch)
 
         wavs.append(torch.from_numpy(audio))
         f0s.append(torch.from_numpy(f0_filled))
