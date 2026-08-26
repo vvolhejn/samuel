@@ -30,6 +30,13 @@ class DataConfig(BaseModel):
     chunk_seconds: float = 4.0
     num_workers: int = 4
     pitch_cache_path: Path | None = None
+    # Which detector produced the pitch cache; validated against the cache's
+    # own metadata at load. "pyin" is Viterbi-smoothed and non-causal; "yin"
+    # and "pesto" caches are computed causally (see scripts/precompute_pitch*)
+    # so the same f0 track is reproducible by a streaming detector at
+    # inference, and unvoiced gaps are filled causally (hold-last) rather than
+    # by interpolation.
+    pitch_source: Literal["pyin", "yin", "pesto"] = "pyin"
     # Every clip is RMS-normalised to this level
     target_rms: float = 0.05
     # Fraction of the manifest reserved as the held-out validation split.

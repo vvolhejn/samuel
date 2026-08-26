@@ -7,6 +7,9 @@ batch_size: 64
 data:
   manifest_path: manifests/librilight_1000h.jsonl
   pitch_cache_path: manifests/pitch_cache/librilight_1000h_spf512.npz
+  # Detector that produced the cache: pyin (non-causal), or yin / pesto
+  # (causal, streamable at inference). Must match the cache's metadata.
+  pitch_source: pyin
   sample_rate: 44100
   chunk_seconds: 4.0
   num_workers: 4
