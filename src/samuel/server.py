@@ -70,6 +70,7 @@ import soundfile as sf
 import torch
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from samuel.data import fill_unvoiced
@@ -451,6 +452,34 @@ def _startup() -> None:
         logger.info("serving frontend from %s", dist)
 
 
+def _param_ranges() -> dict[str, list[float]]:
+    """``[lo, hi]`` per parameter the model drives, for clients that let you
+    override a trajectory by hand (the looper) and need to know what a legal
+    value is. ``frequency`` is not in ``param_spec`` — it comes from pyin —
+    so it carries the pitch tracker's range instead."""
+    assert _model is not None
+    ranges = {
+        name: [float(lo), float(hi)]
+        for name, (lo, hi, _init) in _model.config.param_spec.items()
+    }
+    ranges["frequency"] = [PYIN_FMIN, PYIN_FMAX]
+    return ranges
+
+
+@app.get("/looper")
+def looper_page() -> FileResponse:
+    """The looper page.
+
+    Next's static export writes a route without a trailing slash as
+    ``<name>.html``, and the catch-all StaticFiles mount only looks for
+    ``looper/index.html``. Serving it by hand is less disruptive than turning
+    on ``trailingSlash``, which would move every other URL the site has."""
+    page = _FRONTEND_DIST / "looper.html"
+    if not page.is_file():
+        raise HTTPException(status_code=404, detail="frontend not built")
+    return FileResponse(page)
+
+
 @app.get("/api/health")
 def health() -> dict:
     assert _model is not None
@@ -461,6 +490,7 @@ def health() -> dict:
         "device": str(next(_model.parameters()).device),
         "checkpoint": _checkpoint,
         "model_fingerprint": _fingerprint,
+        "param_ranges": _param_ranges(),
     }
 
 
@@ -529,6 +559,7 @@ async def synthesize(request: Request) -> dict:
 # Uncommon default port (avoids clashing with the usual 8000/8080/3000). The
 # dev proxy in webapp/next.config.ts points here too — keep them in sync.
 DEFAULT_PORT = 8471
+
 
 def _parse_args() -> None:
     """Turn CLI flags into the env vars the app reads.

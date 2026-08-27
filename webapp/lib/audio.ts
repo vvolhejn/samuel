@@ -131,6 +131,27 @@ async function synthesizeBlob(blob: Blob): Promise<UtteranceResult> {
   };
 }
 
+/** Send a bar-aligned looper take to the model backend, at whatever rate the
+ * AudioContext captured it (the backend resamples). Deliberately not
+ * `synthesizeUtterance`: that trims the silence off both ends, and in a loop
+ * the silence is the timing — a rest at the top of the bar has to survive. */
+export async function synthesizeTake(
+  audio: Float32Array,
+  sampleRate: number,
+): Promise<{ response: SynthResponse; blob: Blob }> {
+  const wav = utils.encodeWAV(audio, 3, sampleRate, 1, 32);
+  const blob = new Blob([wav], { type: "audio/wav" });
+  const res = await fetch("/api/synthesize", {
+    method: "POST",
+    headers: { "Content-Type": "audio/wav" },
+    body: blob,
+  });
+  if (!res.ok) {
+    throw new Error(`backend error ${res.status}: ${await res.text()}`);
+  }
+  return { response: (await res.json()) as SynthResponse, blob };
+}
+
 /** Send one VAD utterance (Float32Array at 16 kHz) to the model backend. */
 export function synthesizeUtterance(
   audio: Float32Array,
@@ -223,6 +244,9 @@ export interface HealthResponse {
   /** Content hash of the loaded weights — the same string wherever they are
    * loaded from, so the committed clip responses can be checked against it. */
   model_fingerprint: string;
+  /** `[lo, hi]` per parameter the model drives, for clients that let you
+   * override a trajectory by hand. Absent from backends predating the looper. */
+  param_ranges?: Record<string, [number, number]>;
 }
 
 /** null when the backend is unreachable or not serving a model. */

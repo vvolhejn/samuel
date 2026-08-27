@@ -4,6 +4,11 @@ import type {
   PinkTromboneElement,
 } from "@/types/pink-trombone";
 import type { SynthResponse } from "@/lib/audio";
+import {
+  cancelAndHold,
+  tractTargets,
+  type TractTargets,
+} from "@/lib/tractParams";
 
 /** Headroom between scheduling and curve start; also the voicing fade-in. */
 const LEAD_S = 0.15;
@@ -59,19 +64,11 @@ export interface PinkTromboneHandle {
   /** The synth's AudioContext, or null before init(). Shared so callers can
    * decode and play their own audio on the same clock and device. */
   audioContext: () => AudioContext | null;
+  /** The AudioParams the trajectories drive, for callers that schedule their
+   * own automation instead of handing over an utterance — the looper, which
+   * writes frame by frame against the loop clock. Null before init(). */
+  tract: () => TractTargets | null;
   ready: () => boolean;
-}
-
-/** Truncate a param's automation at ``t``, holding its current value.
- * cancelScheduledValues cannot cut short an in-progress setValueCurveAtTime
- * (see scheduleCurve); cancelAndHoldAtTime can, but is Chrome/Safari-only —
- * the fallback leaves a running curve playing to its end. */
-function cancelAndHold(param: AudioParam, t: number) {
-  const p = param as AudioParam & {
-    cancelAndHoldAtTime?: (when: number) => AudioParam;
-  };
-  if (p.cancelAndHoldAtTime) p.cancelAndHoldAtTime(t);
-  else param.cancelScheduledValues(t);
 }
 
 function canCancelAndHold(param: AudioParam) {
@@ -504,6 +501,21 @@ export function usePinkTrombone(): PinkTromboneHandle {
     [],
   );
 
+  const tract = useCallback(() => {
+    const element = elementRef.current;
+    const constriction = constrictionRef.current;
+    const lipConstriction = lipConstrictionRef.current;
+    const masterGain = masterGainRef.current;
+    if (!element || !constriction || !lipConstriction || !masterGain)
+      return null;
+    return tractTargets(
+      element,
+      constriction,
+      lipConstriction,
+      masterGain.gain,
+    );
+  }, []);
+
   const ready = useCallback(() => elementRef.current !== null, []);
 
   // Stable handle: effects depending on it must not re-run on re-render.
@@ -520,6 +532,7 @@ export function usePinkTrombone(): PinkTromboneHandle {
       startVoice,
       endVoice: fadeVoicing,
       audioContext,
+      tract,
       ready,
     }),
     [
@@ -533,6 +546,7 @@ export function usePinkTrombone(): PinkTromboneHandle {
       voice,
       startVoice,
       audioContext,
+      tract,
       ready,
     ],
   );

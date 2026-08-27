@@ -86,5 +86,82 @@ from `out/`, and the backend as a container on the same origin. See
   worklet URL patched to an absolute path (see
   `scripts/vendor-pink-trombone.sh`).
 
+## Looper (`/looper`)
+
+A second page, and a different way of using the same model: record a
+bar-aligned take, loop the parameter trajectory it comes back as, and play
+over it from a MIDI keyboard.
+
+Nothing here streams. A take is a finite recording sent to the same
+`/api/synthesize` as the main page, which is what makes the whole thing cheap:
+no streaming encoder, no streaming pitch tracker, no causal input
+normalisation, and a full loop's worth of wall clock to compute the next
+loop in. It also means the checkpoint does not have to be causal.
+
+- **Recording is cut from a rolling buffer, not started and stopped.**
+  `lib/loopRecorder.ts` keeps the mic in memory via an AudioWorklet
+  (`public/looper/recorder-worklet.js`) that tags each block with its
+  `currentFrame`. A take is then an exact sample range on the same clock the
+  loop is scheduled against — the VAD's frame callback and MediaRecorder both
+  lose that, and a loop cut on their timing drifts. What no API reports is
+  microphone *input* latency, so a take lands slightly late against the grid;
+  the "record offset" slider is the manual compensation.
+- **The trajectory is indexed by loop phase, not by frame**
+  (`lib/loopTrajectory.ts`), so the loop follows tempo for free. At half the
+  tempo the articulation reads out half as fast and nothing transposes, because
+  pitch is a separate parameter rather than a property of a resampled waveform.
+  The last few frames are bent to meet the first so the loop point doesn't jump.
+- **`lib/loopClock.ts` answers one question** — what phase is it at time `t` —
+  from either its own tempo or MIDI clock. External sync averages the tempo
+  continuously but re-anchors the phase only at loop boundaries: USB clock
+  jitter is around a millisecond, and correcting mid-loop is audible as a lurch.
+- **`lib/loopScheduler.ts` writes the tract** on the usual two-clock
+  arrangement: a coarse timer wakes often and schedules every parameter frame
+  inside a 30 ms lookahead, each as a ramp landing at an exact time. Per
+  channel it keeps a weight: 0 is purely the recording, 1 is purely your hands,
+  and the value written is the crossfade. Nothing smooths the output itself —
+  at weight 0 the recorded articulation reaches the synth exactly as the model
+  predicted it.
+
+### Handover
+
+Each channel is `recorded`, `transpose`/`scale`/`offset`, or `replace`. The
+middle one is usually what you want: it keeps the recorded contour and moves
+it, and that contour is most of what makes the loop sound like speech rather
+than a held vowel.
+
+Pitch is worth understanding separately, for two reasons.
+
+The model never sees pitch. `frequency` is not an encoder input — it is
+scattered into the output parameter vector (`model.py`), having come from pyin.
+So substituting a MIDI note for it is exact: there is no distribution to be
+out of, and nothing to retrain.
+
+And pitch in `replace` mode is written the instant the note arrives rather than
+at the next scheduled frame, with the scheduler standing off that parameter
+until the note lifts. That takes the lookahead window out of note-on latency.
+`transpose` cannot do this — it has to keep tracking the contour it is
+transposing — so it costs one window of delay.
+
+`intensity` is the loudness channel; `voiceness` is breathy-to-pressed timbre,
+not level (it drives the synth's `tenseness` *and* `loudness`). Everything
+except pitch is driven by a controller, assigned by clicking "learn CC" and
+reaching for a knob. The computer keyboard plays notes too (`a w s e d f…`,
+`z`/`x` for octave) so none of this needs hardware to try.
+
+Mono only — one tract, one glottis.
+
+### Caveats
+
+- Web MIDI is Chromium and Firefox (behind a prompt); Safari has none. The
+  computer keyboard still works there.
+- Keep echo cancellation on unless you are wearing headphones: the synth is
+  playing into the room the take is recorded in. Auto gain control is off by
+  default here — it fights the level the model reads as loudness, and moves
+  under a loop that is already down.
+- The route is served explicitly by `samuel.server` (`/looper`): Next's static
+  export writes it as `looper.html`, which the catch-all static mount would not
+  find.
+
 Expect rough, babble-adjacent speech — the checkpoint's eval WER is ~0.9;
 the webapp faithfully reproduces what the model predicts.
