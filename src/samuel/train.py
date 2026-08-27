@@ -424,27 +424,30 @@ def _controller_diagnostics(
     under ``diag/`` to keep the train/eval namespaces clean.
 
     One bucket histogram per trainable param, ``bucket_usage``: hard argmax
-    counts (what eval and hard-Gumbel pick).
+    counts (what eval and hard-Gumbel pick). The direct head emits no logits,
+    so only the encoder stats are logged for it.
     """
-    logits = aux["logits"].detach().float()  # [B, T, n_t, n_b]
     z = aux["z"].detach().float()  # [B, dim, T]
-    _, _, _, n_b = logits.shape
-
-    top2 = logits.topk(2, dim=-1).values
-    margin = top2[..., 0] - top2[..., 1]  # [B, T, n_t]
-    argmax = logits.argmax(-1)  # [B, T, n_t]
-    edges = np.arange(n_b + 1) - 0.5
 
     out: dict[str, float | wandb.Histogram] = {}
-    for j, name in enumerate(trainable_names):
-        a_j = argmax[..., j].flatten()
-        counts = torch.bincount(a_j, minlength=n_b).float()
-        out[f"diag/margin/{name}"] = margin[..., j].mean().item()
-        out[f"diag/bucket_usage/{name}"] = wandb.Histogram(
-            np_histogram=(counts.cpu().numpy(), edges)
-        )
+    if "logits" in aux:
+        logits = aux["logits"].detach().float()  # [B, T, n_t, n_b]
+        _, _, _, n_b = logits.shape
 
-    out["diag/margin/mean"] = margin.mean().item()
+        top2 = logits.topk(2, dim=-1).values
+        margin = top2[..., 0] - top2[..., 1]  # [B, T, n_t]
+        argmax = logits.argmax(-1)  # [B, T, n_t]
+        edges = np.arange(n_b + 1) - 0.5
+
+        for j, name in enumerate(trainable_names):
+            a_j = argmax[..., j].flatten()
+            counts = torch.bincount(a_j, minlength=n_b).float()
+            out[f"diag/margin/{name}"] = margin[..., j].mean().item()
+            out[f"diag/bucket_usage/{name}"] = wandb.Histogram(
+                np_histogram=(counts.cpu().numpy(), edges)
+            )
+
+        out["diag/margin/mean"] = margin.mean().item()
     out["diag/z_mean_norm"] = z.norm(dim=1).mean().item()
     # Per-feature std across batch+time, averaged. Low ⇒ encoder collapsed.
     out["diag/z_std_per_feat"] = z.std(dim=(0, 2)).mean().item()
@@ -1029,12 +1032,17 @@ def main(hydra_cfg: DictConfig) -> None:
         # saturate to one-hot (which kills the soft-Gumbel gradient) but
         # positions above the floor feel no pressure toward uniform.
         # Hinged per position, not on the mean: uncertain positions must
-        # not offset saturated ones.
-        logits = aux["logits"].float()
-        log_probs = F.log_softmax(logits, dim=-1)
-        entropy_per_pos = -(log_probs.exp() * log_probs).sum(-1)  # [B, T, P]
-        entropy = entropy_per_pos.mean()
-        entropy_penalty = F.relu(cfg.loss.entropy_floor - entropy_per_pos).mean()
+        # not offset saturated ones. The direct head has no logits, so the
+        # penalty is zero there.
+        if "logits" in aux:
+            logits = aux["logits"].float()
+            log_probs = F.log_softmax(logits, dim=-1)
+            entropy_per_pos = -(log_probs.exp() * log_probs).sum(-1)  # [B, T, P]
+            entropy = entropy_per_pos.mean()
+            entropy_penalty = F.relu(cfg.loss.entropy_floor - entropy_per_pos).mean()
+        else:
+            entropy = torch.zeros((), device=device)
+            entropy_penalty = torch.zeros((), device=device)
         # Always computed (it's cheap) so the raw value can be compared across
         # runs; contributes to the gradient only when weighted.
         smooth_loss = _smoothness_loss(params, module, cfg.loss.smooth_weights)
