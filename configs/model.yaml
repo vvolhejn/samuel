@@ -20,6 +20,10 @@ model:
   # Straight-through (one-hot) Gumbel-softmax during training instead of the
   # soft expectation over bucket centers. Eval always snaps to argmax.
   gumbel_hard: false
+  # gumbel: categorical head over bucket centers. direct: one scalar per
+  # parameter squashed into its range by a scaled tanh; ignores n_buckets,
+  # gumbel_hard, tau, and the entropy penalty.
+  head_type: gumbel
 
   # Control frames of future input the controller may see. 0 keeps the total
   # algorithmic delay at one frame (11.6 ms), which the glottis ramp needs

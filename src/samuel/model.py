@@ -13,6 +13,7 @@ never gain-matched, so the model has to produce the level itself (see
 from __future__ import annotations
 
 import math
+from typing import Literal
 
 import torch
 import torch.nn.functional as F
@@ -131,6 +132,12 @@ class PinkTromboneControllerConfig(BaseModel):
     # is the soft distribution and the synth sees a smooth expectation between
     # bucket centers.
     gumbel_hard: bool = False
+    # "gumbel": categorical head over bucket centers, Gumbel-softmax sampled
+    # during training. "direct": one scalar per parameter, squashed into
+    # [lo, hi] by a scaled tanh; deterministic, ignores tau, and the entropy
+    # penalty and bucket diagnostics do not apply. The f0 head (if enabled)
+    # keeps its categorical form either way.
+    head_type: Literal["gumbel", "direct"] = "gumbel"
     # Control frames of future input the model may use. Control frame ``t`` is
     # read off encoder frame ``t + lookahead_frames``, so it sees samples up to
     # ``(t + 1 + lookahead_frames) * samples_per_frame``. Synthesis needs one
@@ -202,8 +209,14 @@ class PinkTromboneController(nn.Module):
         centers = lo.unsqueeze(1) + steps.unsqueeze(0) * (hi - lo).unsqueeze(1)
         self.register_buffer("bucket_centers", centers)
 
-        self.head = nn.Linear(config.encoder.dimension, n_trainable * config.n_buckets)
-        # Bias init at zero -> uniform softmax -> mean bucket value at start.
+        head_out = (
+            n_trainable
+            if config.head_type == "direct"
+            else n_trainable * config.n_buckets
+        )
+        self.head = nn.Linear(config.encoder.dimension, head_out)
+        # Bias init at zero -> uniform softmax -> mean bucket value at start
+        # (direct head: tanh(0) -> the same range midpoint).
         with torch.no_grad():
             self.head.bias.zero_()
 
@@ -256,10 +269,11 @@ class PinkTromboneController(nn.Module):
                 sane range. Required unless ``config.f0.enabled``, in which case
                 the model predicts pitch itself and this argument is ignored
                 (it stays the *label*, consumed by the loss, not an input).
-            tau: Gumbel-softmax temperature (training only).
-            return_aux: if True, also return a dict with ``logits``
-                ``[B, T_ctrl, n_trainable, n_buckets]`` and ``z`` (encoder
-                output, ``[B, dim, T_ctrl]``) for diagnostics.
+            tau: Gumbel-softmax temperature (training only; ignored by the
+                direct head).
+            return_aux: if True, also return a dict with ``z`` (encoder
+                output, ``[B, dim, T_ctrl]``) and, for the gumbel head,
+                ``logits`` ``[B, T_ctrl, n_trainable, n_buckets]``.
 
         Returns:
             ``[B, T_ctrl, N_PARAMS]`` parameter tensor (and ``aux`` dict if
@@ -294,28 +308,33 @@ class PinkTromboneController(nn.Module):
         if k > 0:
             z = z[..., k:]
 
-        logits = self.head(
-            rearrange(z, "b d t -> b t d")
-        ).float()  # [B, T_ctrl, n_t*n_b]
-        logits = rearrange(logits, "b t (p k) -> b t p k", k=self.n_buckets)
-
-        if self.training:
-            # hard=False: the forward output is the soft Gumbel-softmax
-            # distribution; (weights * centers).sum is then a smooth
-            # expectation between bucket centers. Eval still snaps to the
-            # argmax bucket, so there's a mild train/eval mismatch.
-            # hard=True (straight-through) removes that mismatch but locked
-            # the argmax when tried before the hinged entropy floor existed
-            # (eval loss bit-identical across many steps) — watch
-            # train/bucket_usage if enabling it.
-            weights = F.gumbel_softmax(
-                logits, tau=tau, hard=self.config.gumbel_hard, dim=-1
-            )
+        h = self.head(rearrange(z, "b d t -> b t d")).float()  # [B, T_ctrl, .]
+        aux: dict[str, Tensor] = {"z": z}
+        if self.config.head_type == "direct":
+            lo = self.bucket_centers[:, 0]
+            hi = self.bucket_centers[:, -1]
+            # [B, T_ctrl, n_t]
+            constrained = 0.5 * (hi + lo) + 0.5 * (hi - lo) * torch.tanh(h)
         else:
-            argmax = logits.argmax(dim=-1)
-            weights = F.one_hot(argmax, num_classes=self.n_buckets).to(logits.dtype)
-
-        constrained = (weights * self.bucket_centers).sum(dim=-1)  # [B, T_ctrl, n_t]
+            logits = rearrange(h, "b t (p k) -> b t p k", k=self.n_buckets)
+            if self.training:
+                # hard=False: the forward output is the soft Gumbel-softmax
+                # distribution; (weights * centers).sum is then a smooth
+                # expectation between bucket centers. Eval still snaps to the
+                # argmax bucket, so there's a mild train/eval mismatch.
+                # hard=True (straight-through) removes that mismatch but locked
+                # the argmax when tried before the hinged entropy floor existed
+                # (eval loss bit-identical across many steps) — watch
+                # train/bucket_usage if enabling it.
+                weights = F.gumbel_softmax(
+                    logits, tau=tau, hard=self.config.gumbel_hard, dim=-1
+                )
+            else:
+                argmax = logits.argmax(dim=-1)
+                weights = F.one_hot(argmax, num_classes=self.n_buckets).to(logits.dtype)
+            # [B, T_ctrl, n_t]
+            constrained = (weights * self.bucket_centers).sum(dim=-1)
+            aux["logits"] = logits
 
         out = torch.zeros(
             B, T_ctrl, N_PARAMS, device=wav.device, dtype=constrained.dtype
@@ -328,7 +347,6 @@ class PinkTromboneController(nn.Module):
             frozen_vals = repeat(self._frozen_vals, "p -> b t p", b=B, t=T_ctrl)
             out = out.scatter(2, frozen_idx, frozen_vals.to(out.dtype))
 
-        aux: dict[str, Tensor] = {"logits": logits, "z": z}
         if predict_f0:
             zt = rearrange(z, "b d t -> b t d")
             f0_logits = self.f0_head(zt).float()  # [B, T_ctrl, K]
