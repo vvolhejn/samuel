@@ -63,6 +63,16 @@ export class LoopClock {
     return this.anchor + turns * loop;
   }
 
+  /** The first beat strictly after `t`: when it lands, and which beat of the
+   * loop it is (0 is the downbeat). Derived from the anchor every time, so
+   * callers never accumulate their own idea of where the beats are. */
+  nextBeat(t: number): { time: number; index: number } {
+    const beat = this.beatSeconds();
+    const perLoop = this.beatsPerBar * this.bars;
+    const n = Math.floor((t - this.anchor) / beat) + 1;
+    return { time: this.anchor + n * beat, index: ((n % perLoop) + perLoop) % perLoop };
+  }
+
   /** Loop boundaries are numbered from the anchor, so a recording armed in one
    * loop can name the boundary it means and be recognised later. */
   boundaryIndexAt(t: number): number {

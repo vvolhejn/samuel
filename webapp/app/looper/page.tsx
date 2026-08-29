@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import Link from "next/link";
 import { insecureContextMessage } from "@/lib/secureContext";
 import { usePinkTrombone } from "@/lib/usePinkTrombone";
-import { useLooper } from "@/lib/useLooper";
+import { useLooper, RECORD_OFFSET_LIMIT_MS } from "@/lib/useLooper";
 import { useMirroredState } from "@/lib/useMirroredState";
 import { noteName } from "@/lib/midi";
 import { MIC_PROCESSING_LABELS } from "@/lib/micProcessing";
@@ -229,7 +229,36 @@ export default function Looper() {
             beats={beats}
             armed={looper.take === "armed"}
             recording={looper.take === "recording"}
+            pulse={looper.metronomeAudible}
           />
+
+          <div className="flex flex-wrap items-center gap-3 text-xs text-neutral-600">
+            <span className="text-neutral-500">click</span>
+            <div className="flex overflow-hidden rounded-md border border-neutral-200">
+              {(["off", "recording", "always"] as const).map((mode) => (
+                <button
+                  key={mode}
+                  onClick={() => looper.setMetronomeMode(mode)}
+                  className={`px-2 py-0.5 ${
+                    looper.metronomeMode === mode
+                      ? "bg-highlight-600 font-medium text-white"
+                      : "bg-white text-neutral-600 hover:bg-highlight-50"
+                  }`}
+                >
+                  {mode === "recording" ? "while recording" : mode}
+                </button>
+              ))}
+            </div>
+            <label className="flex items-center gap-1">
+              <input
+                type="checkbox"
+                checked={looper.muteWhileRecording}
+                onChange={(e) => looper.setMuteWhileRecording(e.target.checked)}
+                className="accent-highlight-600"
+              />
+              mute the loop while recording
+            </label>
+          </div>
 
           <div className="flex items-center justify-between text-xs text-neutral-500">
             <span>
@@ -244,6 +273,50 @@ export default function Looper() {
               />
             )}
           </div>
+        </section>
+
+        {/* Saved takes */}
+        <section className="flex flex-col gap-2 rounded-xl border border-neutral-200 p-3">
+          <SectionTitle>takes</SectionTitle>
+          {looper.takes.length === 0 ? (
+            <p className="text-xs text-neutral-500">
+              Every take is saved here as the model&apos;s parameters, in this
+              browser, so a refresh does not cost you the loop.
+            </p>
+          ) : (
+            <ul className="flex flex-col gap-1">
+              {looper.takes.map((take) => (
+                <li
+                  key={take.id}
+                  className="flex items-center gap-2 text-xs text-neutral-600"
+                >
+                  <button
+                    onClick={() => looper.loadTake(take.id)}
+                    className="rounded-full border border-neutral-200 bg-white px-3 py-0.5 text-neutral-700 hover:bg-highlight-50"
+                  >
+                    Load
+                  </button>
+                  <span className="tabular-nums">
+                    {new Date(take.id).toLocaleTimeString([], {
+                      hour: "2-digit",
+                      minute: "2-digit",
+                    })}
+                  </span>
+                  <span className="text-neutral-500">
+                    {take.bars} × {take.beatsPerBar}/4 ·{" "}
+                    {take.bpm.toFixed(0)} bpm · {take.loopSeconds.toFixed(1)} s
+                  </span>
+                  <button
+                    onClick={() => looper.removeTake(take.id)}
+                    title="Delete this take"
+                    className="ml-auto rounded-full px-2 py-0.5 text-neutral-400 hover:bg-highlight-50 hover:text-highlight-700"
+                  >
+                    ×
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
         </section>
 
         {/* Clock */}
@@ -422,8 +495,8 @@ export default function Looper() {
             record offset
             <input
               type="range"
-              min={-50}
-              max={150}
+              min={-RECORD_OFFSET_LIMIT_MS}
+              max={RECORD_OFFSET_LIMIT_MS}
               step={5}
               value={looper.recordOffsetMs}
               onChange={(e) => looper.setRecordOffsetMs(Number(e.target.value))}
@@ -433,7 +506,10 @@ export default function Looper() {
           </label>
           <p className="text-xs text-neutral-500">
             Nothing reports microphone input latency, so a take lands slightly
-            late against the grid. Turn this up until the loop sits on the beat.
+            late against the grid. Scrub this until the loop sits on the beat.
+            The take is recorded with {RECORD_OFFSET_LIMIT_MS} ms to spare
+            either side, so it slides the loop you are hearing — one model
+            frame at a time — instead of asking for another take.
           </p>
           <div className="flex flex-wrap gap-3 text-xs text-neutral-600">
             {MIC_PROCESSING_LABELS.map(({ key, label }) => (

@@ -9,7 +9,9 @@
  * Input latency is the one thing this cannot see. The samples that arrive
  * tagged with frame F were spoken some milliseconds earlier, and no browser
  * API reports how many, so a take always sits slightly late against the grid.
- * `offsetSeconds` on extract() is the manual compensation for it. */
+ * a take is therefore recorded with a pad either side of the bar, and the
+ * alignment is fixed afterwards by sliding the trajectory. See
+ * lib/loopTrajectory.ts. */
 
 import { levelToSlots, makeLevelStore, LevelStore } from "@/lib/levelStore";
 import { MicProcessing, MIC_PROCESSING_DEFAULTS } from "@/lib/micProcessing";
@@ -118,19 +120,12 @@ export class LoopRecorder {
 
   /** Pull `[fromTime, toTime)` on the AudioContext clock out of the buffer.
    *
-   * `offsetSeconds` shifts the window earlier to compensate for input latency;
-   * positive values reach further back. Returns null if the window is not
-   * entirely in the buffer, so a caller that asks too early gets an honest no
-   * rather than a take with a hole in it. */
-  extract(
-    fromTime: number,
-    toTime: number,
-    offsetSeconds = 0,
-  ): Float32Array | null {
+   * Returns null if the window is not entirely in the buffer, so a caller that
+   * asks too early gets an honest no rather than a take with a hole in it. */
+  extract(fromTime: number, toTime: number): Float32Array | null {
     const rate = this.sampleRate;
-    const shift = Math.round(offsetSeconds * rate);
-    const from = Math.round(fromTime * rate) - shift;
-    const to = Math.round(toTime * rate) - shift;
+    const from = Math.round(fromTime * rate);
+    const to = Math.round(toTime * rate);
     const length = to - from;
     if (length <= 0) return null;
 

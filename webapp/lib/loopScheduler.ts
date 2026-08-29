@@ -117,6 +117,8 @@ export class LoopScheduler {
 
   private timer: ReturnType<typeof setInterval> | null = null;
   private running = false;
+  /** Output held down while the loop keeps turning underneath it. */
+  private muted = false;
   /** Audio-clock time of the next parameter frame to write. */
   private nextTime = 0;
   private lastPhase = 0;
@@ -171,7 +173,7 @@ export class LoopScheduler {
     for (const param of allParams(this.targets)) pin(param, now);
     const gate = this.targets.gate;
     cancelAndHold(gate, now);
-    gate.setTargetAtTime(1, now, GATE_FADE_S / 3);
+    gate.setTargetAtTime(this.muted ? 0 : 1, now, GATE_FADE_S / 3);
     this.timer = setInterval(this.tick, TICK_MS);
   }
 
@@ -202,6 +204,32 @@ export class LoopScheduler {
     }
     if (!this.trajectory) this.trajectory = trajectory;
     else this.pending = trajectory;
+  }
+
+  /** Silence the output without stopping the loop. The trajectory keeps
+   * playing against the clock, so unmuting drops you back into the phrase
+   * where it has got to rather than where you left it. Used while a take is
+   * recorded: the take is of you, not of the loop and the room. */
+  setMuted(muted: boolean) {
+    if (muted === this.muted) return;
+    this.muted = muted;
+    if (!this.running) return;
+    const now = this.targets.ctx.currentTime;
+    const gate = this.targets.gate;
+    cancelAndHold(gate, now);
+    gate.setTargetAtTime(muted ? 0 : 1, now, GATE_FADE_S / 3);
+  }
+
+  isMuted(): boolean {
+    return this.muted;
+  }
+
+  /** Re-align every take the scheduler holds against the grid, in seconds of
+   * input latency. Applies to the pending take too: it is the same hands and
+   * the same interface, so it was recorded through the same latency. */
+  setTakeOffsetSeconds(seconds: number) {
+    this.trajectory?.setOffsetSeconds(seconds);
+    this.pending?.setOffsetSeconds(seconds);
   }
 
   setOverride(channel: Channel, patch: Partial<ChannelOverride>) {

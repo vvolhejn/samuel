@@ -10,6 +10,7 @@ export function PhaseBar({
   beats,
   armed,
   recording,
+  pulse,
 }: {
   /** Reads the current loop phase in [0, 1). Polled, not pushed. */
   phase: () => number;
@@ -17,21 +18,31 @@ export function PhaseBar({
   beats: number;
   armed: boolean;
   recording: boolean;
+  /** Mark the beat the click is on, so the metronome can be seen as well as
+   * heard — and read at a glance while the loop is muted for a take. */
+  pulse: boolean;
 }) {
   const headRef = useRef<HTMLDivElement>(null);
+  const cellRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     let raf = 0;
     const tick = () => {
+      const p = phase();
       const head = headRef.current;
       if (head) {
-        head.style.transform = `translateX(${phase() * 100}%)`;
+        head.style.transform = `translateX(${p * 100}%)`;
+      }
+      const cell = cellRef.current;
+      if (cell) {
+        const beat = Math.floor(p * Math.max(1, beats));
+        cell.style.transform = `translateX(${beat * 100}%)`;
       }
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [phase]);
+  }, [phase, beats]);
 
   const fill = recording
     ? "bg-highlight-600"
@@ -41,6 +52,16 @@ export function PhaseBar({
 
   return (
     <div className="relative h-6 w-full overflow-hidden rounded-md border border-neutral-200 bg-white">
+      {/* The beat the click lands on. One cell wide, slid across like the head. */}
+      <div className="absolute inset-0 flex">
+        <div
+          ref={cellRef}
+          className={`h-full will-change-transform ${
+            pulse ? "bg-highlight-100" : "bg-neutral-100"
+          }`}
+          style={{ width: `${100 / Math.max(1, beats)}%` }}
+        />
+      </div>
       {/* Beat ticks. The first is the downbeat and is drawn darker. */}
       {Array.from({ length: Math.max(1, beats) }, (_, i) => (
         <div

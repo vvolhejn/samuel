@@ -104,13 +104,18 @@ loop in. It also means the checkpoint does not have to be causal.
   `currentFrame`. A take is then an exact sample range on the same clock the
   loop is scheduled against — the VAD's frame callback and MediaRecorder both
   lose that, and a loop cut on their timing drifts. What no API reports is
-  microphone *input* latency, so a take lands slightly late against the grid;
-  the "record offset" slider is the manual compensation.
+  microphone *input* latency, so a take lands slightly late against the grid.
+  A take is therefore cut with a pad of extra audio either side of the bar, and
+  the "record offset" slider slides the *predicted parameters* over that pad
+  rather than re-cutting the audio: the alignment is fixed after the fact, to
+  one model frame (~12 ms), on the loop you are already listening to.
 - **The trajectory is indexed by loop phase, not by frame**
   (`lib/loopTrajectory.ts`), so the loop follows tempo for free. At half the
   tempo the articulation reads out half as fast and nothing transposes, because
   pitch is a separate parameter rather than a property of a resampled waveform.
   The last few frames are bent to meet the first so the loop point doesn't jump.
+  The loop is a window over the padded take, copied out whenever the record
+  offset moves, which is what makes that control retroactive.
 - **`lib/loopClock.ts` answers one question** — what phase is it at time `t` —
   from either its own tempo or MIDI clock. External sync averages the tempo
   continuously but re-anchors the phase only at loop boundaries: USB clock
@@ -122,6 +127,31 @@ loop in. It also means the checkpoint does not have to be causal.
   and the value written is the crossfade. Nothing smooths the output itself —
   at weight 0 the recorded articulation reaches the synth exactly as the model
   predicted it.
+- **`lib/metronome.ts` clicks on every beat**, scheduled the same way and off
+  the same clock, so the click and the loop cannot disagree. Beat times are
+  re-derived from the clock at every wake-up rather than accumulated, which is
+  what keeps them on the loop when the tempo moves or an external clock
+  re-anchors the downbeat. The click defaults to sounding for a take only, and
+  the beat it is on is marked on the phase bar as well.
+- **The loop is muted for the take itself**, not for the count-in: the take is
+  of you, and what is already looping would come back through the mic and be
+  re-synthesised on top of itself. Muting rides the same output gate as
+  start/stop, so the trajectory keeps turning against the clock and comes back
+  where it has got to. Turn it off to overdub against what is playing.
+
+### Saved takes
+
+Every take is written to IndexedDB as the model predicted it — the parameter
+frames, not the audio — so a refresh does not cost you the loop
+(`lib/takeStore.ts`). The frames are small, they load with no backend and no
+wait, and they are exactly what the trajectory is built from. The pads are
+stored with them, so the record offset still slides on a loaded take. The
+newest 20 are kept and older ones drop off on their own. Loading a take
+restores the metre it was recorded in, but not the tempo: the loop follows
+whatever tempo is running.
+
+Storage is allowed to fail. A private window or a browser with site data turned
+off refuses, and the looper works as before without it.
 
 ### Handover
 
