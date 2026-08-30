@@ -180,16 +180,6 @@ class LossConfig(BaseModel):
     #   rest * sum_p rest_weights[p] * mean_{batch,time} |p_norm - target_p|
     # on the same range-normalised params as ``smooth``/``accel``. Params
     # absent from ``rest_targets`` are unpenalised.
-    #
-    # The point is the frames where the reconstruction loss has no opinion:
-    # during silence nothing pins the tongue, so it parks wherever it happens
-    # to be. L1 makes the pull a constant force regardless of distance, so it
-    # is a fixed small offset to the recon gradient -- negligible where that
-    # gradient is strong (speech), decisive where it is weak or just noise
-    # (silence). It has to stay small: these gradients are heavy-tailed, large
-    # only in the frames where an articulator does its work, so a force even a
-    # few percent above this wins in the low-gradient majority of frames and
-    # the parameter stops being used at all.
     rest: float = 0.01
     # Target values in *raw* parameter units (same scale as model.param_spec),
     # normalised internally by the same [lo, hi] range. Empty disables the term.
