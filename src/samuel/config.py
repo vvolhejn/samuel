@@ -130,7 +130,7 @@ class LossConfig(BaseModel):
     mfcc: float = 1.0  # L1 on first 20 MFCCs (frame-aligned to samples_per_frame)
     mel: float = 0.0  # L1 on log-mel spectrogram (frame-aligned to samples_per_frame)
     stft: float = 0.0  # Multi-scale log-magnitude STFT, n_ffts (512, 1024, 2048)
-    entropy: float = 1.0
+    entropy: float = 0.1
     # Per-position entropy floor in nats (1.0 ~ spread over e ~ 2.7 buckets).
     entropy_floor: float = 1.0
     # MFCC-loss STFT window size. Default 2048 with samples_per_frame=512 gives
@@ -143,17 +143,16 @@ class LossConfig(BaseModel):
     # control trajectories, computed on range-normalised params (each trainable
     # param rescaled to [0, 1]. Contribution to the training loss:
     #   smooth * sum_p smooth_weights[p] * mean_{batch,time} |Δp_norm|
-    # Off in favour of ``accel``: penalising displacement cannot tell a fast
-    # gesture apart from jitter, so this either leaves the jitter in place or
-    # freezes the parameter.
-    smooth: float = 0.0
+    smooth: float = 0.3
     smooth_weights: dict[str, float] = Field(
         default_factory=lambda: {
             "tongueIndex": 1.0,
-            "tongueDiameter": 0.3,
             "constrictionIndex": 1.0,
-            "constrictionDiameter": 0.1,
-            "lipDiameter": 0.1,
+            "tongueDiameter": 0.3,
+            "constrictionDiameter": 0.3,
+            "lipDiameter": 0.3,
+            "voiceness": 0.1,
+            "intensity": 0.1,
         }
     )
 
@@ -167,10 +166,38 @@ class LossConfig(BaseModel):
     accel_weights: dict[str, float] = Field(
         default_factory=lambda: {
             "tongueIndex": 1.0,
-            "tongueDiameter": 0.3,
             "constrictionIndex": 1.0,
-            "constrictionDiameter": 0.1,
-            "lipDiameter": 0.1,
+            "tongueDiameter": 0.3,
+            "constrictionDiameter": 0.3,
+            "lipDiameter": 0.3,
+            "voiceness": 0.1,
+            "intensity": 0.1,
+        }
+    )
+
+    # Rest-posture prior: a small constant L1 pull of each control trajectory
+    # toward a fixed "closed mouth" posture,
+    #   rest * sum_p rest_weights[p] * mean_{batch,time} |p_norm - target_p|
+    # on the same range-normalised params as ``smooth``/``accel``. Params
+    # absent from ``rest_targets`` are unpenalised.
+    rest: float = 0.01
+    # Target values in *raw* parameter units (same scale as model.param_spec),
+    # normalised internally by the same [lo, hi] range. Empty disables the term.
+    rest_targets: dict[str, float] = Field(
+        default_factory=lambda: {
+            "lipDiameter": 0.3,  # top of the [0, 0.3] closure band: almost closed
+            "tongueDiameter": 3.5,  # max of [1.5, 3.5]: tongue body down
+            "constrictionDiameter": 3.0,  # max of [-2, 3]: no tip constriction
+        }
+    )
+    # Per-param multipliers; params absent here default to 1.0. The recon
+    # gradient differs ~5x across these params, so a flat weight would bias the
+    # lips far harder than the tongue.
+    rest_weights: dict[str, float] = Field(
+        default_factory=lambda: {
+            "lipDiameter": 0.3,
+            "tongueDiameter": 1.0,
+            "constrictionDiameter": 1.0,
         }
     )
 
