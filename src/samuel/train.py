@@ -914,6 +914,11 @@ def main(hydra_cfg: DictConfig) -> None:
 
     # Model
     model = PinkTromboneController(cfg.model).to(device)
+    if cfg.run.init_ckpt is not None:
+        ckpt = torch.load(cfg.run.init_ckpt, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        if rank == 0:
+            print(f"Initialised model from {cfg.run.init_ckpt} (step {ckpt['step']})")
     for field in ("smooth_weights", "accel_weights", "rest_targets", "rest_weights"):
         unknown = set(getattr(cfg.loss, field)) - set(model.trainable_names_)
         if unknown:
@@ -1111,12 +1116,20 @@ def main(hydra_cfg: DictConfig) -> None:
         rest_loss = _rest_pose_loss(
             params, module, cfg.loss.rest_targets, cfg.loss.rest_weights
         )
+        reg_scale = (
+            min(1.0, step / cfg.loss.reg_ramp_steps)
+            if cfg.loss.reg_ramp_steps > 0
+            else 1.0
+        )
         loss = (
             recon_loss
             + cfg.loss.entropy * entropy_penalty
-            + cfg.loss.smooth * smooth_loss
-            + cfg.loss.accel * accel_loss
-            + cfg.loss.rest * rest_loss
+            + reg_scale
+            * (
+                cfg.loss.smooth * smooth_loss
+                + cfg.loss.accel * accel_loss
+                + cfg.loss.rest * rest_loss
+            )
         )
 
         f0_readouts: dict[str, float] = {}
@@ -1156,6 +1169,7 @@ def main(hydra_cfg: DictConfig) -> None:
                 **{f"train/{k}": v for k, v in f0_readouts.items()},
                 "train/rest_loss": rest_loss.item(),
                 "train/lr": optimizer.param_groups[0]["lr"],
+                "train/reg_scale": reg_scale,
                 "train/tau": tau,
                 "train/grad_norm": float(grad_norm),
                 "train/epoch": epoch,
