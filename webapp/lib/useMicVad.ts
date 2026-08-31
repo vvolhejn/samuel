@@ -99,6 +99,10 @@ export function useMicVad({
   /** User-intended mic state — the Microphone/Stop toggle, and so also "a
    * recording is in progress". */
   const [micOn, micOnRef, setMicOn] = useMirroredState(false);
+  /** Between the press and the first frame of audio. onBeforeStart wakes the
+   * backend, which takes a container cold start when it has been asleep, and
+   * the VAD then loads its model. Nothing looks different for either. */
+  const [starting, startingRef, setStarting] = useMirroredState(false);
   /** Is the VAD hearing speech *this frame*? Drives the meter's colour, and
    * nothing else — it flips tens of times a second, so it must never gate a
    * control. */
@@ -172,7 +176,11 @@ export function useMicVad({
 
   const startMic = useCallback(async () => {
     const { setOwner, setError } = optionsRef.current;
+    // The button stays pressable through the wait for anyone using a keyboard,
+    // so a second press must not build a second VAD over the first.
+    if (startingRef.current) return;
     setError(null);
+    setStarting(true);
     try {
       await optionsRef.current.onBeforeStart();
 
@@ -216,8 +224,19 @@ export function useMicVad({
       setError(micErrorMessage(e));
       setMicOn(false);
       setOwner("none");
+    } finally {
+      setStarting(false);
     }
-  }, [showHeard, levelStore, stopMic, micOnRef, setMicOn, micProcessingRef]);
+  }, [
+    showHeard,
+    levelStore,
+    stopMic,
+    micOnRef,
+    setMicOn,
+    micProcessingRef,
+    startingRef,
+    setStarting,
+  ]);
 
   /** Resume the VAD only if the user hasn't turned the mic off. Everything that
    * takes the mouth hands it back this way. */
@@ -272,6 +291,7 @@ export function useMicVad({
   return {
     micOn,
     micOnRef,
+    starting,
     heard,
     levelStore,
     micProcessing,
