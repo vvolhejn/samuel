@@ -115,6 +115,10 @@ class RunConfig(BaseModel):
     runs_root: Path = Path("runs")
     name: str
     seed: int = 0
+    # Initialise model weights from this checkpoint (fine-tune): loads the
+    # model state dict only; optimizer, step counter, and data order start
+    # fresh.
+    init_ckpt: Path | None = None
 
     @field_validator("runs_root")
     @classmethod
@@ -151,6 +155,9 @@ class LossConfig(BaseModel):
     # param rescaled to [0, 1]. Contribution to the training loss:
     #   smooth * sum_p smooth_weights[p] * mean_{batch,time} |Δp_norm|
     smooth: float = 0.3
+    # Ramp the smooth/accel/rest weights linearly from 0 to their full values
+    # over this many steps. 0 applies them at full strength from step 0.
+    reg_ramp_steps: int = 0
     smooth_weights: dict[str, float] = Field(
         default_factory=lambda: {
             "tongueIndex": 1.0,

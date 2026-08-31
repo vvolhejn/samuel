@@ -49,6 +49,9 @@ loss:
   # trajectories, sum_p smooth_weights[p] * mean|Δp_norm|. Params not listed
   # in smooth_weights are unpenalised. See LossConfig for details.
   smooth: 0.3
+  # Ramp smooth/accel/rest linearly from 0 to full weight over this many
+  # steps; 0 = full strength from step 0.
+  reg_ramp_steps: 0
   smooth_weights:
     tongueIndex: 1.0
     constrictionIndex: 1.0
@@ -110,6 +113,9 @@ run:
   runs_root: runs
   name: ???
   seed: 0
+  # Checkpoint to initialise the model weights from (fine-tune). Loads model
+  # weights only; optimizer and step start fresh.
+  init_ckpt: null
 
 hydra:
   run:
