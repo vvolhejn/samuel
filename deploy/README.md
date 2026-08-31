@@ -95,13 +95,18 @@ will not reliably notice a re-push.
 
 ## Cost
 
-`instance_type` is `standard-3` (2 vCPU / 8 GiB), matching the thread counts in
-the Dockerfile. Containers scale to zero; `sleepAfter` in
+`instance_type` is a custom 1 vCPU / 4 GiB / 8 GB. The vCPU count must match the
+thread counts in the Dockerfile. Containers scale to zero; `sleepAfter` in
 `webapp/worker/index.ts` sets how long an idle instance stays awake. Memory and
 disk are billed for the whole awake window, CPU only while computing. The
-allowance included with the plan covers roughly 3 hours awake at this size; past
-that it is about $0.08/hour awake. `max_instances` is 1, since each extra awake
+allowance included with the plan covers roughly 6 hours awake at this size; past
+that it is about $0.04/hour awake. `max_instances` is 1, since each extra awake
 instance multiplies the memory bill.
+
+The size comes from measured use: a 2.14 GB memory peak and a 1.62 GB disk peak
+over a week. Do not raise it without a measurement. Cloudflare bills memory and
+disk on the provisioned amount, not on the amount used, so headroom is paid for
+around the clock.
 
 Cold start measured locally is ~10 s: container boot, `import torch`, then the
 checkpoint load.
