@@ -8,7 +8,7 @@ import math
 
 import torch
 import torch.nn.functional as F
-from einops import rearrange, repeat
+from einops import repeat
 from torch import Tensor
 
 SAMPLE_RATE = 44100
@@ -202,22 +202,40 @@ class SimplexNoise:
 # ---------------------------------------------------------------------------
 
 
+_GLOTTIS_PARAMS = (
+    "frequency",
+    "voiceness",
+    "intensity",
+    "vibratoWobble",
+    "vibratoFrequency",
+    "vibratoGain",
+)
+
+
 def _upsample_params(
     params: Tensor, samples_per_frame: int = SAMPLES_PER_FRAME
 ) -> Tensor:
-    """[B, T, P] at control rate -> [B, T_samples, P] at SAMPLE_RATE."""
+    """[B, T, P] at control rate -> [B, T_samples, P] at SAMPLE_RATE.
+
+    Frame ``t`` starts exactly at sample ``t * samples_per_frame`` and ramps
+    linearly to frame ``t + 1``'s value over the frame; the final frame has no
+    successor and holds. So a sample in frame ``t`` depends on control frames
+    ``t`` and ``t + 1`` and nothing else, which is one control frame of
+    algorithmic delay whatever the clip length. (Interpolating the whole
+    trajectory with ``align_corners=True`` instead makes the control-frame ->
+    sample mapping depend on ``T``, which no streaming implementation can
+    reproduce.)
+    """
     B, T, P = params.shape
-    T_samples = T * samples_per_frame
     if T == 1:
-        return params.expand(B, T_samples, P)
-    # F.interpolate wants [B, C, L]
-    up = F.interpolate(
-        rearrange(params, "b t p -> b p t"),
-        size=T_samples,
-        mode="linear",
-        align_corners=True,
+        return params.expand(B, samples_per_frame, P)
+    nxt = torch.cat([params[:, 1:], params[:, -1:]], dim=1)  # [B, T, P]
+    ramp = (
+        torch.arange(samples_per_frame, device=params.device, dtype=params.dtype)
+        / samples_per_frame
     )
-    return rearrange(up, "b p t -> b t p")
+    up = params.unsqueeze(2) + (nxt - params).unsqueeze(2) * ramp.view(1, 1, -1, 1)
+    return up.reshape(B, T * samples_per_frame, P)
 
 
 def _samples_per_frame(control_rate: float) -> int:
@@ -845,29 +863,32 @@ def _ola_convolve(source: Tensor, h: Tensor, hop: int) -> Tensor:
 def _tract_ola(
     glottis_out: Tensor,  # [B, S]
     noise_mod: Tensor,  # [B, S]
-    tongue_index: Tensor,  # [B, S]
-    tongue_diameter: Tensor,  # [B, S]
-    constriction_index: Tensor,  # [B, S]
-    constriction_diameter: Tensor,  # [B, S]
-    lip_diameter: Tensor,  # [B, S]
+    tongue_index: Tensor,  # [B, T] at control rate
+    tongue_diameter: Tensor,  # [B, T]
+    constriction_index: Tensor,  # [B, T]
+    constriction_diameter: Tensor,  # [B, T]
+    lip_diameter: Tensor,  # [B, T]
     ir_length: int = 4096,
     samples_per_frame: int = SAMPLES_PER_FRAME,
 ) -> Tensor:  # [B, S]
+    """One FIR per control frame; frame ``t``'s filter comes from frame ``t``.
+
+    The tract parameters arrive at control rate because that is the rate the
+    impulse responses are computed at -- upsampling them to 44.1 kHz only to
+    resample them back down would blend each frame with its successor for no
+    gain, and would make the tract, unlike the glottis, look ahead a frame.
+    """
     B, S = glottis_out.shape
     N = _TRACT_N
     ns = _NOSE_START
     device = glottis_out.device
     dtype = glottis_out.dtype
     hop = samples_per_frame
-    T = S // hop  # S is always a multiple of hop
+    T = tongue_index.shape[1]
+    assert S == T * hop, f"expected {T * hop} samples for {T} frames, got {S}"
 
-    # --- Per-frame parameters sampled at frame midpoints ---
-    mid = torch.arange(T, device=device) * hop + hop // 2  # [T]
-    ti_f = tongue_index[:, mid]  # [B, T]
-    td_f = tongue_diameter[:, mid]
-    ci_f = constriction_index[:, mid]
-    cd_f = constriction_diameter[:, mid]
-    ld_f = lip_diameter[:, mid]
+    ti_f, td_f = tongue_index, tongue_diameter  # [B, T]
+    ci_f, cd_f, ld_f = constriction_index, constriction_diameter, lip_diameter
 
     # Oral reflection coefficients [B, T, N]
     diameter_f = _compute_diameter_profile(ti_f, td_f, ci_f, cd_f, ld_f, N)
@@ -894,27 +915,28 @@ def _tract_ola(
     r_N_f = (2 * A_N_f - sum_A_f) / sum_A_f
 
     # --- Turbulence source at full sample rate ---
-    thinness = torch.clamp(8 * (0.7 - constriction_diameter), 0.0, 1.0)
-    openness = torch.clamp(30 * (constriction_diameter - 0.3), 0.0, 1.0)
-    valid_mask = (
-        (constriction_index >= 2)
-        & (constriction_index <= N)
-        & (constriction_diameter > 0)
-    ).to(dtype)
+    # These are per-sample gains on the noise, not filter coefficients, so they
+    # do get the sample-rate ramp (a step at every frame boundary would click).
+    turb_up = _upsample_params(torch.stack([ci_f, cd_f, ld_f], dim=-1), hop)
+    ci_s, cd_s, ld_s = turb_up[..., 0], turb_up[..., 1], turb_up[..., 2]
+
+    thinness = torch.clamp(8 * (0.7 - cd_s), 0.0, 1.0)
+    openness = torch.clamp(30 * (cd_s - 0.3), 0.0, 1.0)
+    valid_mask = ((ci_s >= 2) & (ci_s <= N) & (cd_s > 0)).to(dtype)
     turb_source = (
         noise_mod * glottis_out * 0.66 * (thinness * openness) / 2 * valid_mask
     )
 
     # Lip turbulence source (fixed injection site at the last tube position)
-    lip_thinness = torch.clamp(8 * (0.7 - lip_diameter), 0.0, 1.0)
-    lip_openness = torch.clamp(30 * (lip_diameter - 0.3), 0.0, 1.0)
+    lip_thinness = torch.clamp(8 * (0.7 - ld_s), 0.0, 1.0)
+    lip_openness = torch.clamp(30 * (ld_s - 0.3), 0.0, 1.0)
     lip_turb_source = (
         noise_mod
         * glottis_out
         * 0.66
         * (lip_thinness * lip_openness)
         / 2
-        * (lip_diameter > 0).to(dtype)
+        * (ld_s > 0).to(dtype)
     )
 
     # --- Impulse responses (parallel over B×T) ---
@@ -1055,17 +1077,19 @@ def pink_trombone_ola(
 
     simplex = SimplexNoise(device=params.device, seed=seed)
     spf = _samples_per_frame(control_rate)
-    params_up = _upsample_params(params, spf)
 
-    p = {name: params_up[..., i] for i, name in enumerate(PARAM_NAMES)}
+    p = {name: params[..., i] for i, name in enumerate(PARAM_NAMES)}
+    # Only the glottis runs per sample; the tract keeps its params at control
+    # rate (see _tract_ola).
+    g = _upsample_params(torch.stack([p[n] for n in _GLOTTIS_PARAMS], dim=-1), spf)
 
     glottis_out, noise_mod = glottis(
-        frequency=p["frequency"],
-        voiceness=p["voiceness"],
-        intensity=p["intensity"],
-        vibrato_wobble=p["vibratoWobble"],
-        vibrato_freq=p["vibratoFrequency"],
-        vibrato_gain=p["vibratoGain"],
+        frequency=g[..., 0],
+        voiceness=g[..., 1],
+        intensity=g[..., 2],
+        vibrato_wobble=g[..., 3],
+        vibrato_freq=g[..., 4],
+        vibrato_gain=g[..., 5],
         simplex=simplex,
     )
 

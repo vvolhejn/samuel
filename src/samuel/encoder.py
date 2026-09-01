@@ -22,7 +22,10 @@ class SEANetEncoderConfig(BaseModel):
     dimension: int = 128
     n_filters: int = 32
     n_residual_layers: int = 3
-    ratios: list[int] = Field(default_factory=lambda: [8, 5, 4, 2])
+    # Product must equal PinkTromboneControllerConfig.samples_per_frame, or
+    # the controller has to resample the latent sequence (see
+    # PinkTromboneController.forward), which costs a few ms of lookahead.
+    ratios: list[int] = Field(default_factory=lambda: [8, 4, 4, 4])
     kernel_size: int = 7
     last_kernel_size: int = 7
     residual_kernel_size: int = 3

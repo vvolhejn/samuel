@@ -77,6 +77,13 @@ class PinkTromboneControllerConfig(BaseModel):
     # is the soft distribution and the synth sees a smooth expectation between
     # bucket centers.
     gumbel_hard: bool = False
+    # Control frames of future input the model may use. Control frame ``t`` is
+    # read off encoder frame ``t + lookahead_frames``, so it sees samples up to
+    # ``(t + 1 + lookahead_frames) * samples_per_frame``. Synthesis needs one
+    # frame beyond that anyway -- the glottis ramps frame ``t`` toward frame
+    # ``t + 1`` (see pink_trombone._upsample_params) -- so total algorithmic
+    # delay is ``lookahead_frames + 1`` frames, 11.6 ms at the default 0.
+    lookahead_frames: int = 0
 
     @property
     def frame_rate(self) -> float:
@@ -195,13 +202,22 @@ class PinkTromboneController(nn.Module):
             raise ValueError(f"expected f0 [{B}, {T_ctrl}], got {tuple(f0.shape)}")
 
         hop = self.encoder.hop_length
-        pad = (hop - S % hop) % hop
+        k = self.config.lookahead_frames
+        # Pad by the lookahead so the encoder emits T_ctrl + k frames, then
+        # drop the first k: control frame t becomes encoder frame t + k.
+        pad = k * self.samples_per_frame
+        pad += (hop - (S + pad) % hop) % hop
         if pad > 0:
             wav = F.pad(wav, (0, pad))
 
         z = self.encoder(wav)  # [B, dim, T_enc]
-        if z.shape[-1] != T_ctrl:
-            z = F.interpolate(z, size=T_ctrl, mode="linear", align_corners=True)
+        # A no-op when prod(encoder.ratios) == samples_per_frame, which is the
+        # default. Otherwise it resamples the latent sequence to control rate,
+        # and costs a few ms of lookahead on top of lookahead_frames.
+        if z.shape[-1] != T_ctrl + k:
+            z = F.interpolate(z, size=T_ctrl + k, mode="linear", align_corners=True)
+        if k > 0:
+            z = z[..., k:]
 
         logits = self.head(
             rearrange(z, "b d t -> b t d")

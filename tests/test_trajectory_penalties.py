@@ -7,12 +7,16 @@ distinction down, since the sweep it supports is read off those numbers.
 
 import torch
 
+from samuel.config import DataConfig, LossConfig, RunConfig, TrainConfig
 from samuel.encoder import SEANetEncoderConfig
 from samuel.model import PinkTromboneController, PinkTromboneControllerConfig
 from samuel.pink_trombone import N_PARAMS, PARAM_NAMES
 from samuel.train import (
     _acceleration_loss,
+    _rest_pose_distance,
+    _rest_pose_loss,
     _reversal_rate,
+    _silent_frame_rest_metrics,
     _smoothness_loss,
 )
 
@@ -75,6 +79,103 @@ class TestAccelerationPenalty:
         traj = _params_from([0.0, 0.1, 0.0, 0.1], module).requires_grad_(True)
         _acceleration_loss(traj, module, _WEIGHTS).backward()
         assert traj.grad.abs().sum() > 0
+
+
+class TestRestPosePrior:
+    def _targets(self, module: PinkTromboneController, at: float) -> dict[str, float]:
+        """``{_PARAM: raw value}`` for a target given in [0, 1] of the range."""
+        lo, hi = module.config.param_spec[_PARAM][:2]
+        return {_PARAM: lo + at * (hi - lo)}
+
+    def test_zero_at_the_target(self):
+        module = _module()
+        traj = _params_from([0.25] * 4, module)
+        assert (
+            _rest_pose_loss(traj, module, self._targets(module, 0.25), {}).item() < 1e-6
+        )
+
+    def test_measures_normalised_distance(self):
+        module = _module()
+        traj = _params_from([0.2, 0.4], module)  # mean distance 0.2 from 0.5
+        loss = _rest_pose_loss(traj, module, self._targets(module, 0.5), {})
+        assert abs(loss.item() - 0.2) < 1e-5
+
+    def test_constant_force_regardless_of_distance(self):
+        """L1, not L2: that is what makes it a fixed offset to the recon gradient."""
+        module = _module()
+        targets = self._targets(module, 1.0)
+        grads = []
+        for at in (0.2, 0.8):
+            traj = _params_from([at] * 4, module).requires_grad_(True)
+            _rest_pose_loss(traj, module, targets, {}).backward()
+            grads.append(traj.grad.abs().sum().item())
+        assert abs(grads[0] - grads[1]) < 1e-6
+
+    def test_weights_scale_the_pull(self):
+        module = _module()
+        targets = self._targets(module, 1.0)
+        traj = _params_from([0.2] * 4, module)
+        base = _rest_pose_loss(traj, module, targets, {}).item()
+        assert (
+            abs(
+                _rest_pose_loss(traj, module, targets, {_PARAM: 0.5}).item()
+                - 0.5 * base
+            )
+            < 1e-6
+        )
+
+    def test_unlisted_params_contribute_nothing(self):
+        module = _module()
+        traj = _params_from([0.2] * 4, module)
+        assert _rest_pose_loss(traj, module, {}, {}).item() == 0.0
+        dist = _rest_pose_distance(traj, module, self._targets(module, 1.0))
+        for name, v in zip(module.trainable_names_, dist.tolist()):
+            if name != _PARAM:
+                assert v == 0.0
+
+    def test_is_differentiable_toward_the_target(self):
+        module = _module()
+        traj = _params_from([0.2] * 4, module).requires_grad_(True)
+        _rest_pose_loss(traj, module, self._targets(module, 1.0), {}).backward()
+        # Below the target, so increasing the param must decrease the loss.
+        assert traj.grad[0, :, PARAM_NAMES.index(_PARAM)].max() < 0
+
+
+class TestSilentFrameRestMetrics:
+    """The eval-side readout: rest distance on the frames the recon loss ignores."""
+
+    def _cfg(self, targets: dict[str, float]) -> TrainConfig:
+        return TrainConfig(
+            run=RunConfig(name="test"),
+            data=DataConfig(manifest_path="manifests/unused.jsonl", target_rms=0.05),
+            loss=LossConfig(rest=0.1, rest_targets=targets),
+        )
+
+    def test_splits_silent_from_loud_frames(self):
+        module = _module()
+        spf = module.samples_per_frame
+        lo, hi = module.config.param_spec[_PARAM][:2]
+        # Frame 0 loud, frame 1 silent; the param sits at the target only
+        # during the silent frame, so the silent-frame distance must be 0
+        # while the all-frame distance is not.
+        params = _params_from([0.0, 1.0], module)
+        target = torch.cat([torch.full((1, spf), 0.05), torch.zeros(1, spf)], dim=1)
+        cfg = self._cfg({_PARAM: hi})
+        out = _silent_frame_rest_metrics(params, module, target, cfg)
+        assert out["eval/silent_frac"] == 0.5
+        assert out["eval/rest_loss_silent"] == 0.0
+        assert out[f"eval/rest_dist_silent/{_PARAM}"] == 0.0
+        assert _rest_pose_distance(params, module, {_PARAM: hi}).sum().item() > 0.4
+        assert lo < hi  # sanity: range orientation assumed above
+
+    def test_reports_only_the_fraction_when_nothing_is_silent(self):
+        module = _module()
+        params = _params_from([0.0, 1.0], module)
+        target = torch.full((1, 2 * module.samples_per_frame), 0.05)
+        out = _silent_frame_rest_metrics(
+            params, module, target, self._cfg({_PARAM: 1.0})
+        )
+        assert out == {"eval/silent_frac": 0.0}
 
 
 class TestReversalRate:

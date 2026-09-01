@@ -530,6 +530,7 @@ async def synthesize(request: Request) -> dict:
 # dev proxy in webapp/next.config.ts points here too — keep them in sync.
 DEFAULT_PORT = 8471
 
+
 def _parse_args() -> None:
     """Turn CLI flags into the env vars the app reads.
 
