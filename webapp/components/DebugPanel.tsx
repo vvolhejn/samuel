@@ -110,12 +110,11 @@ export function DebugPanel({
           hide
         </button>
       </div>
-
-      <section>
-        <div className="mb-1">
-          <SectionTitle>checkpoint</SectionTitle>
-        </div>
-        {health ? (
+      {health && (
+        <section>
+          <div className="mb-1">
+            <SectionTitle>checkpoint</SectionTitle>
+          </div>
           <p className="font-mono break-all text-neutral-500">
             {health.checkpoint.startsWith("https://") ? (
               <a
@@ -130,10 +129,8 @@ export function DebugPanel({
               health.checkpoint
             )}
           </p>
-        ) : (
-          <p className="text-neutral-400">backend unreachable</p>
-        )}
-      </section>
+        </section>
+      )}
 
       <section>
         <div className="mb-1">

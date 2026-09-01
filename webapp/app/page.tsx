@@ -90,7 +90,9 @@ export default function Home() {
    * a new action has to stop, what the mic may do, and what the UI dims. */
   const [owner, ownerRef, setOwner] = useMirroredState<Owner>("none");
   const [error, setError] = useState<string | null>(null);
-  /** null until /api/health answers (or if the backend is down). */
+  /** null until the first mic start asks the backend. The page never contacts
+   * it on load: waking the container costs memory for as long as it stays
+   * awake, and the clips are answered from the committed responses. */
   const [health, setHealth] = useState<HealthResponse | null>(null);
   /** The model's last answer. `lastResponse` is the copy the callbacks read;
    * refs must not be read in render, so the state is what the panel shows. */
@@ -149,6 +151,7 @@ export default function Home() {
   const {
     micOn,
     micOnRef,
+    starting: micStarting,
     heard,
     levelStore,
     micProcessing,
@@ -166,7 +169,7 @@ export default function Home() {
           "Model backend unreachable — run: uv run --extra server python -m samuel.server --no-frontend",
         );
       }
-      setHealth(current); // also picks up a checkpoint swap since page load
+      setHealth(current);
       await trombone.resume(); // we're in a user gesture
     },
     isBusy,
@@ -189,11 +192,6 @@ export default function Home() {
       });
     }
   }, [trombone]);
-
-  // Which checkpoint the backend is serving (shown under the title).
-  useEffect(() => {
-    void fetchHealth().then(setHealth);
-  }, []);
 
   // The pre-recorded clips, one button each, and the answers committed for them.
   useEffect(() => {
@@ -731,7 +729,7 @@ export default function Home() {
                 and to be done, so it stays in one place and says which. */}
             <button
               onClick={toggleMic}
-              disabled={insecure !== null}
+              disabled={insecure !== null || micStarting}
               title={insecure ? "Unavailable on an insecure origin" : undefined}
               /* Fixed width so the two labels don't resize it, and outlined
                  while recording: the filled pill is an invitation, and there is
@@ -743,7 +741,7 @@ export default function Home() {
                   : "border-transparent bg-highlight-600 font-semibold text-white hover:bg-highlight-700 disabled:opacity-40 disabled:hover:bg-highlight-600"
               }`}
             >
-              {micOn ? "Stop" : "Microphone"}
+              {micStarting ? "Starting…" : micOn ? "Stop" : "Microphone"}
             </button>
 
             {/* Both faces share one grid cell, so the column is always as tall

@@ -47,13 +47,13 @@ snapshot_download(sys.argv[1], revision=sys.argv[2], local_dir='/app/model')" \
 # (Path(__file__).parents[2]) resolves to /app.
 COPY src/ /app/src/
 
-# Match instance_type in webapp/wrangler.jsonc (standard-3 = 2 vCPU). A
-# container sees the *host's* core count, not its CPU quota, so torch and numba
-# would otherwise start one thread per host core and thrash: on a 128-core host
+# Match the vcpu of instance_type in webapp/wrangler.jsonc. A container sees
+# the *host's* core count, not its CPU quota, so torch and numba would
+# otherwise start one thread per host core and thrash: on a 128-core host
 # capped at 2 CPUs, a 5 s utterance went from 0.9 s to over 2 minutes.
-ENV OMP_NUM_THREADS=2 \
-    MKL_NUM_THREADS=2 \
-    NUMBA_NUM_THREADS=2
+ENV OMP_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    NUMBA_NUM_THREADS=1
 
 # No SAMUEL_ALLOW_ORIGINS: the Worker serves the frontend from this same
 # origin, so /api/* is never a cross-origin request.
