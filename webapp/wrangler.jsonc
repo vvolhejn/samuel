@@ -31,7 +31,7 @@
       // would be silently ignored.
       "image_vars": {
         "MODEL_REPO": "vvolhejn/samuel",
-        "MODEL_REVISION": "d6b5c34d39bbffb1e7faa4ea7bc7518c0297f813"
+        "MODEL_REVISION": "cfd4ba3b0ea411d40f404d226022bc70f9e06139"
       },
       // Sized from the measured peak: 2.14 GB memory, 1.62 GB disk. Memory and
       // disk are billed on what is *provisioned*, so the headroom above was

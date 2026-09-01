@@ -33,6 +33,13 @@ cluster. On the cluster:
 deploy/stage-model.sh <run-dir>          # strips last.pt 42 MB -> 14 MB
 ```
 
+The staged `config.json` is the run's config, copied verbatim. If the run comes
+from a branch that adds a config field, the current `main` rejects that field
+and the container fails at startup. Delete the extra field from
+`deploy/model/config.json` before you upload. The server reads only the `model`
+block, so a field outside it is harmless. One known case: runs with an f0 head
+carry `model.f0`, which `PinkTromboneControllerConfig` forbids.
+
 Then, from a machine that has a Hub write token:
 
 ```bash

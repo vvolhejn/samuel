@@ -5,8 +5,8 @@
 Records your voice in the browser (press Microphone, press Stop; Silero VAD
 only trims the recording to the speech in it), sends the audio to a Python
 backend running the trained controller
-(`onset-off_20260527-193518` / wandb `i30dfe0t`), and plays the predicted
-parameter trajectories through the vendored Pink Trombone synth — the tract
+(`la0-ft-smooth-gumbel_20260831-121718` / wandb `3yval67z`), and plays the
+predicted parameter trajectories through the vendored Pink Trombone synth — the tract
 visualization animates along.
 
 ## Run
