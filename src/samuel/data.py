@@ -118,7 +118,7 @@ def fill_unvoiced_causal(
 # Sources whose caches are computed causally: unvoiced gaps are filled with
 # fill_unvoiced_causal over the whole file at load time (so the fill can hold
 # values across chunk boundaries without ever reading ahead).
-CAUSAL_PITCH_SOURCES = frozenset({"yin", "pesto"})
+CAUSAL_PITCH_SOURCES = frozenset({"yin"})
 
 
 def _fill_chunk(f0: np.ndarray, voiced: np.ndarray, cache: "PitchCache") -> np.ndarray:

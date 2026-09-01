@@ -30,13 +30,10 @@ class DataConfig(BaseModel):
     chunk_seconds: float = 4.0
     num_workers: int = 4
     pitch_cache_path: Path | None = None
-    # Which detector produced the pitch cache; validated against the cache's
-    # own metadata at load. "pyin" is Viterbi-smoothed and non-causal; "yin"
-    # and "pesto" caches are computed causally (see scripts/precompute_pitch*)
-    # so the same f0 track is reproducible by a streaming detector at
-    # inference, and unvoiced gaps are filled causally (hold-last) rather than
-    # by interpolation.
-    pitch_source: Literal["pyin", "yin", "pesto"] = "pyin"
+    # Which detector produced the pitch cache.
+    # "pyin" or "yin". "pyin" is mostly more accurate but non-causal,
+    # meaning it cannot be used for streaming
+    pitch_source: Literal["pyin", "yin"] = "pyin"
     # Every clip is RMS-normalised to this level
     target_rms: float = 0.05
     # Fraction of the manifest reserved as the held-out validation split.
@@ -115,9 +112,8 @@ class RunConfig(BaseModel):
     runs_root: Path = Path("runs")
     name: str
     seed: int = 0
-    # Initialise model weights from this checkpoint (fine-tune): loads the
-    # model state dict only; optimizer, step counter, and data order start
-    # fresh.
+    # Initialise model weights from this checkpoint (fine-tune). Only loads the model
+    # state dict; optimizer, step counter, and data order start fresh.
     init_ckpt: Path | None = None
 
     @field_validator("runs_root")

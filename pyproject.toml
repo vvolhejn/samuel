@@ -18,13 +18,11 @@ dependencies = [
     "julius>=0.2.8",
     "librosa>=0.11.0",
     "numpy>=2.4.4",
-    "pesto-pitch",
     "plotly>=6.7.0",
     "pydantic>=2.0",
     "scipy>=1.17.1",
     "soundfile>=0.12",
     "torch==2.8.*",
-    "torchaudio==2.8.0",
     "tqdm>=4.67.3",
     "transformers>=5.14.1",
     "wandb>=0.18",
@@ -55,13 +53,4 @@ dev = [
 [tool.uv.workspace]
 members = [
     "foo/foop",
-    "third_party/pesto",
 ]
-
-[tool.uv.sources]
-pesto-pitch = { workspace = true }
-
-[tool.ruff]
-# Vendored upstream code is kept byte-identical to its source.
-extend-exclude = ["third_party"]
-force-exclude = true
