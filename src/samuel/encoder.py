@@ -22,7 +22,9 @@ class SEANetEncoderConfig(BaseModel):
     dimension: int = 128
     n_filters: int = 32
     n_residual_layers: int = 3
-    ratios: list[int] = Field(default_factory=lambda: [8, 5, 4, 2])
+    # These ratios should multiply to 512 = samples_per_frame, so that we can avoid
+    # resampling the latents
+    ratios: list[int] = Field(default_factory=lambda: [8, 4, 4, 4])
     kernel_size: int = 7
     last_kernel_size: int = 7
     residual_kernel_size: int = 3

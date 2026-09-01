@@ -30,6 +30,10 @@ class DataConfig(BaseModel):
     chunk_seconds: float = 4.0
     num_workers: int = 4
     pitch_cache_path: Path | None = None
+    # Which detector produced the pitch cache.
+    # "pyin" or "yin". "pyin" is mostly more accurate but non-causal,
+    # meaning it cannot be used for streaming
+    pitch_source: Literal["pyin", "yin"] = "pyin"
     # Every clip is RMS-normalised to this level
     target_rms: float = 0.05
     # Fraction of the manifest reserved as the held-out validation split.
@@ -108,6 +112,9 @@ class RunConfig(BaseModel):
     runs_root: Path = Path("runs")
     name: str
     seed: int = 0
+    # Initialise model weights from this checkpoint (fine-tune). Only loads the model
+    # state dict; optimizer, step counter, and data order start fresh.
+    init_ckpt: Path | None = None
 
     @field_validator("runs_root")
     @classmethod
@@ -144,6 +151,9 @@ class LossConfig(BaseModel):
     # param rescaled to [0, 1]. Contribution to the training loss:
     #   smooth * sum_p smooth_weights[p] * mean_{batch,time} |Δp_norm|
     smooth: float = 0.3
+    # Ramp the smooth/accel/rest weights linearly from 0 to their full values
+    # over this many steps. 0 applies them at full strength from step 0.
+    reg_ramp_steps: int = 0
     smooth_weights: dict[str, float] = Field(
         default_factory=lambda: {
             "tongueIndex": 1.0,
