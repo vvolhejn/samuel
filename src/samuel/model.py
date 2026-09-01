@@ -78,18 +78,13 @@ class PinkTromboneControllerConfig(BaseModel):
     # is the soft distribution and the synth sees a smooth expectation between
     # bucket centers.
     gumbel_hard: bool = False
-    # "gumbel": categorical head over bucket centers, Gumbel-softmax sampled
-    # during training. "direct": one scalar per parameter, squashed into
-    # [lo, hi] by a scaled tanh; deterministic, ignores tau, and the entropy
-    # penalty and bucket diagnostics do not apply. The f0 head (if enabled)
-    # keeps its categorical form either way.
+    # gumbel: Categorical head over bucket centers.
+    # direct: One scalar per parameter squashed into its range by a scaled tanh.
+    #   Ignores n_buckets, gumbel_hard, tau, and the entropy penalty.
     head_type: Literal["gumbel", "direct"] = "gumbel"
-    # Control frames of future input the model may use. Control frame ``t`` is
-    # read off encoder frame ``t + lookahead_frames``, so it sees samples up to
-    # ``(t + 1 + lookahead_frames) * samples_per_frame``. Synthesis needs one
-    # frame beyond that anyway -- the glottis ramps frame ``t`` toward frame
-    # ``t + 1`` (see pink_trombone._upsample_params) -- so total algorithmic
-    # delay is ``lookahead_frames + 1`` frames, 11.6 ms at the default 0.
+    # Increase to delay the controller prediction, by this many frames, so that
+    # it sees future audio and can make more accurate predictions.
+    # At lookahead_frames=0, the delay is one frame (11.6 ms when samples_per_frame=512).
     lookahead_frames: int = 0
 
     @property
