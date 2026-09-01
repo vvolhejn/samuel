@@ -4,7 +4,7 @@ model:
     dimension: 128
     n_filters: 32
     n_residual_layers: 3
-    # prod = 512 = samples_per_frame, so no latent resampling is needed
+    # These ratios should multiply to 512 = samples_per_frame, so no latent resampling is needed
     ratios: [8, 4, 4, 4]
     kernel_size: 7
     last_kernel_size: 7
