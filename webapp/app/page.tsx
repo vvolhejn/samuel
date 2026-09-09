@@ -20,6 +20,7 @@ import {
   SynthResponse,
 } from "@/lib/audio";
 import { insecureContextMessage } from "@/lib/secureContext";
+import { setAudioSessionType } from "@/lib/audioSession";
 import { downloadBlob, makeZip } from "@/lib/zip";
 import { usePinkTrombone } from "@/lib/usePinkTrombone";
 import { useOriginalAudio } from "@/lib/useOriginalAudio";
@@ -192,6 +193,9 @@ export default function Home() {
       });
     }
   }, [trombone]);
+
+  // Otherwise the mute switch silences the synth — see lib/audioSession.ts.
+  useEffect(() => setAudioSessionType("playback"), []);
 
   // The pre-recorded clips, one button each, and the answers committed for them.
   useEffect(() => {

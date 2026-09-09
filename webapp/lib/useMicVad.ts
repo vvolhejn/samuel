@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { MicVAD } from "@ricky0123/vad-web";
 import { levelToSlots, makeLevelStore } from "@/lib/levelStore";
 import { micErrorMessage } from "@/lib/secureContext";
+import { setAudioSessionType } from "@/lib/audioSession";
 import { MicProcessing, MIC_PROCESSING_DEFAULTS } from "@/lib/micProcessing";
 import { useMirroredState } from "@/lib/useMirroredState";
 
@@ -163,6 +164,7 @@ export function useMicVad({
       const frames = framesRef.current;
       framesRef.current = [];
       await vadRef.current?.pause();
+      setAudioSessionType("playback");
       if (submit) {
         const audio = trimToSpeech(frames);
         if (audio) optionsRef.current.onUtterance(audio);
@@ -190,10 +192,14 @@ export function useMicVad({
         // processing flags on; ours re-read the ref, and since pause() stops
         // the tracks and start() re-acquires, a toggle lands on the next
         // listening cycle without rebuilding the VAD.
-        const getStream = () =>
-          navigator.mediaDevices.getUserMedia({
+        const getStream = () => {
+          // Immediately before the call, not merely somewhere upstream of it:
+          // Safari rejects capture outright while the category is "playback".
+          setAudioSessionType("play-and-record");
+          return navigator.mediaDevices.getUserMedia({
             audio: { channelCount: 1, ...micProcessingRef.current },
           });
+        };
         // No onSpeechStart/onSpeechEnd: the VAD's own segmenting decides
         // nothing here, and the audio we send is the one we assemble below.
         vadRef.current = await MicVAD.new({
@@ -286,7 +292,12 @@ export function useMicVad({
 
   /** Stop listening without touching the user's intent, for whatever is about
    * to make sound. `restoreMic` is what undoes it. */
-  const pauseMic = useCallback(() => vadRef.current?.pause(), []);
+  const pauseMic = useCallback(async () => {
+    await vadRef.current?.pause();
+    // Only once the tracks are gone: with one open, Safari keeps the output on
+    // the earpiece whatever we ask for.
+    setAudioSessionType("playback");
+  }, []);
 
   return {
     micOn,
