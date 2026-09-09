@@ -29,14 +29,14 @@ DEFAULT_CLIP = REPO_ROOT / "webapp" / "public" / "clips" / "clip-21b.mp3"
 DEFAULT_OUT = REPO_ROOT / "iclc" / "iclc-2027-paper" / "images" / "clip-21b-params.png"
 # Read row by row: each index/diameter pair sits side by side in one row.
 PLOT_ORDER = [
-    "frequency",
-    "voiceness",
-    "intensity",
-    "lipDiameter",
-    "tongueIndex",
-    "tongueDiameter",
-    "constrictionIndex",
     "constrictionDiameter",
+    "constrictionIndex",
+    "tongueDiameter",
+    "tongueIndex",
+    "lipDiameter",
+    "intensity",
+    "voiceness",
+    "frequency",
 ]
 COLUMNS = 4
 ROW_HEIGHT = 210

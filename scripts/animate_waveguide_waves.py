@@ -18,8 +18,8 @@ section per frame.
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -28,21 +28,38 @@ import plotly.io as pio
 import torch
 from plotly.subplots import make_subplots
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+from samuel import pink_trombone as pt
 
-from plot_waveguide_waves import (  # noqa: E402
-    LEFT_COLOR,
-    RIGHT_COLOR,
-    load_params,
-    pick_frame,
-)
-from samuel import pink_trombone as pt  # noqa: E402
+REPO_ROOT = Path(__file__).resolve().parents[1]
+CLIPS_DIR = REPO_ROOT / "webapp" / "public" / "clips" / "precomputed"
 
+RIGHT_COLOR = "#d62728"
+LEFT_COLOR = "#1f77b4"
 LIPS_COLOR = "#444444"
 STEP_RATE = 2 * pt.SAMPLE_RATE
 STRIDE = 1
-WIDTH = 1600
-HEIGHT = 520
+# Half the canvas of the rendered image, so every label comes out twice as
+# large next to the plot. SCALE brings the pixel size back up.
+WIDTH = 800
+HEIGHT = 260
+SCALE = 2
+
+
+def load_params(clip: str) -> tuple[torch.Tensor, float, np.ndarray]:
+    """Read one precomputed clip into a [1, T, 12] tensor."""
+    data = json.loads((CLIPS_DIR / f"{clip}.json").read_text())
+    params = data["params"]
+    columns = [params[name] for name in pt.PARAM_NAMES]
+    tensor = torch.tensor(columns, dtype=torch.float32).T.unsqueeze(0)
+    return tensor, float(data["frame_rate"]), np.array(data["voiced"], dtype=bool)
+
+
+def pick_frame(voiced: np.ndarray, intensity: np.ndarray) -> int:
+    """Frame in the middle of the clip that is voiced and loud."""
+    score = voiced.astype(np.float32) * intensity
+    center = len(score) / 2
+    weight = np.exp(-(((np.arange(len(score)) - center) / (0.15 * len(score))) ** 2))
+    return int(np.argmax(score * weight))
 
 
 def record_impulse_response(
@@ -276,7 +293,7 @@ def main() -> None:
     pio.write_images(
         figures,
         [frame_dir / f"{j:04d}.png" for j in range(len(shown))],
-        scale=1,
+        scale=SCALE,
         width=WIDTH,
         height=HEIGHT,
     )
