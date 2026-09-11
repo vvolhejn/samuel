@@ -112,6 +112,7 @@ class SamuelCodec(LatentCodec):
         pitch_workers: int | None = None,
         ir_length: int | None = None,
         target_rms: float | None = None,
+        encode_batch_size: int = 8,
     ):
         super().__init__()
         if stack < 1:
@@ -137,6 +138,9 @@ class SamuelCodec(LatentCodec):
         )
         self.f0_ref = f0_ref or math.sqrt(PYIN_FMIN * PYIN_FMAX)
         self.pitch_workers = pitch_workers or max(1, len(os.sched_getaffinity(0)) - 2)
+        # The controller's activations on 44.1 kHz audio grow with the batch
+        # (64 x 20 s peaked at ~40 GiB), so rows go through it in chunks.
+        self.encode_batch_size = encode_batch_size
         self._pool: Pool | None = None
 
         self.trainable_names = cfg.trainable_names()
@@ -199,7 +203,15 @@ class SamuelCodec(LatentCodec):
 
         n_frames = self.controller.t_ctrl_for(S)
         f0 = self._f0(wav, lengths, n_frames)
-        params = self.controller(wav[:, None], f0)  # [B, T, N_PARAMS]
+        params = torch.cat(
+            [
+                self.controller(
+                    wav[i : i + self.encode_batch_size, None],
+                    f0[i : i + self.encode_batch_size],
+                )
+                for i in range(0, wav.shape[0], self.encode_batch_size)
+            ]
+        )  # [B, T, N_PARAMS]
         scaled = (params[..., self.trainable_idx] - self.lo) / (
             self.hi - self.lo
         ) * 2 - 1
