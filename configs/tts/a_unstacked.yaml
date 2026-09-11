@@ -31,9 +31,9 @@ optim:
   warmup_steps: 1000
 
 run_dir: runs/tts/a_unstacked
-batch_size: 64
-grad_accum_steps: 1
-max_steps: 100000
+batch_size: 16
+grad_accum_steps: 4
+max_steps: 50000
 stats_ema_steps: 1000
 ema_decay: 0.999
 log_freq: 50

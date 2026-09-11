@@ -8,11 +8,11 @@ codec:
   type: samuel.tts.codec:SamuelCodec
   kwargs:
     checkpoint: hf:vvolhejn/samuel
-    stack: 1
+    stack: 8
 
 data:
-  train_jsonl: data/tts/hifitts2_200h/train_aligned.jsonl
-  valid_jsonl: data/tts/hifitts2_200h/eval_aligned.jsonl
+  train_jsonl: data/tts/hifitts2_tiny_long_s8/train_aligned.jsonl
+  valid_jsonl: ""
   max_duration_sec: 30.0
   max_voice_prompt_sec: 5.0
 
@@ -30,13 +30,13 @@ optim:
   schedule: cosine
   warmup_steps: 1000
 
-run_dir: runs/tts/base
+run_dir: runs/tts/bench_b
 batch_size: 64
 grad_accum_steps: 1
-max_steps: 50000
-stats_ema_steps: 1000
+max_steps: 40
+stats_ema_steps: 5
 ema_decay: 0.999
-log_freq: 50
+log_freq: 10
 valid_freq: 2500
 # Validation encodes audio on the fly (pyin on CPU), so keep it short.
 num_valid_batches: 6
@@ -44,3 +44,4 @@ ckpt_freq: 2500
 num_ckpt_keep: 3
 sample_freq: 2500
 sample_cfg_coef: 2.0
+sample_sentences: []

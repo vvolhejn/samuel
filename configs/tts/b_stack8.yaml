@@ -33,7 +33,7 @@ optim:
 run_dir: runs/tts/b_stack8
 batch_size: 64
 grad_accum_steps: 1
-max_steps: 100000
+max_steps: 50000
 stats_ema_steps: 1000
 ema_decay: 0.999
 log_freq: 50
