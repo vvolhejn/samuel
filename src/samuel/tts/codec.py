@@ -13,8 +13,8 @@ import json
 import math
 import os
 import re
-from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import get_context
+from multiprocessing.pool import Pool
 from pathlib import Path
 
 import numpy as np
@@ -137,7 +137,7 @@ class SamuelCodec(LatentCodec):
         )
         self.f0_ref = f0_ref or math.sqrt(PYIN_FMIN * PYIN_FMAX)
         self.pitch_workers = pitch_workers or max(1, len(os.sched_getaffinity(0)) - 2)
-        self._pool: ProcessPoolExecutor | None = None
+        self._pool: Pool | None = None
 
         self.trainable_names = cfg.trainable_names()
         self.n_trainable = len(self.trainable_names)
@@ -159,11 +159,11 @@ class SamuelCodec(LatentCodec):
 
     # -- pitch ------------------------------------------------------------
 
-    def _pitch_pool(self) -> ProcessPoolExecutor:
+    def _pitch_pool(self) -> Pool:
+        # multiprocessing.Pool workers are daemonic, so they die with the
+        # interpreter; ProcessPoolExecutor workers kept finished runs alive.
         if self._pool is None:
-            self._pool = ProcessPoolExecutor(
-                max_workers=self.pitch_workers, mp_context=get_context("spawn")
-            )
+            self._pool = get_context("spawn").Pool(processes=self.pitch_workers)
         return self._pool
 
     def _f0(self, wav: Tensor, lengths: Tensor, n_frames: int) -> Tensor:
@@ -176,7 +176,7 @@ class SamuelCodec(LatentCodec):
         if len(jobs) == 1:
             tracks = [_pyin_job(jobs[0])]
         else:
-            tracks = list(self._pitch_pool().map(_pyin_job, jobs))
+            tracks = self._pitch_pool().map(_pyin_job, jobs)
         return torch.from_numpy(np.stack(tracks)).to(wav.device)
 
     # -- codec interface --------------------------------------------------
