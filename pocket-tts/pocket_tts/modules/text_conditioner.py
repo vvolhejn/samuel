@@ -1,0 +1,74 @@
+import logging
+
+import sentencepiece
+import torch
+from torch import nn
+
+from pocket_tts.utils.utils import download_if_necessary
+
+logger = logging.getLogger(__name__)
+
+
+class SentencePieceTokenizer:
+    """This tokenizer should be used for natural language descriptions.
+    For example:
+    ["he didn't, know he's going home.", 'shorter sentence'] =>
+    [[78, 62, 31,  4, 78, 25, 19, 34],
+    [59, 77, PAD, PAD, PAD, PAD, PAD, PAD]]
+
+    Args:
+        n_bins (int): should be equal to the number of elements in the sentencepiece tokenizer.
+        tokenizer_path (str): path to the sentencepiece tokenizer model.
+
+    """
+
+    def __init__(self, nbins: int, tokenizer_path: str):
+        logger.info("Loading sentencepiece tokenizer from %s", tokenizer_path)
+        local_path = download_if_necessary(tokenizer_path)
+        self.sp = sentencepiece.SentencePieceProcessor(str(local_path))
+        assert nbins == self.sp.vocab_size(), (
+            f"sentencepiece tokenizer has vocab size={self.sp.vocab_size()} but nbins={nbins} was specified"
+        )
+
+    def __call__(self, text: str) -> torch.Tensor:
+        return torch.tensor(self.sp.encode(text, out_type=int))[None, :]
+
+
+DEFAULT_TOKENIZER_N_BINS = 4000
+DEFAULT_TOKENIZER_PATH = (
+    "hf://kyutai/pocket-tts-without-voice-cloning/"
+    "tokenizer.model@d4fdd22ae8c8e1cb3634e150ebeff1dab2d16df3"
+)
+
+
+def get_default_tokenizer() -> SentencePieceTokenizer:
+    """Return a SentencePieceTokenizer with the default model path and vocab size.
+
+    Downloads the tokenizer model from HuggingFace on first use.
+    """
+    return SentencePieceTokenizer(DEFAULT_TOKENIZER_N_BINS, DEFAULT_TOKENIZER_PATH)
+
+
+class LUTConditioner(nn.Module):
+    """Lookup table TextConditioner.
+
+    Args:
+        n_bins (int): Number of bins.
+        dim (int): Hidden dim of the model (text-encoder/LUT).
+        output_dim (int): Output dim of the conditioner.
+        tokenizer (str): Name of the tokenizer.
+        possible_values (list[str] or None): list of possible values for the tokenizer.
+    """
+
+    def __init__(self, n_bins: int, tokenizer_path: str, dim: int, output_dim: int):
+        super().__init__()
+        self.dim = dim
+        self.output_dim = output_dim
+        self.tokenizer = SentencePieceTokenizer(n_bins, tokenizer_path)
+        self.embed = nn.Embedding(n_bins + 1, self.dim)  # n_bins + 1 for padding.
+
+    def prepare(self, x: str) -> torch.Tensor:
+        return self.tokenizer(x).to(self.embed.weight.device)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        return self.embed(tokens)
