@@ -26,6 +26,7 @@ dependencies = [
     "soundfile>=0.12",
     "sphn>=0.2.1",
     "torch==2.8.*",
+    "torchaudio==2.8.*",
     "tqdm>=4.67.3",
     "transformers>=5.14.1",
     "wandb>=0.18",
