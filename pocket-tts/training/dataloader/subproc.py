@@ -6,10 +6,14 @@ prompt (a random window elsewhere in the same file). Lines are sharded across
 ranks by line index.
 """
 
+import atexit
 import logging
 import multiprocessing.queues
+import os
 import queue
+import signal
 from collections.abc import Iterator
+from multiprocessing import resource_tracker
 from typing import Any
 
 import sentencepiece
@@ -26,12 +30,34 @@ def _feed_queue(
     sentence_piece_proto: bytes,
     loader_kwargs: dict[str, Any],
 ):
+    # torch_shm_manager (started by the file_system strategy) would otherwise
+    # inherit the resource tracker's pipe and outlive this process, and the
+    # main process then hangs at exit waiting for the tracker to see EOF.
+    tracker_fd = resource_tracker._resource_tracker._fd
+    if tracker_fd is not None:
+        os.set_inheritable(tracker_fd, False)
     torch_mp.set_sharing_strategy("file_system")
     sentence_piece = sentencepiece.SentencePieceProcessor()
     sentence_piece.load_from_serialized_proto(sentence_piece_proto)
     loader = DataLoader(tokenize=sentence_piece.encode, **loader_kwargs)
     for batch in loader:
         q.put(batch)
+
+
+def _child_pids(pid: int) -> list[int]:
+    """Direct children of `pid` (Linux /proc scan)."""
+    kids = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as f:
+                fields = f.read().rsplit(")", 1)[1].split()
+        except OSError:
+            continue
+        if int(fields[1]) == pid:
+            kids.append(int(entry))
+    return kids
 
 
 class SubprocessDataLoader:
@@ -77,6 +103,25 @@ class SubprocessDataLoader:
             )
             proc.start()
             self._procs.append(proc)
+        atexit.register(self.shutdown)
+
+    def shutdown(self):
+        """Stop the loader processes and the torch_shm_manager each one started.
+
+        The managers are grandchildren; a terminated loader leaves its manager
+        orphaned, so they are collected before the loader goes.
+        """
+        for proc in self._procs:
+            if proc.pid is None:
+                continue
+            helpers = _child_pids(proc.pid)
+            if proc.is_alive():
+                proc.terminate()
+            for pid in helpers:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
 
     def _check_procs(self):
         dead = [p for p in self._procs if not p.is_alive()]
