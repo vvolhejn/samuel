@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 
 import sphn
 import torch
@@ -72,13 +73,15 @@ def main() -> None:
     )
     if args.params:
         params = codec.latents_to_params(latents[None])[0].cpu()  # ty: ignore[unresolved-attribute]
-        json.dump(
-            {
-                "frame_rate": codec.sample_rate / codec.samples_per_frame,
-                "names": PARAM_NAMES,
-                "params": params.tolist(),
-            },  # ty: ignore[unresolved-attribute]
-            open(args.params, "w"),
+        control_rate = codec.sample_rate / codec.samples_per_frame  # ty: ignore[unresolved-attribute]
+        Path(args.params).write_text(
+            json.dumps(
+                {
+                    "frame_rate": control_rate,
+                    "names": PARAM_NAMES,
+                    "params": params.tolist(),
+                }
+            )
         )
 
 
