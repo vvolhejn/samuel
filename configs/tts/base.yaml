@@ -1,0 +1,46 @@
+# Shared settings of the Samuel-codec TTS runs; the per-run configs in this
+# directory are copies with codec.kwargs / run_dir changed (training.args has
+# no include mechanism).
+model_config: configs/tts/samuel_model.yaml
+start_from_pretrained: false
+
+codec:
+  type: samuel.tts.codec:SamuelCodec
+  kwargs:
+    checkpoint: hf:vvolhejn/samuel
+    stack: 1
+
+data:
+  train_jsonl: data/tts/hifitts2_200h/train_aligned.jsonl
+  valid_jsonl: data/tts/hifitts2_200h/eval_aligned.jsonl
+  max_duration_sec: 30.0
+  max_voice_prompt_sec: 5.0
+
+flow:
+  type: lsd
+  kwargs: {}
+
+flow_batch_multiplier: 4
+eos_loss_weight: 0.1
+text_dropout: 0.2
+voice_dropout: 0.2
+
+optim:
+  lr: 2e-4
+  schedule: cosine
+  warmup_steps: 1000
+
+run_dir: runs/tts/base
+batch_size: 64
+grad_accum_steps: 1
+max_steps: 100000
+stats_ema_steps: 1000
+ema_decay: 0.999
+log_freq: 50
+valid_freq: 2500
+# Validation encodes audio on the fly (pyin on CPU), so keep it short.
+num_valid_batches: 6
+ckpt_freq: 2500
+num_ckpt_keep: 3
+sample_freq: 2500
+sample_cfg_coef: 2.0

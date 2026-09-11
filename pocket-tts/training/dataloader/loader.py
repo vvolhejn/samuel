@@ -75,8 +75,9 @@ class DataLoader:
         self.rng = random.Random(seed)
         self.frame_size = int(sample_rate / frame_rate)
         meta_path = Path(jsonl).with_suffix(".meta.json")
+        self.latent_mode = meta_path.exists()
         self.stitch_frames = 0
-        if meta_path.exists():
+        if self.latent_mode:
             meta = json.loads(meta_path.read_text())
             self.stitch_frames = int(meta["stitch_frames"])
             self.latents_root = Path(jsonl).parent
@@ -217,19 +218,22 @@ class DataLoader:
 
     def _sample_latent(self, entry: Entry) -> tuple[Any, ...]:
         """(stitch wav, tokens, prompt latents, tail latents, target frames)."""
-        assert self.stitch_frames > 0, f"{entry.path}: latents entry but no meta file loaded"
+        assert self.latent_mode, f"{entry.path}: latents entry but no meta file loaded"
         assert entry.latents_file is not None, f"{entry.path}: not a latents entry"
         lat = self._load_latents(entry.latents_file)
         cut_frames, text = self._latent_cut(entry, lat.shape[0])
         tokens = torch.tensor(self.tokenize(text), dtype=torch.long)
         target_frames = self._latent_target_frames(entry, cut_frames, lat.shape[0])
         stitch_frames = min(self.stitch_frames, target_frames)
-        stitch = audio._load_window(
-            entry.path,
-            entry.start + cut_frames / self.frame_rate,
-            stitch_frames / self.frame_rate,
-            self.sample_rate,
-        )
+        if stitch_frames > 0:
+            stitch = audio._load_window(
+                entry.path,
+                entry.start + cut_frames / self.frame_rate,
+                stitch_frames / self.frame_rate,
+                self.sample_rate,
+            )
+        else:
+            stitch = np.zeros(0, dtype=np.float32)
         tail = lat[cut_frames + stitch_frames : cut_frames + target_frames]
         return stitch, tokens, self._latent_prompt(lat, cut_frames), tail, target_frames
 
@@ -318,7 +322,7 @@ class DataLoader:
                     continue
                 batch, samples = samples[: self.batch_size], samples[self.batch_size :]
                 yielded += 1
-                if self.stitch_frames:
+                if self.latent_mode:
                     yield self._collate_latent(batch)
                     continue
                 wavs, tokens, prompts, prompt_lens = zip(*batch, strict=True)

@@ -42,6 +42,15 @@ class FlowArgs:
 
 
 @dataclass
+class CodecArgs:
+    # "mimi" (the released codec, built from model_config's mimi section and
+    # weights_path), or the import path of a training.codec.LatentCodec
+    # subclass ("package.module:ClassName"), constructed with kwargs.
+    type: str = "mimi"
+    kwargs: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class OptimArgs:
     lr: float = 2e-4
     weight_decay: float = 0.1
@@ -61,10 +70,12 @@ class TrainArgs:
     data: DataArgs = field(default_factory=DataArgs)
     flow: FlowArgs = field(default_factory=FlowArgs)
     optim: OptimArgs = field(default_factory=OptimArgs)
+    codec: CodecArgs = field(default_factory=CodecArgs)
 
     # A pocket-tts model config (e.g. pocket_tts/config/english.yaml or a local
     # variant). Defines the FlowLM/Mimi architecture, the tokenizer, and the
     # weights used for Mimi (and for the FlowLM too when start_from_pretrained).
+    # With a non-Mimi codec the mimi section and weights_path may be omitted.
     model_config: str = ""
     # Dotted-path edits applied to model_config before it is validated, e.g.
     # {"flow_lm.transformer.num_layers": 24} to train the 24-layer teacher from
@@ -117,6 +128,7 @@ class TrainArgs:
     )
     sample_freq: int = 10000
     sample_temp: float = 0.3
+    sample_max_sec: float = 30.0
     sample_cfg_coef: float = 1.0
     ckpt_freq: int = 2000
     num_ckpt_keep: int = 3
@@ -166,7 +178,7 @@ class TrainArgs:
 
 
 def _from_dict(cls: type[T], data: dict[str, Any]) -> T:
-    sub = {"data": DataArgs, "flow": FlowArgs, "optim": OptimArgs}
+    sub = {"data": DataArgs, "flow": FlowArgs, "optim": OptimArgs, "codec": CodecArgs}
     kwargs = {}
     fields = {f.name: f for f in dataclasses.fields(cls)}
     for key, value in data.items():

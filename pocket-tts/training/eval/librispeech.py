@@ -34,10 +34,9 @@ import sphn
 import torch
 from pydantic import BaseModel
 
-from pocket_tts.models.mimi import MimiModel
-from pocket_tts.modules.stateful_module import init_states
 from training.args import load_args
 from training.checkpointing import EMA, latest_checkpoint, load_checkpoint
+from training.codec import LatentCodec
 from training.modules.builders import build_models
 from training.modules.model import TrainableTTS
 
@@ -189,16 +188,13 @@ def build_transcriber(
     return transcribe
 
 
-MIN_FRAMES = 8
-
-
 def load_run(
     run_dir: str | Path,
     device: torch.device,
     use_ema: bool = False,
     checkpoint: str | Path | None = None,
-) -> tuple[TrainableTTS, MimiModel, int]:
-    """(model, mimi, step) from a run dir, weights on `device`, in eval mode."""
+) -> tuple[TrainableTTS, LatentCodec, int]:
+    """(model, codec, step) from a run dir, weights on `device`, in eval mode."""
     run_dir = Path(run_dir)
     args = load_args(run_dir / "args.yaml")
     # Inference never needs the distillation teacher: it only shapes the training
@@ -206,7 +202,7 @@ def load_run(
     # Building it would require the teacher checkpoint to still sit at the
     # relative path recorded at training time.
     args.distill_cfg_coef = 0.0
-    model, mimi, _ = build_models(args)
+    model, codec, _ = build_models(args)
     ckpt = Path(checkpoint) if checkpoint else latest_checkpoint(run_dir)
     assert ckpt is not None and ckpt.exists(), f"no checkpoint in {run_dir}"
     ema = EMA(model, 1.0) if use_ema else None
@@ -214,8 +210,8 @@ def load_run(
     if ema is not None:
         model.load_state_dict(ema.shadow, strict=False)
     model.to(device).eval()
-    mimi.to(device)
-    return model, mimi, step
+    codec.to(device)
+    return model, codec, step
 
 
 def load_mono(path: str, sample_rate: int) -> torch.Tensor:
@@ -228,15 +224,13 @@ def load_mono(path: str, sample_rate: int) -> torch.Tensor:
 
 
 def latents_to_wav(
-    mimi: MimiModel, latents: torch.Tensor, device: torch.device
+    codec: LatentCodec, latents: torch.Tensor, device: torch.device
 ) -> torch.Tensor | None:
     """[T, C] latents to a mono waveform; None when the generation was empty."""
-    if latents.shape[0] < MIN_FRAMES:
+    if latents.shape[0] < codec.min_decode_frames:
         return None
-    ratio = round(mimi.encoder_frame_rate / mimi.frame_rate)
-    state = init_states(mimi, 1, (latents.shape[0] + MIN_FRAMES) * ratio)
     with torch.no_grad():
-        return mimi.decode_from_latent(latents[None].to(device), state)[0, 0]
+        return codec.decode_to_audio(latents[None].to(device))[0, 0]
 
 
 def score_items(
@@ -245,7 +239,7 @@ def score_items(
     """Generate and score `items` on one device. Returns per-item records."""
     from whisper_normalizer.english import EnglishTextNormalizer
 
-    model, mimi, step = load_run(
+    model, codec, step = load_run(
         args.run_dir, device, use_ema=args.use_ema, checkpoint=args.checkpoint
     )
     # Same seed per shard => rerunning a checkpoint reproduces its numbers, so a
@@ -294,18 +288,18 @@ def score_items(
     else:
         tokenize = sp_encode
 
-    max_frames = int(args.max_sec * mimi.frame_rate)
-    min_frames = MIN_FRAMES
+    max_frames = int(args.max_sec * codec.frame_rate)
+    min_frames = codec.min_decode_frames
 
     def load_voice(path: str) -> torch.Tensor:
-        wav = load_mono(path, mimi.sample_rate)
+        wav = load_mono(path, codec.sample_rate)
         if args.voice_sec:
-            wav = wav[: int(args.voice_sec * mimi.sample_rate)]
+            wav = wav[: int(args.voice_sec * codec.sample_rate)]
         return wav
 
     def decode(latents: torch.Tensor) -> torch.Tensor:
-        wav = latents_to_wav(mimi, latents, device)
-        assert wav is not None, "generations shorter than MIN_FRAMES are skipped above"
+        wav = latents_to_wav(codec, latents, device)
+        assert wav is not None, "generations shorter than min_decode_frames are skipped above"
         return wav
 
     records = []
@@ -315,7 +309,7 @@ def score_items(
         tokens = [torch.tensor(tokenize(c["text"]), dtype=torch.long) for c in chunk]
         with torch.no_grad():
             voice_latents = [
-                mimi.encode_to_latent(load_voice(c["prompt"])[None, None].to(device))[0]
+                codec.encode_to_latent(load_voice(c["prompt"])[None, None].to(device))[0]
                 for c in chunk
             ]
             outs = model.generate(
@@ -345,11 +339,11 @@ def score_items(
                 sphn.write_wav(
                     os.path.join(args.save_audio, f"{item['idx']:04d}_{pid}.wav"),
                     audio.cpu().numpy(),
-                    int(mimi.sample_rate),
+                    int(codec.sample_rate),
                 )
             try:
                 gen16k = sphn.resample(
-                    audio.cpu().numpy(), src_sample_rate=mimi.sample_rate, dst_sample_rate=16000
+                    audio.cpu().numpy(), src_sample_rate=codec.sample_rate, dst_sample_rate=16000
                 )
             except BaseException:  # noqa: BLE001 -- sphn panics (Rust) on degenerate audio
                 records.append(
@@ -451,7 +445,7 @@ def main():
         "--save-audio",
         default=None,
         help="directory to save each generated clip as <row_index>_<prompt_id>.wav at the "
-        "native 24kHz (row-indexed so paired eval conditions align exactly)",
+        "codec's native sample rate (row-indexed so paired eval conditions align exactly)",
     )
     parser.add_argument(
         "--prompt-root",

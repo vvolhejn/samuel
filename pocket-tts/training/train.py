@@ -25,9 +25,9 @@ import torch
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from pocket_tts.models.mimi import MimiModel
 from training.args import TrainArgs, dump_args, load_args, save_args
 from training.checkpointing import EMA, latest_checkpoint, load_checkpoint, save_checkpoint
+from training.codec import LatentCodec
 from training.dataloader import DataLoader, SubprocessDataLoader, encode_batch
 from training.distributed import (
     avg_across_ranks,
@@ -62,7 +62,7 @@ class Run:
     args: TrainArgs
     model: TrainableTTS  # unwrapped, for EMA/checkpointing
     wrapped: nn.Module  # DDP-wrapped when distributed, else the model itself
-    mimi: MimiModel
+    codec: LatentCodec
     optimizer: torch.optim.Optimizer
     ema: EMA | None
     start_step: int
@@ -75,7 +75,7 @@ class Run:
 def setup(config_path: str) -> Run:
     """Resolve the config, build the models, restore any checkpoint."""
     setup_logging()
-    torch.backends.cuda.matmul.allow_tf32 = True  # fp32 islands (Mimi encode)
+    torch.backends.cuda.matmul.allow_tf32 = True  # fp32 islands (codec encode)
     # cuDNN's bf16 SDPA backward emits NaN at larger batch shapes and is not faster.
     torch.backends.cuda.enable_cudnn_sdp(False)
     args = load_args(config_path)
@@ -111,10 +111,10 @@ def setup(config_path: str) -> Run:
     if rank == 0:
         save_args(args, run_dir / "args.yaml")
 
-    model, mimi, _config = build_models(args)
+    model, codec, _config = build_models(args)
     model.to(device)
-    mimi.to(device)
-    ensure_train_latents(args, mimi, device, rank, world_size)
+    codec.to(device)
+    ensure_train_latents(args, codec, device, rank, world_size)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if rank == 0:
         logger.info(f"flow_lm + objective: {n_params / 1e6:.1f}M trainable params")
@@ -146,13 +146,13 @@ def setup(config_path: str) -> Run:
     if is_torchrun():
         wrapped = DDP(model, device_ids=[device.index], find_unused_parameters=not args.compile)
     if args.compile:
-        _compile_models(model, mimi)
+        _compile_models(model, codec)
 
     return Run(
         args=args,
         model=model,
         wrapped=wrapped,
-        mimi=mimi,
+        codec=codec,
         optimizer=optimizer,
         ema=ema,
         start_step=start_step,
@@ -166,7 +166,7 @@ def setup(config_path: str) -> Run:
 def main(config_path: str):
     run = setup(config_path)
     # Unpacked for the hot loop; the thin ones stay run.* at their call sites.
-    args, model, mimi = run.args, run.model, run.mimi
+    args, model, codec = run.args, run.model, run.codec
     optimizer, ema, device, rank = run.optimizer, run.ema, run.device, run.rank
     progress, start_step = run.progress, run.start_step
 
@@ -177,8 +177,8 @@ def main(config_path: str):
             args.data.train_jsonl,
             sentence_piece,
             args.batch_size,
-            mimi.sample_rate,
-            mimi.frame_rate,
+            codec.sample_rate,
+            codec.frame_rate,
             args.data.max_duration_sec,
             args.data.max_voice_prompt_sec,
             rank,
@@ -220,7 +220,7 @@ def main(config_path: str):
         for micro in range(args.grad_accum_steps):
             batch = next(train_loader)
             latents, mask, voice_prompt_latents, num_voice_prompt_frames = encode_batch(
-                mimi, batch, device
+                codec, batch, device
             )
             with autocast:
                 loss, metrics = run.wrapped(
@@ -257,7 +257,7 @@ def main(config_path: str):
                     f"termination signal received: checkpointing step {step + 1} before exit"
                 )
                 save_checkpoint(
-                    args.run_dir, step + 1, model, optimizer, ema, args.num_ckpt_keep, mimi
+                    args.run_dir, step + 1, model, optimizer, ema, args.num_ckpt_keep, codec
                 )
                 progress.log("checkpoint", step + 1)
             shutdown_distributed()
@@ -274,10 +274,20 @@ def main(config_path: str):
             last_log, steps_since_log = now, 0
             values = {k: v.item() for k, v in metrics.items() if v.numel() == 1}
             shown = {k: f"{v:.4f}" for k, v in values.items()}
+            mem = torch.cuda.max_memory_allocated() / 2**30 if device.type == "cuda" else 0.0
             logger.info(
-                f"step {step + 1} | lr {lr:.2e} | grad {grad_norm:.2f} | {speed:.2f} it/s | {shown}"
+                f"step {step + 1} | lr {lr:.2e} | grad {grad_norm:.2f} | {speed:.2f} it/s | "
+                f"{mem:.1f} GiB | {shown}"
             )
-            progress.log("train", step + 1, values, lr=lr, grad_norm=grad_norm.item(), it_s=speed)
+            progress.log(
+                "train",
+                step + 1,
+                values,
+                lr=lr,
+                grad_norm=grad_norm.item(),
+                it_s=speed,
+                peak_mem_gib=mem,
+            )
         if rank == 0 and step - start_step == VERBOSE_STEPS - 1:
             logger.info(f"per-step logging done, logging every {args.log_freq} steps from now on")
 
@@ -290,20 +300,24 @@ def main(config_path: str):
             and args.sample_freq > 0
             and (step + 1) % args.sample_freq == 0
         ):
-            write_samples(model, mimi, tokenize, args, args.run_dir, step + 1, sample_voice, device)
+            write_samples(
+                model, codec, tokenize, args, args.run_dir, step + 1, sample_voice, device
+            )
 
         if (step + 1) % args.valid_freq == 0 and args.data.valid_jsonl:
-            valid_metrics = validate(model, mimi, args, device, rank, run.world_size, step + 1)
+            valid_metrics = validate(model, codec, args, device, rank, run.world_size, step + 1)
             progress.log("valid", step + 1, valid_metrics)
             model.train()
 
         if rank == 0 and (step + 1) % args.ckpt_freq == 0:
-            save_checkpoint(args.run_dir, step + 1, model, optimizer, ema, args.num_ckpt_keep, mimi)
+            save_checkpoint(
+                args.run_dir, step + 1, model, optimizer, ema, args.num_ckpt_keep, codec
+            )
             progress.log("checkpoint", step + 1)
 
     if rank == 0:
         save_checkpoint(
-            args.run_dir, args.max_steps, model, optimizer, ema, args.num_ckpt_keep, mimi
+            args.run_dir, args.max_steps, model, optimizer, ema, args.num_ckpt_keep, codec
         )
         progress.log("checkpoint", args.max_steps)
         logger.info("done")
@@ -313,7 +327,7 @@ def main(config_path: str):
 @torch.no_grad()
 def validate(
     model: TrainableTTS,
-    mimi: MimiModel,
+    codec: LatentCodec,
     args: TrainArgs,
     device: torch.device,
     rank: int,
@@ -327,8 +341,8 @@ def validate(
             args.data.valid_jsonl,
             tokenize,
             args.batch_size,
-            mimi.sample_rate,
-            mimi.frame_rate,
+            codec.sample_rate,
+            codec.frame_rate,
             args.data.max_duration_sec,
             args.data.max_voice_prompt_sec,
             rank,
@@ -348,7 +362,7 @@ def validate(
         except StopIteration:
             break
         latents, mask, voice_prompt_latents, num_voice_prompt_frames = encode_batch(
-            mimi, batch, device
+            codec, batch, device
         )
         with autocast:
             _, metrics = model(

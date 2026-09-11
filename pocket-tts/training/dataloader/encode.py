@@ -10,7 +10,7 @@ import logging
 
 import torch
 
-from pocket_tts.models.mimi import MimiModel
+from training.codec import LatentCodec
 
 from .types import Batch
 
@@ -19,11 +19,13 @@ logger = logging.getLogger(__name__)
 
 @torch.no_grad()
 def encode_batch(
-    mimi: MimiModel, batch: Batch, device: torch.device
+    codec: LatentCodec, batch: Batch, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if batch.tail_latents is not None:
-        stitch = mimi.encode_to_latent(batch.audio.to(device))
-        latents = torch.cat([stitch, batch.tail_latents.to(device)], dim=1)
+        latents = batch.tail_latents.to(device)
+        if batch.audio.shape[-1] > 0:
+            stitch = codec.encode_to_latent(batch.audio.to(device))
+            latents = torch.cat([stitch, latents], dim=1)
         T = latents.shape[1]
         num_audio_frames = batch.num_audio_frames.to(device).clamp(max=T)
         mask = torch.arange(T, device=device)[None, :] < num_audio_frames[:, None]
@@ -34,11 +36,11 @@ def encode_batch(
         )
         return latents.float(), mask, voice_prompt_latents.float(), num_voice_prompt_frames
     audio = batch.audio.to(device)
-    latents = mimi.encode_to_latent(audio)  # [B, T, C]
+    latents = codec.encode_to_latent(audio)  # [B, T, C]
     T = latents.shape[1]
     num_audio_frames = batch.num_audio_frames.to(device).clamp(max=T)
     mask = torch.arange(T, device=device)[None, :] < num_audio_frames[:, None]
-    voice_prompt_latents = mimi.encode_to_latent(batch.voice_audio.to(device))
+    voice_prompt_latents = codec.encode_to_latent(batch.voice_audio.to(device))
     num_voice_prompt_frames = batch.num_voice_prompt_frames.to(device).clamp(
         max=voice_prompt_latents.shape[1]
     )

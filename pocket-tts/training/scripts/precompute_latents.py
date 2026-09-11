@@ -1,4 +1,3 @@
-import hashlib
 import json
 import logging
 import multiprocessing
@@ -14,12 +13,10 @@ import torch
 import typer
 from tqdm import tqdm
 
-from pocket_tts.models.mimi import MimiModel
-from pocket_tts.utils.config import Config
-from pocket_tts.utils.utils import download_if_necessary
 from training.args import load_args
+from training.codec import LatentCodec
 from training.dataloader import Entry, _load_window
-from training.modules.builders import build_mimi, load_model_config
+from training.modules.builders import build_codec
 
 logger = logging.getLogger("precompute_latents")
 app = typer.Typer(pretty_exceptions_show_locals=False)
@@ -63,54 +60,16 @@ def _chunk_jobs(lines: list[str], idxs: list[int], sample_rate: int) -> list[Dec
     return [(e.path, e.start, e.duration, sample_rate) for e in map(_parse_entry, chunk)]
 
 
-def mimi_encode_hash(mimi: MimiModel) -> str:
-    """Hash of the weights on the encode path (encoder, encoder transformer,
-    downsample): identifies which Mimi produced a latents store."""
-    h = hashlib.sha256()
-    for name in ("encoder", "encoder_transformer", "downsample"):
-        module = getattr(mimi, name, None)
-        if module is None:
-            continue
-        for k, v in sorted(module.state_dict().items()):
-            h.update(f"{name}.{k}:{tuple(v.shape)}".encode())
-            h.update(v.detach().cpu().contiguous().numpy().tobytes())
-    return h.hexdigest()
-
-
-def load_frozen_mimi(config: Config) -> MimiModel:
-    mimi = build_mimi(config.mimi)
-    weights_file = download_if_necessary(str(config.weights_path))
-    state = safetensors.torch.load_file(weights_file)
-    mimi_state = {k.removeprefix("mimi."): v for k, v in state.items() if k.startswith("mimi.")}
-    mimi.load_state_dict(mimi_state, strict=True)
-    encoder_max = max(
-        v.abs().max().item() for k, v in mimi_state.items() if k.startswith("encoder.")
-    )
-    if encoder_max == 0:
-        raise SystemExit(
-            f"{config.weights_path} ships an all-zero Mimi encoder (a release without "
-            "voice cloning). Point the config at weights with a real encoder."
-        )
-    mimi.eval()
-    for p in mimi.parameters():
-        p.requires_grad_(False)
-    # Same per-module compile as training; dynamic shapes because chunks pad
-    # to their own longest row.
-    mimi.encoder.compile(dynamic=True)
-    mimi.encoder_transformer.compile(dynamic=True)
-    return mimi
-
-
 @torch.no_grad()
-def measure_stitch_frames(mimi: MimiModel, audio: torch.Tensor) -> tuple[int, float]:
-    fs = mimi.frame_size
-    full = mimi.encode_to_latent(audio)
+def measure_stitch_frames(codec: LatentCodec, audio: torch.Tensor) -> tuple[int, float]:
+    fs = codec.frame_size
+    full = codec.encode_to_latent(audio)
     k = full.shape[1] // 2
-    cold = mimi.encode_to_latent(audio[..., k * fs :])
+    cold = codec.encode_to_latent(audio[..., k * fs :])
     n = min(cold.shape[1], full.shape[1] - k) - 1
     rel = (cold[:, :n] - full[:, k : k + n]).norm(dim=-1) / (full[:, k : k + n].norm(dim=-1) + 1e-8)
     rel = rel.max(dim=0).values
-    prompt_cold = mimi.encode_to_latent(audio[..., : k * fs])
+    prompt_cold = codec.encode_to_latent(audio[..., : k * fs])
     pn = min(prompt_cold.shape[1], k) - 1
     floor = (
         ((prompt_cold[:, :pn] - full[:, :pn]).norm(dim=-1) / (full[:, :pn].norm(dim=-1) + 1e-8))
@@ -125,19 +84,21 @@ def measure_stitch_frames(mimi: MimiModel, audio: torch.Tensor) -> tuple[int, fl
 def _calibrate(
     pool: ProcessPoolExecutor,
     lines: list[str],
-    mimi: MimiModel,
+    codec: LatentCodec,
     batch_size: int,
     device: torch.device,
 ) -> tuple[int, float]:
+    if codec.stitch_frames is not None:
+        return codec.stitch_frames, 0.0
     longest = sorted(map(_parse_entry, lines[:CALIBRATION_POOL_LINES]), key=lambda e: -e.duration)
-    jobs = [(e.path, e.start, e.duration, mimi.sample_rate) for e in longest[:batch_size]]
+    jobs = [(e.path, e.start, e.duration, codec.sample_rate) for e in longest[:batch_size]]
     calib = list(pool.map(_decode_one, jobs))
     max_len = max(len(w) for w in calib)
-    max_len -= max_len % mimi.frame_size
+    max_len -= max_len % codec.frame_size
     audio = torch.zeros(len(calib), 1, max_len)
     for b, w in enumerate(calib):
         audio[b, 0, : min(len(w), max_len)] = torch.from_numpy(w[:max_len])
-    return measure_stitch_frames(mimi, audio.to(device))
+    return measure_stitch_frames(codec, audio.to(device))
 
 
 def _entry_frames(n_samples: int, sample_rate: int, frame_rate: float) -> int:
@@ -191,11 +152,13 @@ def _write_chunk(
     lens: list[int],
     idxs: list[int],
     manifest: Path,
-    mimi: MimiModel,
+    codec: LatentCodec,
     tag: str,
 ):
     for b, n_samples in enumerate(lens):
-        frames = min(_entry_frames(n_samples, mimi.sample_rate, mimi.frame_rate), latents.shape[1])
+        frames = min(
+            _entry_frames(n_samples, codec.sample_rate, codec.frame_rate), latents.shape[1]
+        )
         path = manifest.parent / _latents_name(manifest, idxs[b], tag)
         # Writer-unique tmp name: concurrent jobs racing on the same manifest
         # then only ever rename complete files (rename is atomic).
@@ -206,7 +169,7 @@ def _write_chunk(
 
 def _encode_pending(
     pool: ProcessPoolExecutor,
-    mimi: MimiModel,
+    codec: LatentCodec,
     device: torch.device,
     lines: list[str],
     manifest: Path,
@@ -219,19 +182,19 @@ def _encode_pending(
     pending = _pending_chunks(lines, manifest, batch_size, tag, worker, num_workers)
     lookahead = decode_workers + 2  # keep every decode worker busy
     futures = {
-        i: pool.submit(_decode_chunk, _chunk_jobs(lines, idxs, mimi.sample_rate))
+        i: pool.submit(_decode_chunk, _chunk_jobs(lines, idxs, codec.sample_rate))
         for i, idxs in enumerate(pending[:lookahead])
     }
     submitted = len(futures)
     for i, idxs in enumerate(tqdm(pending, desc=f"encode {manifest.name}")):
         arr, lens = futures.pop(i).result()
         if submitted < len(pending):
-            jobs = _chunk_jobs(lines, pending[submitted], mimi.sample_rate)
+            jobs = _chunk_jobs(lines, pending[submitted], codec.sample_rate)
             futures[submitted] = pool.submit(_decode_chunk, jobs)
             submitted += 1
         with torch.no_grad():
-            latents = mimi.encode_to_latent(torch.from_numpy(arr).to(device)).cpu()
-        _write_chunk(latents, lens, idxs, manifest, mimi, tag)
+            latents = codec.encode_to_latent(torch.from_numpy(arr).to(device)).cpu()
+        _write_chunk(latents, lens, idxs, manifest, codec, tag)
 
 
 def _write_manifest_and_meta(
@@ -239,18 +202,18 @@ def _write_manifest_and_meta(
     new_lines: list[str],
     stitch_frames: int,
     floor: float,
-    mimi: MimiModel,
-    weights_path: str,
-    mimi_hash: str,
+    codec: LatentCodec,
+    codec_desc: str,
+    codec_hash: str,
 ):
     out_manifest = manifest.with_name(manifest.stem + "_latents.jsonl")
     _atomic_write_text(out_manifest, "\n".join(new_lines) + "\n")
     meta = {
         "stitch_frames": stitch_frames,
         "noise_floor": floor,
-        "frame_rate": mimi.frame_rate,
-        "weights_path": weights_path,
-        "mimi_hash": mimi_hash,
+        "frame_rate": codec.frame_rate,
+        "codec": codec_desc,
+        "codec_hash": codec_hash,
     }
     meta_path = manifest.with_name(manifest.stem + "_latents.meta.json")
     _atomic_write_text(meta_path, json.dumps(meta, indent=2) + "\n")
@@ -259,11 +222,11 @@ def _write_manifest_and_meta(
 
 def precompute_manifest(
     manifest: Path,
-    mimi: MimiModel,
+    codec: LatentCodec,
     device: torch.device,
     batch_size: int,
     decode_workers: int,
-    weights_path: str,
+    codec_desc: str,
     worker: int = 0,
     num_workers: int = 1,
 ):
@@ -273,18 +236,18 @@ def precompute_manifest(
     worker 0 waits for the others' files and writes the manifest and meta.
     """
     lines = manifest.read_text().splitlines()
-    mimi_hash = mimi_encode_hash(mimi)
-    tag = mimi_hash[:8]
+    codec_hash = codec.encode_hash()
+    tag = codec_hash[:8]
     (manifest.parent / "latents" / tag).mkdir(parents=True, exist_ok=True)
     decode_workers = decode_workers or default_decode_workers()
     pool = ProcessPoolExecutor(
         max_workers=decode_workers, mp_context=multiprocessing.get_context("spawn")
     )
     if worker == 0:
-        stitch_frames, floor = _calibrate(pool, lines, mimi, batch_size, device)
+        stitch_frames, floor = _calibrate(pool, lines, codec, batch_size, device)
         logger.info(f"{manifest.name}: stitch_frames={stitch_frames} (noise floor {floor:.1e})")
     _encode_pending(
-        pool, mimi, device, lines, manifest, batch_size, decode_workers, tag, worker, num_workers
+        pool, codec, device, lines, manifest, batch_size, decode_workers, tag, worker, num_workers
     )
     if worker != 0:
         return
@@ -292,7 +255,7 @@ def precompute_manifest(
         time.sleep(5)
     new_lines = _annotated_lines(lines, manifest, tag)
     _write_manifest_and_meta(
-        manifest, new_lines, stitch_frames, floor, mimi, weights_path, mimi_hash
+        manifest, new_lines, stitch_frames, floor, codec, codec_desc, codec_hash
     )
 
 
@@ -300,19 +263,19 @@ def precompute_manifest(
 def main(config: str, batch_size: int = 16, decode_workers: int = 0):
     logging.basicConfig(level=logging.INFO)
     args = load_args(config)
-    model_config = load_model_config(args.model_config, args.model_overrides)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cuda.matmul.allow_tf32 = True
-    mimi = load_frozen_mimi(model_config).to(device)
+    codec = build_codec(args).to(device)
+    codec.compile()
     if not args.data.train_jsonl:
         raise SystemExit("the config has no data.train_jsonl to precompute")
     precompute_manifest(
         Path(args.data.train_jsonl),
-        mimi,
+        codec,
         device,
         batch_size,
         decode_workers,
-        str(model_config.weights_path),
+        f"{args.codec.type} {args.model_config}",
     )
 
 

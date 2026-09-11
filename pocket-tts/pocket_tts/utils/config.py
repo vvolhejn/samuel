@@ -115,7 +115,9 @@ class MimiConfig(StrictModel):
 
 class Config(StrictModel):
     flow_lm: FlowLMConfig
-    mimi: MimiConfig
+    # Absent only for training configs that pair the FlowLM with another codec
+    # (training.codec); inference always needs it.
+    mimi: MimiConfig | None = None
     weights_path: str | None = None
     weights_path_without_voice_cloning: str | None = None
     pad_with_spaces_for_short_inputs: bool = False

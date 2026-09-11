@@ -1,8 +1,9 @@
 """Checkpointing: resumable training state + pocket-tts-format export.
 
 `export_pocket_safetensors` writes a single model.safetensors with flow_lm.*
-and mimi.* keys — the exact format pocket-tts loads via `weights_path` in a
-model config (point a copy of the config's weights_path at the exported file).
+keys plus whatever the codec exports (mimi.* for Mimi) — the exact format
+pocket-tts loads via `weights_path` in a model config (point a copy of the
+config's weights_path at the exported file).
 """
 
 import logging
@@ -13,6 +14,7 @@ import safetensors.torch
 import torch
 from torch import nn
 
+from training.codec import LatentCodec
 from training.modules.model import TrainableTTS
 
 logger = logging.getLogger(__name__)
@@ -67,9 +69,9 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     ema: EMA | None,
     num_keep: int,
-    mimi: nn.Module | None = None,
+    codec: LatentCodec | None = None,
 ):
-    """Write the resumable training state; with `mimi`, also refresh the
+    """Write the resumable training state; with `codec`, also refresh the
     pocket-tts-format export (run_dir/model.safetensors)."""
     run_dir.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -94,8 +96,8 @@ def save_checkpoint(
         old.unlink()
     for old_opt in sorted(run_dir.glob("optim_*.pt"))[:-1]:
         old_opt.unlink()
-    if mimi is not None:
-        export_pocket_safetensors(run_dir / "model.safetensors", model.flow_lm, mimi, ema)
+    if codec is not None:
+        export_pocket_safetensors(run_dir / "model.safetensors", model.flow_lm, codec, ema)
 
 
 def latest_checkpoint(run_dir: Path) -> Path | None:
@@ -130,7 +132,7 @@ def load_checkpoint(
 
 
 def export_pocket_safetensors(
-    path: Path, flow_lm: nn.Module, mimi: nn.Module, ema: EMA | None = None
+    path: Path, flow_lm: nn.Module, codec: LatentCodec, ema: EMA | None = None
 ):
     flow_state = {k: v.detach().float().cpu() for k, v in flow_lm.state_dict().items()}
     if ema is not None:
@@ -138,7 +140,7 @@ def export_pocket_safetensors(
             if k.startswith("flow_lm."):
                 flow_state[k.removeprefix("flow_lm.")] = v.cpu()
     state = {f"flow_lm.{k}": v for k, v in flow_state.items()}
-    state.update({f"mimi.{k}": v.detach().cpu() for k, v in mimi.state_dict().items()})
+    state.update(codec.export_state())
     path = Path(path)
     tmp = path.with_suffix(".tmp")
     safetensors.torch.save_file(state, str(tmp))
