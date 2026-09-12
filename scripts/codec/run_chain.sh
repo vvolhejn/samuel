@@ -7,7 +7,7 @@
 set -u
 cd "$(dirname "$0")/../.."
 log=runs/codec_chain.log
-common="optim.max_steps=30000 loss.smooth=0.15 loss.accel=0.15 loss.rest=0.01 loss.reg_ramp_steps=10000 run.runs_root=runs/codec"
+common="optim.max_steps=30000 loss.smooth=0.15 loss.accel=0.15 loss.rest=0.01 loss.reg_start_steps=5000 loss.reg_ramp_steps=5000 run.runs_root=runs/codec"
 MAX_ATTEMPTS=${MAX_ATTEMPTS:-3}
 PVAR_MIN=${PVAR_MIN:-0.002}
 mkdir -p runs/codec
