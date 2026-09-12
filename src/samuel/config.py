@@ -154,6 +154,8 @@ class LossConfig(BaseModel):
     # Ramp the smooth/accel/rest weights linearly from 0 to their full values
     # over this many steps. 0 applies them at full strength from step 0.
     reg_ramp_steps: int = 0
+    # Penalties are off before this step; the ramp (if any) starts here.
+    reg_start_steps: int = 0
     smooth_weights: dict[str, float] = Field(
         default_factory=lambda: {
             "tongueIndex": 1.0,
