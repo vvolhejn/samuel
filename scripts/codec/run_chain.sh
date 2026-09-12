@@ -16,6 +16,14 @@ pvar_at_1000() {  # prints the step-1000 eval pvar of a stdout file, or nothing
   tr '\r' '\n' < "$1" | grep -o "\[eval\] step=1000 .*pvar=[0-9.e-]*" | tail -1 | sed 's/.*pvar=//'
 }
 
+kill_tree() {  # the training process and its dataloader workers, then wait for the GPU memory
+  pkill -9 -P "$1" 2>/dev/null; kill -9 "$1" 2>/dev/null
+  for _ in $(seq 1 60); do
+    nvidia-smi --query-compute-apps=pid --format=csv,noheader | grep -qx "$1" || break
+    sleep 5
+  done
+}
+
 for spec in "$@"; do
   name="${spec%%|*}"; overrides="${spec#*|}"
   for attempt in $(seq 1 $MAX_ATTEMPTS); do
@@ -23,7 +31,8 @@ for spec in "$@"; do
     out=runs/codec/$name.stdout
     [ $attempt -gt 1 ] && out=runs/codec/$name.seed$seed.stdout
     echo "[$(date)] start $name seed=$seed: $overrides" >> $log
-    uv run python -m samuel.train run.name=$name run.seed=$seed $common $overrides > $out 2>&1 &
+    # The venv python directly (not `uv run`), so $pid is the training process itself.
+    .venv/bin/python -m samuel.train run.name=$name run.seed=$seed $common $overrides > $out 2>&1 &
     pid=$!
     collapsed=0
     while kill -0 $pid 2>/dev/null; do
@@ -32,13 +41,17 @@ for spec in "$@"; do
       if [ -n "$pv" ]; then
         if awk -v p="$pv" -v m="$PVAR_MIN" 'BEGIN{exit !(p < m)}'; then
           echo "[$(date)] $name seed=$seed collapsed at step 1000 (pvar=$pv), killing" >> $log
-          kill -9 $pid; collapsed=1
+          kill_tree $pid; collapsed=1
         fi
         break
       fi
     done
-    if [ $collapsed -eq 1 ]; then sleep 10; continue; fi
+    if [ $collapsed -eq 1 ]; then continue; fi
     wait $pid; rc=$?
+    if [ $rc -ne 0 ] && [ -z "$(pvar_at_1000 $out)" ]; then
+      echo "[$(date)] $name seed=$seed died before step 1000 (exit $rc), retrying" >> $log
+      kill_tree $pid; continue
+    fi
     echo "[$(date)] end $name seed=$seed (exit $rc): $(tr '\r' '\n' < $out | grep '\[eval\]' | tail -1 | cut -c1-200)" >> $log
     break
   done
