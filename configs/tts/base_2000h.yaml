@@ -9,7 +9,7 @@ codec:
   kwargs:
     checkpoint: hf:vvolhejn/samuel
     stack: 1
-    pitch_workers: 14
+    pitch_workers: 22
 
 data:
   train_jsonl: data/tts/hifitts2_2000h/train_aligned.jsonl
