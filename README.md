@@ -25,8 +25,7 @@ uv run --extra server python -m samuel.server --no-frontend --port 8471
 
 ## How it was trained
 
-Details on how this model was trained will be published soon.
-For now, feel free to poke around the codebase.
+Check out [the blog post](https://vvolhejn.com/blog/2026-08-17-samuel).
 
 ## License
 
