@@ -3,36 +3,78 @@
     "name": "clip-06b.mp3",
     "source": "/lustre/scwpod02/client/kyutai/datasets/librilight_segmented/train/3157/8480/riseandfall2_36_davis_64kb_0003.flac",
     "offset_s": 39.13,
-    "duration_s": 9.27
+    "duration_s": 9.27,
+    "librivox": {
+      "title": "Rise and Fall of the Confederate Government, Volume 2",
+      "author": "Jefferson Davis",
+      "reader": "TriciaG",
+      "url": "https://librivox.org/the-rise-and-fall-of-the-confederate-government-volume-2-by-jefferson-davis/",
+      "file_url": "https://archive.org/download/risefall_confederategovt_2_1506_librivox/riseandfall2_36_davis_64kb.mp3"
+    }
   },
   {
     "name": "clip-13b.mp3",
     "source": "/lustre/scwpod02/client/kyutai/datasets/librilight_segmented/train/3490/3009/deathworld_08_harrison_64kb_0002.flac",
     "offset_s": 21.03,
-    "duration_s": 10.0
+    "duration_s": 10.0,
+    "librivox": {
+      "title": "Deathworld",
+      "author": "Harry Harrison",
+      "reader": "Gregg Margarite",
+      "url": "https://librivox.org/deathworld-by-harry-harrison/",
+      "file_url": "https://archive.org/download/deathworld_gm_0904_librivox/deathworld_08_harrison_64kb.mp3"
+    }
   },
   {
     "name": "clip-14b.mp3",
     "source": "/lustre/scwpod02/client/kyutai/datasets/librilight_segmented/train/248/1117/eightyyears_07_stanton_64kb_0033.flac",
     "offset_s": 14.0,
-    "duration_s": 9.4
+    "duration_s": 9.4,
+    "librivox": {
+      "title": "Eighty Years and More",
+      "author": "Elizabeth Cady Stanton",
+      "reader": "Becky Miller",
+      "url": "https://librivox.org/eighty-years-and-more-reminiscences-1815-1897-by-elizabeth-cady-stanton/",
+      "file_url": "https://archive.org/download/eightyyearsandmore_1110_librivox/eightyyears_07_stanton_64kb.mp3"
+    }
   },
   {
     "name": "clip-21b.mp3",
     "source": "/lustre/scwpod02/client/kyutai/datasets/librilight_segmented/train/83/4505/sylviebrunoconcluded_14_carroll_64kb_0010.flac",
     "offset_s": 20.56,
-    "duration_s": 9.0
+    "duration_s": 9.0,
+    "librivox": {
+      "title": "Sylvie and Bruno Concluded",
+      "author": "Lewis Carroll",
+      "reader": "Catharine Eastman",
+      "url": "https://librivox.org/sylvie-and-bruno-concluded-by-lewis-carroll/",
+      "file_url": "https://archive.org/download/sylvie_bruno_concluded_1310_librivox/sylviebrunoconcluded_14_carroll_64kb.mp3"
+    }
   },
   {
     "name": "clip-23b.mp3",
     "source": "/lustre/scwpod02/client/kyutai/datasets/librilight_segmented/train/204/4067/travelsinalaska_14_muir_64kb_0019.flac",
     "offset_s": 25.94,
-    "duration_s": 8.9
+    "duration_s": 8.9,
+    "librivox": {
+      "title": "Travels in Alaska",
+      "author": "John Muir",
+      "reader": "Mark F. Smith",
+      "url": "https://librivox.org/travels-in-alaska-by-john-muir/",
+      "file_url": "https://archive.org/download/travels_in_alaska_1010_librivox/travelsinalaska_14_muir_64kb.mp3"
+    }
   },
   {
     "name": "clip-26b.mp3",
     "source": "/lustre/scwpod02/client/kyutai/datasets/librilight_segmented/train/4078/8463/talesofspaceandtime_02_wells_64kb_0025.flac",
     "offset_s": 11.63,
-    "duration_s": 10.0
+    "duration_s": 10.0,
+    "librivox": {
+      "title": "Tales of Space and Time",
+      "author": "H. G. Wells",
+      "reader": "Richard Kilmer",
+      "url": "https://librivox.org/tales-of-space-and-time-by-h-g-wells/",
+      "file_url": "https://archive.org/download/talesofspaceandtime_1401_librivox/talesofspaceandtime_02_wells_64kb.mp3"
+    }
   }
 ]

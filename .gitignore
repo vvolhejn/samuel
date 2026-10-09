@@ -1,10 +1,17 @@
 *.pyc
 __pycache__/
+.DS_Store
 
 .nfs*
 
 runs/
 manifests/
+# Worktrees symlink manifests/ back to the main checkout; the trailing-slash
+# pattern above does not match a symlink, so `git add -A` would commit it.
+/manifests
 artifacts/
 logs/
 train.log
+
+# staged for the Cloudflare container image (see deploy/README.md)
+deploy/model/

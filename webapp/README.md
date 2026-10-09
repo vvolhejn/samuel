@@ -1,9 +1,12 @@
 # Samuel webapp — speak, and the vocal tract mimics you
 
-Records your voice in the browser, detects end-of-utterance with Silero VAD,
-sends the audio to a Python backend running the trained controller
-(`onset-off_20260527-193518` / wandb `i30dfe0t`), and plays the predicted
-parameter trajectories through the vendored Pink Trombone synth — the tract
+**Note to humans: slop below, refer to main README**
+
+Records your voice in the browser (press Microphone, press Stop; Silero VAD
+only trims the recording to the speech in it), sends the audio to a Python
+backend running the trained controller
+(`la0-ft-smooth-gumbel_20260831-121718` / wandb `3yval67z`), and plays the
+predicted parameter trajectories through the vendored Pink Trombone synth — the tract
 visualization animates along.
 
 ## Run
@@ -25,16 +28,7 @@ static export (`out/`, via `pnpm build`) and mounts it at `/`:
 uv run --extra server python -m samuel.server
 ```
 
-Open http://127.0.0.1:8471, click Start, allow the microphone, speak, pause —
-it speaks back. Env overrides:
-
-- `SAMUEL_CHECKPOINT` — local `.pt` or wandb artifact ref. The run's
-  `config.json` is found next to it (`<run_dir>/config.json`) automatically
-- `SAMUEL_RUN_CONFIG` — override the auto-found config (only its `model` block
-  is used); required only for a wandb-artifact checkpoint
-- `SAMUEL_PORT` / `SAMUEL_HOST` — default `127.0.0.1:8471`
-- `SAMUEL_FRONTEND_SKIP_BUILD=1` — serve an existing `out/` without rebuilding
-- `SAMUEL_SERVE_FRONTEND=0` — API only (use the dev-mode workflow below)
+Open http://127.0.0.1:8471. See `--help` for more flags.
 
 ### Two processes (frontend dev mode)
 
@@ -48,12 +42,20 @@ pnpm dev   # in another shell
 
 Open http://localhost:3000 — `/api/*` is proxied to the backend on :8471.
 
+### Deployment
+
+`deploy/` puts both halves on Cloudflare as a single Worker: the static export
+from `out/`, and the backend as a container on the same origin. See
+`deploy/README.md`.
+
 ## How it works
 
-- `app/page.tsx` — state machine `idle → listening → recording → processing →
-  speaking`; mic + Silero VAD via `@ricky0123/vad-web` (assets self-hosted
-  under `public/vad/`).
-- `lib/audio.ts` — encodes the 16 kHz VAD segment as WAV, POSTs to
+- `app/page.tsx` — owns the synth: who has it (`lib/owner.ts`) and what the
+  page shows for it.
+- `lib/useMicVad.ts` — the mic: recording runs from Microphone to Stop, and
+  Silero VAD via `@ricky0123/vad-web` (assets self-hosted under `public/vad/`)
+  is used only to trim the recording to the frames it heard speech in.
+- `lib/audio.ts` — encodes the 16 kHz recording as WAV, POSTs to
   `/api/synthesize`.
 - `src/samuel/server.py` (repo root) — resamples to 44.1 kHz, extracts pyin
   f0 (the model's external `frequency` input), runs the checkpoint, returns
@@ -69,6 +71,14 @@ Open http://localhost:3000 — `/api/*` is proxied to the backend on :8471.
   no meaningful envelope — the backend returns the per-frame `gain` curve
   (computed against its own Python resynthesis) and the frontend applies it
   via a master GainNode. Without it, silence hums.
+- **Precomputed clips**: the six numbered buttons feed the model committed MP3s
+  from `public/clips/`, so their answers never change — they are generated once
+  by `scripts/precompute_clip_responses.py` into `public/clips/precomputed/`
+  and played from there, with a 0.5–1 s fake pause so the button still reads as
+  thinking. Regenerate them after a checkpoint swap: `index.json` records a
+  fingerprint of the weights they came from, and when it disagrees with
+  `/api/health` the frontend ignores them (console warning, and a red line in
+  the debug panel) and asks the backend as before.
 - **Debug**: the "Python synth" button plays the backend's own
   (volume-matched) resynthesis of the last utterance, for A/B comparison with
   the browser synth. "Mic off/on" toggles the VAD without tearing it down.

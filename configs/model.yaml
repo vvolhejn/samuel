@@ -4,7 +4,9 @@ model:
     dimension: 128
     n_filters: 32
     n_residual_layers: 3
-    ratios: [8, 5, 4, 2]
+    # These ratios should multiply to 512 = samples_per_frame, so that we can avoid
+    # resampling the latents
+    ratios: [8, 4, 4, 4]
     kernel_size: 7
     last_kernel_size: 7
     residual_kernel_size: 3
@@ -19,6 +21,15 @@ model:
   # Straight-through (one-hot) Gumbel-softmax during training instead of the
   # soft expectation over bucket centers. Eval always snaps to argmax.
   gumbel_hard: false
+  # gumbel: Categorical head over bucket centers.
+  # direct: One scalar per parameter squashed into its range by a scaled tanh.
+  #   Ignores n_buckets, gumbel_hard, tau, and the entropy penalty.
+  head_type: gumbel
+
+  # Increase to delay the controller prediction, by this many frames, so that
+  # it sees future audio and can make more accurate predictions.
+  # At lookahead_frames=0, the delay is one frame (11.6 ms when samples_per_frame=512).
+  lookahead_frames: 0
 
   # (lo, hi, init) per trainable parameter. ``frequency`` is supplied
   # externally from the pyin cache. ``intensity`` is trainable: the synth

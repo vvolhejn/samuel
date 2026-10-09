@@ -89,8 +89,55 @@ def fill_unvoiced(
     return np.clip(out, fmin, fmax)
 
 
+def fill_unvoiced_causal(
+    f0: np.ndarray,
+    voiced: np.ndarray,
+    fmin: float,
+    fmax: float,
+) -> np.ndarray:
+    """Hold the last voiced f0 through unvoiced runs.
+
+    Unlike ``fill_unvoiced`` this never reads ahead, so a streaming
+    implementation can reproduce it exactly. Frames before the first voiced
+    one get ``(fmin + fmax) / 2`` (same fallback as ``fill_unvoiced``).
+    Output is clamped to ``[fmin, fmax]``.
+    """
+    n = f0.shape[0]
+    if n == 0:
+        return f0.astype(np.float32, copy=True)
+    # indices of the most recent voiced frame at or before each position
+    last_voiced = np.maximum.accumulate(np.where(voiced, np.arange(n), -1))
+    out = np.where(
+        last_voiced >= 0,
+        f0[np.clip(last_voiced, 0, None)],
+        0.5 * (fmin + fmax),
+    ).astype(np.float32)
+    return np.clip(out, fmin, fmax)
+
+
+# Sources whose caches are computed causally: unvoiced gaps are filled with
+# fill_unvoiced_causal over the whole file at load time (so the fill can hold
+# values across chunk boundaries without ever reading ahead).
+CAUSAL_PITCH_SOURCES = frozenset({"yin"})
+
+
+def _fill_chunk(f0: np.ndarray, voiced: np.ndarray, cache: "PitchCache") -> np.ndarray:
+    """Per-chunk unvoiced fill, respecting the cache's fill mode.
+
+    Prefilled (causal-source) chunks keep their values — filling again here
+    would discard the hold-last state carried across chunk boundaries. Only
+    frames past the end of the cached track (still 0.0) get held forward.
+    """
+    if not cache.prefilled:
+        return fill_unvoiced(f0, voiced, cache.fmin, cache.fmax)
+    have = f0 > 0.0  # filled tracks are clamped to [fmin, fmax], so 0 == missing
+    if have.all():
+        return f0.astype(np.float32, copy=False)
+    return fill_unvoiced_causal(f0, have, cache.fmin, cache.fmax)
+
+
 class PitchCache(BaseModel):
-    """Per-file pyin f0 cache with the metadata it was computed under."""
+    """Per-file f0 cache with the metadata it was computed under."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -100,12 +147,17 @@ class PitchCache(BaseModel):
     samples_per_frame: int
     fmin: float
     fmax: float
+    source: str
+    # True when the f0 arrays are already filled through unvoiced regions
+    # (causal sources); consumers must not fill again.
+    prefilled: bool
 
 
 def _load_pitch_cache(
     path: Path,
     sample_rate: int,
     samples_per_frame: int,
+    expected_source: str = "pyin",
 ) -> PitchCache:
     """Load a pitch cache, validating it matches (sample_rate, samples_per_frame)."""
     z = np.load(path)
@@ -121,16 +173,32 @@ def _load_pitch_cache(
             f"--manifest <m> --out {path} "
             f"--sample-rate {sample_rate} --samples-per-frame {samples_per_frame}"
         )
+    # Caches written before pitch sources existed carry no "source" key.
+    source = str(z["source"]) if "source" in z else "pyin"
+    if source != expected_source:
+        raise ValueError(
+            f"pitch cache {path} was computed with source={source!r} but "
+            f"data.pitch_source={expected_source!r}; point pitch_cache_path "
+            f"at a matching cache or regenerate it"
+        )
+    fmin = float(z["fmin"]) if "fmin" in z else float(z["pyin_fmin"])
+    fmax = float(z["fmax"]) if "fmax" in z else float(z["pyin_fmax"])
+    prefilled = source in CAUSAL_PITCH_SOURCES
     n = int(z["n_files"])
     by_file: dict[int, tuple[np.ndarray, np.ndarray]] = {}
     for i in range(n):
-        by_file[i] = (z[f"f0_{i}"], z[f"voiced_{i}"])
+        f0, voiced = z[f"f0_{i}"], z[f"voiced_{i}"]
+        if prefilled:
+            f0 = fill_unvoiced_causal(f0, voiced, fmin, fmax)
+        by_file[i] = (f0, voiced)
     return PitchCache(
         by_file=by_file,
         sample_rate=cache_sr,
         samples_per_frame=cache_spf,
-        fmin=float(z["pyin_fmin"]),
-        fmax=float(z["pyin_fmax"]),
+        fmin=fmin,
+        fmax=fmax,
+        source=source,
+        prefilled=prefilled,
     )
 
 
@@ -158,6 +226,7 @@ class LibriLightChunks(IterableDataset):
         seed: int = 0,
         drop_last: bool = True,
         pitch_cache_path: Path | None = None,
+        pitch_source: str = "pyin",
         samples_per_frame: int | None = None,
         val_fraction: float = 0.0,
     ):
@@ -193,7 +262,7 @@ class LibriLightChunks(IterableDataset):
                     "samples_per_frame is required when pitch_cache_path is set"
                 )
             self._pitch = _load_pitch_cache(
-                pitch_cache_path, sample_rate, samples_per_frame
+                pitch_cache_path, sample_rate, samples_per_frame, pitch_source
             )
             assert self.chunk_samples % samples_per_frame == 0
             self.pitch_frames_per_chunk = self.chunk_samples // samples_per_frame
@@ -218,8 +287,6 @@ class LibriLightChunks(IterableDataset):
 
         spf = self.samples_per_frame
         T_pitch = self.pitch_frames_per_chunk if self._pitch is not None else 0
-        fmin = self._pitch.fmin if self._pitch is not None else 70.0
-        fmax = self._pitch.fmax if self._pitch is not None else 500.0
 
         for df in files:
             try:
@@ -254,7 +321,7 @@ class LibriLightChunks(IterableDataset):
                 else:
                     f0_chunk = pitch_f0[p_start:p_end].astype(np.float32, copy=False)
                     voiced_chunk = pitch_voiced[p_start:p_end]
-                f0_filled = fill_unvoiced(f0_chunk, voiced_chunk, fmin, fmax)
+                f0_filled = _fill_chunk(f0_chunk, voiced_chunk, self._pitch)
                 yield {
                     "audio": torch.from_numpy(chunk),
                     "pitch": torch.from_numpy(f0_filled),
@@ -283,6 +350,7 @@ def build_dataloader(
         seed=seed,
         drop_last=drop_last,
         pitch_cache_path=cfg.pitch_cache_path,
+        pitch_source=cfg.pitch_source,
         samples_per_frame=samples_per_frame,
         val_fraction=cfg.val_fraction,
     )

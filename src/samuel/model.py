@@ -13,6 +13,7 @@ never gain-matched, so the model has to produce the level itself (see
 from __future__ import annotations
 
 import math
+from typing import Literal
 
 import torch
 import torch.nn.functional as F
@@ -77,6 +78,14 @@ class PinkTromboneControllerConfig(BaseModel):
     # is the soft distribution and the synth sees a smooth expectation between
     # bucket centers.
     gumbel_hard: bool = False
+    # gumbel: Categorical head over bucket centers.
+    # direct: One scalar per parameter squashed into its range by a scaled tanh.
+    #   Ignores n_buckets, gumbel_hard, tau, and the entropy penalty.
+    head_type: Literal["gumbel", "direct"] = "gumbel"
+    # Increase to delay the controller prediction, by this many frames, so that
+    # it sees future audio and can make more accurate predictions.
+    # At lookahead_frames=0, the delay is one frame (11.6 ms when samples_per_frame=512).
+    lookahead_frames: int = 0
 
     @property
     def frame_rate(self) -> float:
@@ -140,8 +149,14 @@ class PinkTromboneController(nn.Module):
         centers = lo.unsqueeze(1) + steps.unsqueeze(0) * (hi - lo).unsqueeze(1)
         self.register_buffer("bucket_centers", centers)
 
-        self.head = nn.Linear(config.encoder.dimension, n_trainable * config.n_buckets)
-        # Bias init at zero -> uniform softmax -> mean bucket value at start.
+        head_out = (
+            n_trainable
+            if config.head_type == "direct"
+            else n_trainable * config.n_buckets
+        )
+        self.head = nn.Linear(config.encoder.dimension, head_out)
+        # Bias init at zero -> uniform softmax -> mean bucket value at start
+        # (direct head: tanh(0) -> the same range midpoint).
         with torch.no_grad():
             self.head.bias.zero_()
 
@@ -178,10 +193,11 @@ class PinkTromboneController(nn.Module):
             f0: ``[B, T_ctrl]`` fundamental frequency in Hz per control frame.
                 Already interpolated through unvoiced regions and clamped to a
                 sane range.
-            tau: Gumbel-softmax temperature (training only).
-            return_aux: if True, also return a dict with ``logits``
-                ``[B, T_ctrl, n_trainable, n_buckets]`` and ``z`` (encoder
-                output, ``[B, dim, T_ctrl]``) for diagnostics.
+            tau: Gumbel-softmax temperature (training only; ignored by the
+                direct head).
+            return_aux: if True, also return a dict with ``z`` (encoder
+                output, ``[B, dim, T_ctrl]``) and, for the gumbel head,
+                ``logits`` ``[B, T_ctrl, n_trainable, n_buckets]``.
 
         Returns:
             ``[B, T_ctrl, N_PARAMS]`` parameter tensor (and ``aux`` dict if
@@ -195,36 +211,50 @@ class PinkTromboneController(nn.Module):
             raise ValueError(f"expected f0 [{B}, {T_ctrl}], got {tuple(f0.shape)}")
 
         hop = self.encoder.hop_length
-        pad = (hop - S % hop) % hop
+        k = self.config.lookahead_frames
+        # Pad by the lookahead so the encoder emits T_ctrl + k frames, then
+        # drop the first k: control frame t becomes encoder frame t + k.
+        pad = k * self.samples_per_frame
+        pad += (hop - (S + pad) % hop) % hop
         if pad > 0:
             wav = F.pad(wav, (0, pad))
 
         z = self.encoder(wav)  # [B, dim, T_enc]
-        if z.shape[-1] != T_ctrl:
-            z = F.interpolate(z, size=T_ctrl, mode="linear", align_corners=True)
+        # A no-op when prod(encoder.ratios) == samples_per_frame, which is the
+        # default. Otherwise it resamples the latent sequence to control rate,
+        # and costs a few ms of lookahead on top of lookahead_frames.
+        if z.shape[-1] != T_ctrl + k:
+            z = F.interpolate(z, size=T_ctrl + k, mode="linear", align_corners=True)
+        if k > 0:
+            z = z[..., k:]
 
-        logits = self.head(
-            rearrange(z, "b d t -> b t d")
-        ).float()  # [B, T_ctrl, n_t*n_b]
-        logits = rearrange(logits, "b t (p k) -> b t p k", k=self.n_buckets)
-
-        if self.training:
-            # hard=False: the forward output is the soft Gumbel-softmax
-            # distribution; (weights * centers).sum is then a smooth
-            # expectation between bucket centers. Eval still snaps to the
-            # argmax bucket, so there's a mild train/eval mismatch.
-            # hard=True (straight-through) removes that mismatch but locked
-            # the argmax when tried before the hinged entropy floor existed
-            # (eval loss bit-identical across many steps) — watch
-            # train/bucket_usage if enabling it.
-            weights = F.gumbel_softmax(
-                logits, tau=tau, hard=self.config.gumbel_hard, dim=-1
-            )
+        h = self.head(rearrange(z, "b d t -> b t d")).float()  # [B, T_ctrl, .]
+        aux: dict[str, Tensor] = {"z": z}
+        if self.config.head_type == "direct":
+            lo = self.bucket_centers[:, 0]
+            hi = self.bucket_centers[:, -1]
+            # [B, T_ctrl, n_t]
+            constrained = 0.5 * (hi + lo) + 0.5 * (hi - lo) * torch.tanh(h)
         else:
-            argmax = logits.argmax(dim=-1)
-            weights = F.one_hot(argmax, num_classes=self.n_buckets).to(logits.dtype)
-
-        constrained = (weights * self.bucket_centers).sum(dim=-1)  # [B, T_ctrl, n_t]
+            logits = rearrange(h, "b t (p k) -> b t p k", k=self.n_buckets)
+            if self.training:
+                # hard=False: the forward output is the soft Gumbel-softmax
+                # distribution; (weights * centers).sum is then a smooth
+                # expectation between bucket centers. Eval still snaps to the
+                # argmax bucket, so there's a mild train/eval mismatch.
+                # hard=True (straight-through) removes that mismatch but locked
+                # the argmax when tried before the hinged entropy floor existed
+                # (eval loss bit-identical across many steps) — watch
+                # train/bucket_usage if enabling it.
+                weights = F.gumbel_softmax(
+                    logits, tau=tau, hard=self.config.gumbel_hard, dim=-1
+                )
+            else:
+                argmax = logits.argmax(dim=-1)
+                weights = F.one_hot(argmax, num_classes=self.n_buckets).to(logits.dtype)
+            # [B, T_ctrl, n_t]
+            constrained = (weights * self.bucket_centers).sum(dim=-1)
+            aux["logits"] = logits
 
         out = torch.zeros(
             B, T_ctrl, N_PARAMS, device=wav.device, dtype=constrained.dtype
@@ -242,5 +272,5 @@ class PinkTromboneController(nn.Module):
         )
         out = out.scatter(2, freq_idx, f0.unsqueeze(-1).to(out.dtype))
         if return_aux:
-            return out, {"logits": logits, "z": z}
+            return out, aux
         return out

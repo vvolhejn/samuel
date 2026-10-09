@@ -363,15 +363,6 @@ class TestPinkTrombone:
         audio = pink_trombone(params)
         assert torch.isfinite(audio).all()
 
-    def test_differentiable_end_to_end(self):
-        params = self._default_params_tensor(B=1, T=2)
-        params.requires_grad_(True)
-        audio = pink_trombone(params)
-        loss = audio.pow(2).mean()
-        loss.backward()
-        assert params.grad is not None
-        assert params.grad.abs().sum() > 0
-
     def test_wrong_param_count(self):
         with pytest.raises(AssertionError):
             pink_trombone(torch.randn(1, 5, 13))

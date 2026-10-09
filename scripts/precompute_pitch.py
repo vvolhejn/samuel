@@ -106,6 +106,10 @@ def main() -> None:
     out["control_rate"] = np.array(
         args.sample_rate / args.samples_per_frame, dtype=np.float64
     )
+    out["source"] = np.array("pyin")
+    out["fmin"] = np.array(args.fmin, dtype=np.float64)
+    out["fmax"] = np.array(args.fmax, dtype=np.float64)
+    # Kept for caches read by code predating the generic fmin/fmax keys.
     out["pyin_fmin"] = np.array(args.fmin, dtype=np.float64)
     out["pyin_fmax"] = np.array(args.fmax, dtype=np.float64)
     out["pyin_frame_length"] = np.array(args.frame_length)

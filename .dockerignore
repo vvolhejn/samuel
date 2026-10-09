@@ -1,0 +1,19 @@
+# The backend image needs only src/ (weights come from the Hub), but its build
+# context is the repo root — where runs/ alone is 64 GB. Without this, Docker
+# would send all of it to the daemon.
+.git/
+.venv*/
+runs/
+manifests/
+artifacts/
+logs/
+notebooks/
+tests/
+examples/
+scripts/
+webapp/
+Pink-Trombone/
+train.log
+**/__pycache__/
+**/.ruff_cache/
+**/.pytest_cache/

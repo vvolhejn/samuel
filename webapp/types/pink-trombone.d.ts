@@ -6,6 +6,17 @@ interface PinkTromboneConstriction {
   diameter: AudioParam;
 }
 
+/** Detail of the element's "voicebox" event: one step of a drag on the glottis
+ * pad. Cancelable — calling preventDefault() stops the element from setting the
+ * parameters itself, which is what lets us schedule them instead (see
+ * GlottisUI._report in the fork). `frequency`/`tenseness` are absent on "end". */
+interface VoiceboxEventDetail {
+  phase: "start" | "move" | "end";
+  frequency?: number;
+  tenseness?: number;
+  loudness?: number;
+}
+
 interface PinkTromboneElement extends HTMLElement {
   setAudioContext(audioContext?: AudioContext): Promise<AudioContext>;
   audioContext: AudioContext;
@@ -37,10 +48,17 @@ declare global {
         > & {
           /** Present (and not "false") ⇒ the tract is drawn greyed out. */
           inactive?: string;
+          /** "false" ⇒ drags on the tract and the voicebox are ignored.
+           * Absent ⇒ they drive the synth, as in the original. */
+          interactive?: string;
         };
       }
     }
   }
 }
 
-export type { PinkTromboneElement, PinkTromboneConstriction };
+export type {
+  PinkTromboneElement,
+  PinkTromboneConstriction,
+  VoiceboxEventDetail,
+};

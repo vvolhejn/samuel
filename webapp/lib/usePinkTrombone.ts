@@ -15,6 +15,8 @@ const LEAD_S = 0.15;
 const FADE_OUT_S = 0.05;
 /** Smoothing for direct (scrub/stop) parameter jumps. */
 const SCRUB_TAU_S = 0.02;
+/** Diameter at which a constriction stops pinching the tract. */
+const OPEN_DIAMETER = 3;
 /** Headroom when re-scheduling mid-utterance (setPlaybackSpeed). Short enough
  * to feel instant, long enough that the audio thread hasn't rendered past it. */
 const RESCHEDULE_LEAD_S = 0.05;
@@ -49,6 +51,19 @@ export interface PinkTromboneHandle {
   scrub: (response: SynthResponse, frac: number) => void;
   /** Fade the voicing after scrubbing (the tract pose stays in place). */
   endScrub: () => void;
+  /** Hold the glottis at one (frequency, voiceness) and sound it — the
+   * voicebox pad, played by hand. Freezes any automation in progress but
+   * leaves the tract pose alone, so the shape on screen, whether the model or
+   * a drag put it there, is the one you hear. */
+  voice: (frequency: number, voiceness: number) => void;
+  /** Start sounding wherever the glottis already stands — entering manual
+   * control, which holds the note until it is left again. */
+  startVoice: () => void;
+  /** Fade the voicing out (the pose stays in place). */
+  endVoice: () => void;
+  /** The synth's AudioContext, or null before init(). Shared so callers can
+   * decode and play their own audio on the same clock and device. */
+  audioContext: () => AudioContext | null;
   /** Start capturing the tract visualization and the synth's output. No-op if
    * the browser can't record, or if a capture is already running. */
   startRecording: () => void;
@@ -109,7 +124,7 @@ function curveValues(response: SynthResponse): Float32Array[] {
     // Older checkpoints predate the lip constriction; leave it open then.
     params.lipDiameter
       ? Float32Array.from(params.lipDiameter)
-      : new Float32Array(params.voiceness.length).fill(3),
+      : new Float32Array(params.voiceness.length).fill(OPEN_DIAMETER),
     Float32Array.from(params.intensity),
   ];
 }
@@ -189,9 +204,9 @@ export function usePinkTrombone(): PinkTromboneHandle {
     // Two persistent constriction slots driven by the model trajectories:
     // the tongue-tip constriction (movable index) and the lip constriction
     // (fixed at the last tract index, mirrors _LIP_INDEX in pink_trombone.py).
-    // Start fully open (diameter 3 ≈ no constriction).
-    const constriction = element.newConstriction(33, 3);
-    const lipConstriction = element.newConstriction(43, 3);
+    // Start fully open.
+    const constriction = element.newConstriction(33, OPEN_DIAMETER);
+    const lipConstriction = element.newConstriction(43, OPEN_DIAMETER);
     // newConstriction() hands out the first slot it considers free, so a
     // regression there would silently give both trajectories the same
     // AudioParams (the second setValueCurveAtTime then overwrites the first).
@@ -340,7 +355,13 @@ export function usePinkTrombone(): PinkTromboneHandle {
     const constriction = constrictionRef.current;
     const lipConstriction = lipConstrictionRef.current;
     const masterGain = masterGainRef.current;
-    if (!playback || !element || !constriction || !lipConstriction || !masterGain)
+    if (
+      !playback ||
+      !element ||
+      !constriction ||
+      !lipConstriction ||
+      !masterGain
+    )
       return;
     if (speed === playback.speed) return;
     // Without cancelAndHoldAtTime the running curve cannot be truncated, and
@@ -396,7 +417,11 @@ export function usePinkTrombone(): PinkTromboneHandle {
     const masterGain = masterGainRef.current;
     if (!element || !constriction || !lipConstriction || !masterGain) return;
     const now = element.audioContext.currentTime;
-    for (const param of automatedParams(element, constriction, lipConstriction)) {
+    for (const param of automatedParams(
+      element,
+      constriction,
+      lipConstriction,
+    )) {
       cancelAndHold(param, now);
     }
     cancelAndHold(masterGain.gain, now);
@@ -434,13 +459,76 @@ export function usePinkTrombone(): PinkTromboneHandle {
     scheduleEndRef.current = now;
   }, []);
 
-  const endScrub = useCallback(() => {
+  const voice = useCallback((frequency: number, voiceness: number) => {
+    playTokenRef.current++;
+    playbackRef.current = null;
+    const element = elementRef.current;
+    const constriction = constrictionRef.current;
+    const lipConstriction = lipConstrictionRef.current;
+    const masterGain = masterGainRef.current;
+    if (!element || !constriction || !lipConstriction || !masterGain) return;
+    const ctx = element.audioContext;
+    void ctx.resume(); // called from a user gesture
+    const now = ctx.currentTime;
+
+    // Freeze the tract where it stands: without this an interrupted utterance
+    // keeps moving the tongue under your hand for the rest of its curves.
+    for (const param of automatedParams(
+      element,
+      constriction,
+      lipConstriction,
+    )) {
+      cancelAndHold(param, now);
+    }
+    // Same mapping as the model's synth and the voicebox pad's own readout (see
+    // curveValues): tenseness = voiceness, loudness = voiceness ** 0.25.
+    element.frequency.setTargetAtTime(frequency, now, SCRUB_TAU_S);
+    element.tenseness.setTargetAtTime(voiceness, now, SCRUB_TAU_S);
+    element.loudness.setTargetAtTime(
+      Math.pow(Math.max(voiceness, 1e-6), 0.25),
+      now,
+      SCRUB_TAU_S,
+    );
+    // The model drives intensity as its energy envelope; by hand it's just the
+    // on switch, so it's the master gain that gates the sound.
+    element.intensity.setTargetAtTime(1, now, SCRUB_TAU_S);
+    cancelAndHold(masterGain.gain, now);
+    masterGain.gain.setTargetAtTime(1, now, 0.03);
+    scheduleEndRef.current = now;
+  }, []);
+
+  /** Sound the note the glottis is already on. Read off the AudioParams rather
+   * than passed in, so entering manual control picks up wherever the last
+   * playback left the voice — the same values the pad's handle is drawn at. */
+  const startVoice = useCallback(() => {
+    const element = elementRef.current;
+    const constriction = constrictionRef.current;
+    const lipConstriction = lipConstrictionRef.current;
+    if (!element || !constriction || !lipConstriction) return;
+    voice(element.frequency.value, element.tenseness.value);
+    // The model's two constrictions belong to playback. By hand the tract is
+    // shaped by dragging it, and a constriction left pinched by the last
+    // utterance would keep muffling every pose you drag to.
+    const now = element.audioContext.currentTime;
+    constriction.diameter.setTargetAtTime(OPEN_DIAMETER, now, SCRUB_TAU_S);
+    lipConstriction.diameter.setTargetAtTime(OPEN_DIAMETER, now, SCRUB_TAU_S);
+  }, [voice]);
+
+  /** Fade the voicing out, leaving every param where it stands. Shared by the
+   * scrub bar (held while the pointer is down) and manual control (held until
+   * it's switched off). */
+  const fadeVoicing = useCallback(() => {
     const masterGain = masterGainRef.current;
     if (!masterGain) return;
     const now = masterGain.context.currentTime;
     cancelAndHold(masterGain.gain, now);
     masterGain.gain.setTargetAtTime(0, now, FADE_OUT_S);
   }, []);
+
+  const audioContext = useCallback(
+    () => elementRef.current?.audioContext ?? null,
+    [],
+  );
 
   const startRecording = useCallback(() => {
     if (recorderRef.current) return;
@@ -467,7 +555,11 @@ export function usePinkTrombone(): PinkTromboneHandle {
       setPlaybackSpeed,
       stop,
       scrub,
-      endScrub,
+      endScrub: fadeVoicing,
+      voice,
+      startVoice,
+      endVoice: fadeVoicing,
+      audioContext,
       startRecording,
       stopRecording,
       ready,
@@ -479,7 +571,10 @@ export function usePinkTrombone(): PinkTromboneHandle {
       setPlaybackSpeed,
       stop,
       scrub,
-      endScrub,
+      fadeVoicing,
+      voice,
+      startVoice,
+      audioContext,
       startRecording,
       stopRecording,
       ready,

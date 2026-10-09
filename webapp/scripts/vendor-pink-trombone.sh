@@ -17,6 +17,9 @@ PT_SRC=../Pink-Trombone
 PT_OUT=public/pink-trombone
 VAD_OUT=public/vad
 
+# Both dirs are gitignored and fully regenerated here, so wipe them rather than
+# copying over the top: a file that stops being vendored must stop shipping.
+rm -rf "$PT_OUT" "$VAD_OUT"
 mkdir -p "$PT_OUT" "$VAD_OUT"
 
 # Separate pnpm project (its only dependency is rollup), not a workspace member.
@@ -40,7 +43,10 @@ ORT_DIST=$(node -e "console.log(require('path').dirname(require.resolve('onnxrun
 
 cp "$VAD_DIST/silero_vad_v5.onnx" "$VAD_DIST/silero_vad_legacy.onnx" \
    "$VAD_DIST/vad.worklet.bundle.min.js" "$VAD_OUT/"
-cp "$ORT_DIST"/ort-wasm-simd-threaded*.wasm "$ORT_DIST"/ort-wasm-simd-threaded*.mjs "$VAD_OUT/"
+# Only the plain wasm build: MicVAD imports `onnxruntime-web/wasm`, so the
+# jsep/jspi/asyncify variants are never fetched (66 MB of the 79 MB). The jsep
+# one is also 25.6 MB, over Cloudflare's 25 MiB per-asset cap.
+cp "$ORT_DIST"/ort-wasm-simd-threaded.wasm "$ORT_DIST"/ort-wasm-simd-threaded.mjs "$VAD_OUT/"
 
 echo "Vendored:"
 ls -la "$PT_OUT" "$VAD_OUT"

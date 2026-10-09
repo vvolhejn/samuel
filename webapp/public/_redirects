@@ -1,0 +1,4 @@
+# /iclc is the URL given in the ICLC submission. It points at the live app for
+# now. If the app changes after the submission, put a frozen copy behind /iclc
+# and remove this line.
+/iclc / 302

@@ -32,10 +32,10 @@ from tqdm import tqdm
 import wandb
 from samuel.config import TrainConfig
 from samuel.data import (
+    _fill_chunk,
     _load_pitch_cache,
     _load_resampled,
     build_dataloader,
-    fill_unvoiced,
     load_manifest,
     split_train_val,
 )
@@ -301,6 +301,86 @@ def _acceleration_loss(
     )
 
 
+def _rest_targets_norm(
+    module: PinkTromboneController, targets: dict[str, float]
+) -> torch.Tensor:
+    """Rest targets, given in raw units, rescaled to the trajectories' [0, 1]."""
+    lo = module.bucket_centers[:, 0]
+    hi = module.bucket_centers[:, -1]
+    tgt = torch.tensor(
+        [targets.get(n, 0.0) for n in module.trainable_names_],
+        dtype=lo.dtype,
+        device=lo.device,
+    )
+    return (tgt - lo) / (hi - lo).clamp_min(1e-8)
+
+
+def _rest_pose_distance(
+    params: torch.Tensor,
+    module: PinkTromboneController,
+    targets: dict[str, float],
+) -> torch.Tensor:
+    """Per-param mean ``|p_norm - target_norm|``; ``[n_trainable]``, unweighted."""
+    tgt_norm = _rest_targets_norm(module, targets)
+    mask = torch.tensor(
+        [1.0 if n in targets else 0.0 for n in module.trainable_names_],
+        dtype=tgt_norm.dtype,
+        device=tgt_norm.device,
+    )
+    p_norm = _normalized_trainable_params(params, module)
+    return (p_norm - tgt_norm.view(1, 1, -1)).abs().mean(dim=(0, 1)) * mask
+
+
+def _rest_pose_loss(
+    params: torch.Tensor,
+    module: PinkTromboneController,
+    targets: dict[str, float],
+    weights: dict[str, float],
+) -> torch.Tensor:
+    """``sum_p w_p * mean |p_norm - target_norm|``; see LossConfig.rest."""
+    dist = _rest_pose_distance(params, module, targets)
+    coeffs = torch.tensor(
+        [weights.get(n, 1.0) for n in module.trainable_names_],
+        dtype=dist.dtype,
+        device=dist.device,
+    )
+    return (dist * coeffs).sum()
+
+
+@torch.no_grad()
+def _silent_frame_rest_metrics(
+    params: torch.Tensor,
+    module: PinkTromboneController,
+    target: torch.Tensor,
+    cfg: TrainConfig,
+    silence_db: float = -20.0,
+) -> dict[str, float]:
+    """Rest-pose distance on frames quieter than ``silence_db`` re. target_rms."""
+    spf = module.samples_per_frame
+    T = params.shape[1]
+    S = T * spf
+    tgt = F.pad(target, (0, max(0, S - target.shape[-1])))[:, :S]
+    frame_rms = tgt.view(tgt.shape[0], T, spf).pow(2).mean(-1).sqrt()  # [N, T]
+    silent = frame_rms < cfg.data.target_rms * 10 ** (silence_db / 20.0)
+    out = {"eval/silent_frac": float(silent.float().mean())}
+    if not bool(silent.any()):
+        return out
+
+    names = module.trainable_names_
+    targets = cfg.loss.rest_targets
+    tgt_norm = _rest_targets_norm(module, targets)
+    p_norm = _normalized_trainable_params(params, module)
+    dist = (p_norm - tgt_norm.view(1, 1, -1)).abs()[silent]  # [n_silent, n_t]
+    per_param = dist.mean(dim=0)
+    total = 0.0
+    for name, v in zip(names, per_param.tolist()):
+        if name in targets:
+            out[f"eval/rest_dist_silent/{name}"] = v
+            total += v
+    out["eval/rest_loss_silent"] = total
+    return out
+
+
 @torch.no_grad()
 def _reversal_rate(params: torch.Tensor, module: PinkTromboneController) -> float:
     """Fraction of moving frames whose direction flips.
@@ -344,27 +424,30 @@ def _controller_diagnostics(
     under ``diag/`` to keep the train/eval namespaces clean.
 
     One bucket histogram per trainable param, ``bucket_usage``: hard argmax
-    counts (what eval and hard-Gumbel pick).
+    counts (what eval and hard-Gumbel pick). The direct head emits no logits,
+    so only the encoder stats are logged for it.
     """
-    logits = aux["logits"].detach().float()  # [B, T, n_t, n_b]
     z = aux["z"].detach().float()  # [B, dim, T]
-    _, _, _, n_b = logits.shape
-
-    top2 = logits.topk(2, dim=-1).values
-    margin = top2[..., 0] - top2[..., 1]  # [B, T, n_t]
-    argmax = logits.argmax(-1)  # [B, T, n_t]
-    edges = np.arange(n_b + 1) - 0.5
 
     out: dict[str, float | wandb.Histogram] = {}
-    for j, name in enumerate(trainable_names):
-        a_j = argmax[..., j].flatten()
-        counts = torch.bincount(a_j, minlength=n_b).float()
-        out[f"diag/margin/{name}"] = margin[..., j].mean().item()
-        out[f"diag/bucket_usage/{name}"] = wandb.Histogram(
-            np_histogram=(counts.cpu().numpy(), edges)
-        )
+    if "logits" in aux:
+        logits = aux["logits"].detach().float()  # [B, T, n_t, n_b]
+        _, _, _, n_b = logits.shape
 
-    out["diag/margin/mean"] = margin.mean().item()
+        top2 = logits.topk(2, dim=-1).values
+        margin = top2[..., 0] - top2[..., 1]  # [B, T, n_t]
+        argmax = logits.argmax(-1)  # [B, T, n_t]
+        edges = np.arange(n_b + 1) - 0.5
+
+        for j, name in enumerate(trainable_names):
+            a_j = argmax[..., j].flatten()
+            counts = torch.bincount(a_j, minlength=n_b).float()
+            out[f"diag/margin/{name}"] = margin[..., j].mean().item()
+            out[f"diag/bucket_usage/{name}"] = wandb.Histogram(
+                np_histogram=(counts.cpu().numpy(), edges)
+            )
+
+        out["diag/margin/mean"] = margin.mean().item()
     out["diag/z_mean_norm"] = z.norm(dim=1).mean().item()
     # Per-feature std across batch+time, averaged. Low ⇒ encoder collapsed.
     out["diag/z_std_per_feat"] = z.std(dim=(0, 2)).mean().item()
@@ -435,7 +518,10 @@ def _eval_setup(
             "data.pitch_cache_path is required (eval needs precomputed f0)"
         )
     pitch = _load_pitch_cache(
-        cfg.data.pitch_cache_path, cfg.data.sample_rate, samples_per_frame
+        cfg.data.pitch_cache_path,
+        cfg.data.sample_rate,
+        samples_per_frame,
+        cfg.data.pitch_source,
     )
 
     n_eval = min(cfg.log.n_eval_clips, len(val_files))
@@ -461,7 +547,7 @@ def _eval_setup(
         if have > 0:
             f0_chunk[:have] = f0_full[:have]
             voiced_chunk[:have] = voiced_full[:have]
-        f0_filled = fill_unvoiced(f0_chunk, voiced_chunk, pitch.fmin, pitch.fmax)
+        f0_filled = _fill_chunk(f0_chunk, voiced_chunk, pitch)
 
         wavs.append(torch.from_numpy(audio))
         f0s.append(torch.from_numpy(f0_filled))
@@ -641,6 +727,16 @@ def _evaluate(
         "eval/param_accel": float(_normalized_trainable_accels(params, model).mean()),
         "eval/reversal_rate": _reversal_rate(params, model),
     }
+    if cfg.loss.rest_targets:
+        rest_dist = _rest_pose_distance(params, model, cfg.loss.rest_targets)
+        out["eval/rest_loss"] = _rest_pose_loss(
+            params, model, cfg.loss.rest_targets, cfg.loss.rest_weights
+        ).item()
+        for name, v in zip(model.trainable_names_, rest_dist.tolist()):
+            if name in cfg.loss.rest_targets:
+                out[f"eval/rest_dist/{name}"] = v
+        out.update(_silent_frame_rest_metrics(params, model, target, cfg))
+
     # Per-param variation too: the scalar mean hides which param is jittery,
     # which is exactly what the smoothing/rate-limit experiments turn on.
     per_param = _normalized_trainable_diffs(params, model).mean(dim=(0, 1))
@@ -760,11 +856,22 @@ def main(hydra_cfg: DictConfig) -> None:
 
     # Model
     model = PinkTromboneController(cfg.model).to(device)
-    for field in ("smooth_weights", "accel_weights"):
+    if cfg.run.init_ckpt is not None:
+        ckpt = torch.load(cfg.run.init_ckpt, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        if rank == 0:
+            print(f"Initialised model from {cfg.run.init_ckpt} (step {ckpt['step']})")
+    for field in ("smooth_weights", "accel_weights", "rest_targets", "rest_weights"):
         unknown = set(getattr(cfg.loss, field)) - set(model.trainable_names_)
         if unknown:
             raise ValueError(
                 f"loss.{field} names non-trainable params: {sorted(unknown)}"
+            )
+    for name, value in cfg.loss.rest_targets.items():
+        lo, hi = cfg.model.param_spec[name][:2]
+        if not lo <= value <= hi:
+            raise ValueError(
+                f"loss.rest_targets[{name}]={value} outside param range [{lo}, {hi}]"
             )
     frame_rate = cfg.model.frame_rate
     samples_per_frame = cfg.model.samples_per_frame
@@ -874,6 +981,7 @@ def main(hydra_cfg: DictConfig) -> None:
             f"[eval] step={step} "
             f"loss={metrics.get('eval/loss', float('nan')):.4f} "
             f"wer={metrics.get('eval/wer', float('nan')):.3f} "
+            f"pvar={metrics.get('eval/param_variation', float('nan')):.5f} "
             f"in {metrics.get('eval/duration_s', float('nan')):.1f}s"
         )
 
@@ -929,21 +1037,38 @@ def main(hydra_cfg: DictConfig) -> None:
         # saturate to one-hot (which kills the soft-Gumbel gradient) but
         # positions above the floor feel no pressure toward uniform.
         # Hinged per position, not on the mean: uncertain positions must
-        # not offset saturated ones.
-        logits = aux["logits"].float()
-        log_probs = F.log_softmax(logits, dim=-1)
-        entropy_per_pos = -(log_probs.exp() * log_probs).sum(-1)  # [B, T, P]
-        entropy = entropy_per_pos.mean()
-        entropy_penalty = F.relu(cfg.loss.entropy_floor - entropy_per_pos).mean()
+        # not offset saturated ones. The direct head has no logits, so the
+        # penalty is zero there.
+        if "logits" in aux:
+            logits = aux["logits"].float()
+            log_probs = F.log_softmax(logits, dim=-1)
+            entropy_per_pos = -(log_probs.exp() * log_probs).sum(-1)  # [B, T, P]
+            entropy = entropy_per_pos.mean()
+            entropy_penalty = F.relu(cfg.loss.entropy_floor - entropy_per_pos).mean()
+        else:
+            entropy = torch.zeros((), device=device)
+            entropy_penalty = torch.zeros((), device=device)
         # Always computed (it's cheap) so the raw value can be compared across
         # runs; contributes to the gradient only when weighted.
         smooth_loss = _smoothness_loss(params, module, cfg.loss.smooth_weights)
         accel_loss = _acceleration_loss(params, module, cfg.loss.accel_weights)
+        rest_loss = _rest_pose_loss(
+            params, module, cfg.loss.rest_targets, cfg.loss.rest_weights
+        )
+        reg_scale = (
+            min(1.0, step / cfg.loss.reg_ramp_steps)
+            if cfg.loss.reg_ramp_steps > 0
+            else 1.0
+        )
         loss = (
             recon_loss
             + cfg.loss.entropy * entropy_penalty
-            + cfg.loss.smooth * smooth_loss
-            + cfg.loss.accel * accel_loss
+            + reg_scale
+            * (
+                cfg.loss.smooth * smooth_loss
+                + cfg.loss.accel * accel_loss
+                + cfg.loss.rest * rest_loss
+            )
         )
 
         loss.backward()
@@ -973,7 +1098,9 @@ def main(hydra_cfg: DictConfig) -> None:
                 "train/entropy_penalty": entropy_penalty.item(),
                 "train/smooth_loss": smooth_loss.item(),
                 "train/accel_loss": accel_loss.item(),
+                "train/rest_loss": rest_loss.item(),
                 "train/lr": optimizer.param_groups[0]["lr"],
+                "train/reg_scale": reg_scale,
                 "train/tau": tau,
                 "train/grad_norm": float(grad_norm),
                 "train/epoch": epoch,
@@ -1001,6 +1128,7 @@ def main(hydra_cfg: DictConfig) -> None:
                 f"[eval] step={step} "
                 f"loss={metrics.get('eval/loss', float('nan')):.4f} "
                 f"wer={metrics.get('eval/wer', float('nan')):.3f} "
+                f"pvar={metrics.get('eval/param_variation', float('nan')):.5f} "
                 f"in {metrics.get('eval/duration_s', float('nan')):.1f}s"
             )
 

@@ -70,3 +70,67 @@ class TestLibriLightChunks:
             f.path for f in files
         )
         assert not (set(f.path for f in r0) & set(f.path for f in r1))
+
+
+class TestCausalPitchFill:
+    def test_fill_unvoiced_causal_holds_last(self):
+        from samuel.data import fill_unvoiced_causal
+
+        f0 = np.array([0.0, 200.0, 0.0, 0.0, 300.0, 0.0], dtype=np.float32)
+        voiced = np.array([False, True, False, False, True, False])
+        out = fill_unvoiced_causal(f0, voiced, 70.0, 500.0)
+        # leading unvoiced -> midpoint; interior/trailing -> hold last voiced
+        np.testing.assert_allclose(out, [285.0, 200.0, 200.0, 200.0, 300.0, 300.0])
+
+    def test_fill_unvoiced_causal_all_unvoiced(self):
+        from samuel.data import fill_unvoiced_causal
+
+        out = fill_unvoiced_causal(
+            np.zeros(4, np.float32), np.zeros(4, bool), 70.0, 500.0
+        )
+        np.testing.assert_allclose(out, [285.0] * 4)
+
+    def test_load_pitch_cache_source_mismatch(self, tmp_path: Path):
+        from samuel.data import _load_pitch_cache
+
+        path = tmp_path / "cache.npz"
+        np.savez(
+            path,
+            sample_rate=np.array(44100),
+            samples_per_frame=np.array(512),
+            source=np.array("yin"),
+            fmin=np.array(70.0),
+            fmax=np.array(500.0),
+            n_files=np.array(1),
+            f0_0=np.array([0.0, 200.0], np.float32),
+            voiced_0=np.array([False, True]),
+        )
+        cache = _load_pitch_cache(path, 44100, 512, "yin")
+        assert cache.prefilled
+        # unvoiced frame was filled at load
+        np.testing.assert_allclose(cache.by_file[0][0], [285.0, 200.0])
+        try:
+            _load_pitch_cache(path, 44100, 512, "pyin")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("source mismatch not detected")
+
+    def test_old_cache_defaults_to_pyin(self, tmp_path: Path):
+        from samuel.data import _load_pitch_cache
+
+        path = tmp_path / "old.npz"
+        np.savez(
+            path,
+            sample_rate=np.array(44100),
+            samples_per_frame=np.array(512),
+            pyin_fmin=np.array(70.0),
+            pyin_fmax=np.array(500.0),
+            n_files=np.array(1),
+            f0_0=np.array([0.0, 200.0], np.float32),
+            voiced_0=np.array([False, True]),
+        )
+        cache = _load_pitch_cache(path, 44100, 512, "pyin")
+        assert cache.source == "pyin" and not cache.prefilled
+        # raw values are untouched for pyin caches
+        np.testing.assert_allclose(cache.by_file[0][0], [0.0, 200.0])
