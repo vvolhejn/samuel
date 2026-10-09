@@ -50,6 +50,9 @@ dev = [
     "pytest>=9.0.2",
 ]
 
+[tool.uv]
+exclude-newer = "7 days"
+
 [tool.uv.workspace]
 members = [
     "foo/foop",
