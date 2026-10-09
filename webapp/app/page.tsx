@@ -19,7 +19,7 @@ import {
   PrecomputedIndex,
   SynthResponse,
 } from "@/lib/audio";
-import { insecureContextMessage } from "@/lib/secureContext";
+import { insecureContextMessage, isLoopbackOrigin } from "@/lib/secureContext";
 import { setAudioSessionType } from "@/lib/audioSession";
 import { downloadBlob, makeZip } from "@/lib/zip";
 import { usePinkTrombone } from "@/lib/usePinkTrombone";
@@ -52,6 +52,7 @@ const BLUR_MUTE_MS = 60_000;
 /** Nothing ever invalidates the secure-context snapshot. */
 const subscribeNever = () => () => {};
 
+
 /** One round trip: what the model heard, and what it said back. Held in memory
  * for the whole session, so cap it — a few seconds of 16 kHz float WAV is
  * ~250 kB per side, and nothing else evicts them. */
@@ -67,6 +68,10 @@ type SynthRequest = {
 
 interface Recording {
   kind: "mic" | "dataset";
+  /** When the utterance was made — stamped as the mtime on every file for this
+   * utterance in the session zip, so a downloaded pair keeps its wall-clock
+   * order after being extracted. */
+  timestamp: Date;
   /** Audio the model was given: a WAV from the mic, an MP3 for a clip. */
   input: Blob;
   /** WAV of the model's output, rendered by the Python synth. Null for a
@@ -82,6 +87,17 @@ interface Recording {
  * and comes back in no time, which reads as a button that didn't work — and
  * makes the six clips feel unlike the mic, which really does take a moment. */
 const FAKE_THINKING_MS = [500, 1000] as const;
+
+/** Local-time YYYY-MM-DDTHH-MM-SS stamp for the session zip's filename: ISO
+ * order for sorting, colons swapped for dashes so it survives every filesystem,
+ * local because that's what a human reads on the file. */
+function filenameStamp(d: Date = new Date()): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return (
+    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` +
+    `T${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`
+  );
+}
 
 const sleep = (ms: number) =>
   new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -130,6 +146,13 @@ export default function Home() {
     subscribeNever,
     insecureContextMessage,
     () => null,
+  );
+  /** Self-hosted (loopback origin) opens the debug panel too — see the render
+   * below. Client-only for the same reason as `insecure`. */
+  const isLocalhost = useSyncExternalStore(
+    subscribeNever,
+    isLoopbackOrigin,
+    () => false,
   );
 
   const trombone = usePinkTrombone();
@@ -358,7 +381,8 @@ export default function Home() {
   }, []);
 
   /** One zip of every input/output pair this session, plus the tract video for
-   * each. */
+   * each. Filename and per-file mtimes carry local wall-clock time so multiple
+   * downloads sit apart in a folder and each utterance keeps its own moment. */
   const downloadHistory = useCallback(async () => {
     const entries = await Promise.all(
       historyRef.current.flatMap((recording, i) => {
@@ -377,11 +401,15 @@ export default function Home() {
           ]);
         }
         return files.map(([name, blob]) =>
-          blob.arrayBuffer().then((b) => ({ name, bytes: new Uint8Array(b) })),
+          blob.arrayBuffer().then((b) => ({
+            name,
+            bytes: new Uint8Array(b),
+            mtime: recording.timestamp,
+          })),
         );
       }),
     );
-    downloadBlob(makeZip(entries), "samuel-session.zip");
+    downloadBlob(makeZip(entries), `samuel-session-${filenameStamp()}.zip`);
   }, []);
 
   /** One round trip through the model: send it some audio, keep what comes
@@ -396,6 +424,7 @@ export default function Home() {
         original.set(inputUrl);
         const entry = remember({
           kind,
+          timestamp: new Date(),
           input: inputBlob,
           output: response.synth_audio_b64
             ? wavBlob(response.synth_audio_b64)
@@ -926,10 +955,13 @@ export default function Home() {
           </p>
         )}
         {error && <p className="text-sm text-red-600">{error}</p>}
-        {/* Dev-only: inlined at build time, so the deployed bundle has no
-            debug UI at all. Never on a phone either — it's a development
-            affordance, and the screen is needed for the drawing. */}
-        {process.env.NODE_ENV === "development" && (
+        {/* Dev builds and self-hosted (loopback) runs get the debug panel: the
+            first via a build-time inline that tree-shakes it out of the deployed
+            bundle, the second via a runtime hostname check that catches
+            samuel.server, which serves a production build. Never on a phone —
+            it's a development affordance, and the screen is needed for the
+            drawing. */}
+        {(process.env.NODE_ENV === "development" || isLocalhost) && (
           <div className="hidden md:block">
             <DebugPanel
               open={debugOpen}

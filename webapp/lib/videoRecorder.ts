@@ -1,9 +1,11 @@
 /**
  * Records the vocal-tract visualization as a video with the synth's audio.
  *
- * There is no single canvas to capture: TractUI stacks two transparent ones
- * (the static background labels below, the animated tract above). So we
- * composite them onto an offscreen canvas every animation frame — over the
+ * There is no single canvas to capture: TractUI stacks a background + tract
+ * pair, and GlottisUI stacks another pair for the voicebox strip below it —
+ * each canvas transparent, each anchored to its own row of the pink-trombone
+ * grid. So we composite them onto an offscreen canvas every animation frame,
+ * placing each one at its layout offset within the host element — over the
  * page's white, since a transparent webm renders black in most players — and
  * capture that instead.
  */
@@ -32,11 +34,16 @@ export interface VideoRecorder {
 }
 
 /**
- * Start compositing `canvases` (bottom first) and recording them together with
- * `audio`. Returns null when the browser has no MediaRecorder or canvas
- * capture — the caller just gets no video, everything else still works.
+ * Start compositing `canvases` (bottom first) inside `host` and recording them
+ * together with `audio`. Composite dimensions come from the host so the frame
+ * matches its design bitmap; each canvas is drawn at its layout offset within
+ * the host, so the tract's 600×500 pair and the voicebox's 600×125 pair land
+ * where they visually sit rather than all at (0, 0). Returns null when the
+ * browser has no MediaRecorder or canvas capture — the caller just gets no
+ * video, everything else still works.
  */
 export function startVideoRecording(
+  host: HTMLElement,
   canvases: HTMLCanvasElement[],
   audio: MediaStream | null,
 ): VideoRecorder | null {
@@ -45,8 +52,10 @@ export function startVideoRecording(
   if (!first || typeof first.captureStream !== "function") return null;
 
   const composite = document.createElement("canvas");
-  composite.width = first.width;
-  composite.height = first.height;
+  // offsetWidth/Height ignore CSS transforms, so they give the host's design
+  // bitmap (600×600 for pink-trombone) even when TractStage has scaled it.
+  composite.width = host.offsetWidth;
+  composite.height = host.offsetHeight;
   const context = composite.getContext("2d");
   if (!context) return null;
 
@@ -55,7 +64,17 @@ export function startVideoRecording(
     frame = requestAnimationFrame(draw);
     context.fillStyle = PAGE_BACKGROUND;
     context.fillRect(0, 0, composite.width, composite.height);
-    for (const canvas of canvases) context.drawImage(canvas, 0, 0);
+    // getBoundingClientRect returns transform-scaled coords, so both sides of
+    // the ratio scale together and the offsets come out in composite pixels.
+    const hostRect = host.getBoundingClientRect();
+    const scaleX = hostRect.width ? composite.width / hostRect.width : 1;
+    const scaleY = hostRect.height ? composite.height / hostRect.height : 1;
+    for (const canvas of canvases) {
+      const rect = canvas.getBoundingClientRect();
+      const x = (rect.left - hostRect.left) * scaleX;
+      const y = (rect.top - hostRect.top) * scaleY;
+      context.drawImage(canvas, x, y);
+    }
   });
 
   const stream = composite.captureStream(FPS);
@@ -78,8 +97,12 @@ export function startVideoRecording(
   recorder.ondataavailable = (event) => {
     if (event.data.size > 0) chunks.push(event.data);
   };
-  // No timeslice: one dataavailable event, delivered on stop().
-  recorder.start();
+  // Timeslice keeps MediaRecorder from buffering the whole recording internally.
+  // Without it, long recordings sometimes truncate their tail on stop — one
+  // dataavailable event has to flush everything, and Chrome will drop clusters
+  // rather than delay the stop. A 1 s slice gives dozens of small chunks with
+  // no user-visible cost.
+  recorder.start(1000);
 
   return {
     stop: () =>

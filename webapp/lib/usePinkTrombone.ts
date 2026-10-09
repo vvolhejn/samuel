@@ -531,8 +531,9 @@ export function usePinkTrombone(): PinkTromboneHandle {
   );
 
   const startRecording = useCallback(() => {
-    if (recorderRef.current) return;
+    if (recorderRef.current || !elementRef.current) return;
     recorderRef.current = startVideoRecording(
+      elementRef.current,
       canvasesRef.current,
       recordDestRef.current?.stream ?? null,
     );

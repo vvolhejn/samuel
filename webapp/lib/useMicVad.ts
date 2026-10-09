@@ -1,14 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { MicVAD } from "@ricky0123/vad-web";
 import { levelToSlots, makeLevelStore } from "@/lib/levelStore";
-import { micErrorMessage } from "@/lib/secureContext";
+import { isLoopbackOrigin, micErrorMessage } from "@/lib/secureContext";
 import { setAudioSessionType } from "@/lib/audioSession";
 import { MicProcessing, MIC_PROCESSING_DEFAULTS } from "@/lib/micProcessing";
 import { useMirroredState } from "@/lib/useMirroredState";
 
 /** Ceiling on one recording. Past it we stop and send what was said: the model
  * takes about as long as the clip does, so an unbroken monologue would otherwise
- * leave you waiting. */
+ * leave you waiting. Lifted on a loopback origin, where nobody is waiting for
+ * a container to warm up. */
 const MAX_RECORDING_MS = 30_000;
 
 /** vad-web's hysteresis, which is all we use it for: a frame above the first is
@@ -218,7 +219,7 @@ export function useMicVad({
             const frames = framesRef.current;
             frames.push({ audio: frame, isSpeech });
             const ms = frames.length * (frame.length / 16);
-            if (ms >= MAX_RECORDING_MS) void stopMic(true);
+            if (!isLoopbackOrigin() && ms >= MAX_RECORDING_MS) void stopMic(true);
           },
         });
       }

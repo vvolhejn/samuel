@@ -30,6 +30,15 @@ function computeInsecureContextMessage(): string | null {
   );
 }
 
+/** True when the page is being served from a loopback origin, i.e. a
+ * self-hosted samuel.server run. A signal to switch on developer affordances
+ * (the debug panel, an unbounded recording length) — not a security check. */
+export function isLoopbackOrigin(): boolean {
+  if (typeof window === "undefined") return false;
+  const h = window.location.hostname;
+  return h === "localhost" || h === "127.0.0.1" || h === "[::1]" || h === "::1";
+}
+
 /** Turn a failure to open the mic into something actionable. */
 export function micErrorMessage(error: unknown): string {
   if (!navigator.mediaDevices) {
