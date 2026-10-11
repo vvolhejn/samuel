@@ -90,6 +90,13 @@ def pyin_f0(audio: np.ndarray, samples_per_frame: int, n_frames: int) -> np.ndar
     return fill_unvoiced(f0, voiced, PYIN_FMIN, PYIN_FMAX)
 
 
+def _usable_cpus() -> int:
+    """CPUs this process may run on (macOS has no sched_getaffinity)."""
+    if hasattr(os, "sched_getaffinity"):
+        return len(os.sched_getaffinity(0))
+    return os.cpu_count() or 1
+
+
 def _pyin_job(args: tuple[np.ndarray, int, int]) -> np.ndarray:
     return pyin_f0(*args)
 
@@ -137,7 +144,7 @@ class SamuelCodec(LatentCodec):
             run_cfg.get("synth", {}).get("ir_length", 256)
         )
         self.f0_ref = f0_ref or math.sqrt(PYIN_FMIN * PYIN_FMAX)
-        self.pitch_workers = pitch_workers or max(1, len(os.sched_getaffinity(0)) - 2)
+        self.pitch_workers = pitch_workers or max(1, _usable_cpus() - 2)
         # The controller's activations on 44.1 kHz audio grow with the batch
         # (64 x 20 s peaked at ~40 GiB), so rows go through it in chunks.
         self.encode_batch_size = encode_batch_size
