@@ -65,14 +65,24 @@ export interface PinkTromboneHandle {
 /** Truncate a param's automation at ``t``, holding its current value.
  * cancelScheduledValues cannot cut short an in-progress setValueCurveAtTime
  * (see scheduleCurve); cancelAndHoldAtTime can, but is Chrome/Safari-only —
- * the fallback leaves a running curve playing to its end. */
+ * the fallback leaves a running curve playing to its end.
+ *
+ * Cancels from a hair before ``t``: Chrome keeps a curve that starts exactly at
+ * the cancel time (the clock moves in 128-sample steps, so a scrub can land
+ * right on a curve's start), and the next event scheduled at ``t`` then throws
+ * for overlapping it. */
 function cancelAndHold(param: AudioParam, t: number) {
   const p = param as AudioParam & {
     cancelAndHoldAtTime?: (when: number) => AudioParam;
   };
-  if (p.cancelAndHoldAtTime) p.cancelAndHoldAtTime(t);
-  else param.cancelScheduledValues(t);
+  const cancelAt = Math.max(0, t - CANCEL_EPS_S);
+  if (p.cancelAndHoldAtTime) p.cancelAndHoldAtTime(cancelAt);
+  else param.cancelScheduledValues(cancelAt);
 }
+
+/** How far before the requested time cancelAndHold cancels: under half a
+ * sample at 44.1 kHz, so the held value is the current one. */
+const CANCEL_EPS_S = 1e-5;
 
 function canCancelAndHold(param: AudioParam) {
   return "cancelAndHoldAtTime" in param;
