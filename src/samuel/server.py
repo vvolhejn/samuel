@@ -393,6 +393,13 @@ _model: PinkTromboneController | None = None
 _tts: tuple | None = None
 # Generation keeps per-call state on the model; one request at a time.
 _tts_lock = threading.Lock()
+# What _load_all is doing ("model", "warm-up", "tts"), or None once it is done.
+# Loading runs in the background so the port opens right away: a cold container
+# then answers 503 "loading" instead of nothing, which the Worker in front of it
+# would otherwise give up on after 20 s, and the webapp can say it is waking up.
+_loading_stage: str | None = "model"
+# Why the checkpoint failed to load, if it did. The server stays up to say so.
+_load_error: str | None = None
 
 
 def _build_frontend() -> Path | None:
@@ -481,12 +488,41 @@ def _load_tts() -> tuple | None:
     return model, codec
 
 
+def _load_all() -> None:
+    global _model, _tts, _loading_stage, _load_error
+    try:
+        model = _load_model()
+    except Exception as e:  # reported by /api/health instead
+        logger.exception("could not load the model")
+        _load_error = f"{type(e).__name__}: {e}"
+        _loading_stage = None
+        return
+    _loading_stage = "warm-up"
+    _model = model
+    _warm_up()
+    _loading_stage = "tts"
+    _tts = _load_tts()
+    _loading_stage = None
+
+
+def _require_model() -> PinkTromboneController:
+    """The model, or a 503 saying it is still loading (500 if it never will)."""
+    if _load_error is not None:
+        raise HTTPException(
+            status_code=500, detail=f"model failed to load: {_load_error}"
+        )
+    # Not served during the warm-up either: that pass exists so that no request
+    # pays for the numba compile.
+    if _model is None or _loading_stage in ("model", "warm-up"):
+        raise HTTPException(
+            status_code=503, detail={"status": "loading", "stage": _loading_stage}
+        )
+    return _model
+
+
 @app.on_event("startup")
 def _startup() -> None:
-    global _model, _tts
-    _model = _load_model()
-    _warm_up()
-    _tts = _load_tts()
+    threading.Thread(target=_load_all, name="load-models", daemon=True).start()
 
     # Mount the built frontend last, so the explicit /api/* routes (registered
     # at import time) still take precedence over the catch-all mount at "/".
@@ -498,6 +534,13 @@ def _startup() -> None:
 
 @app.get("/api/health")
 def health() -> dict:
+    """503 with {"status": "loading", "stage": ...} until everything is loaded,
+    text-to-speech included; the webapp polls this while the server wakes up."""
+    _require_model()
+    if _loading_stage is not None:
+        raise HTTPException(
+            status_code=503, detail={"status": "loading", "stage": _loading_stage}
+        )
     assert _model is not None
     assert _checkpoint is not None
     return {
@@ -557,6 +600,7 @@ def _mimic(audio: np.ndarray) -> dict:
 
 @app.post("/api/synthesize")
 async def synthesize(request: Request) -> dict:
+    _require_model()
     body = await request.body()
     if not body:
         raise HTTPException(status_code=400, detail="empty request body")
@@ -580,6 +624,11 @@ class TtsRequest(BaseModel):
 def tts(request: TtsRequest) -> dict:
     """Speak ``text``: the same response as /api/synthesize, but the trajectories
     come from the text-to-speech model instead of from imitating audio."""
+    _require_model()
+    if _loading_stage == "tts":
+        raise HTTPException(
+            status_code=503, detail={"status": "loading", "stage": _loading_stage}
+        )
     if _tts is None:
         raise HTTPException(
             status_code=503, detail="text-to-speech is not available on this server"

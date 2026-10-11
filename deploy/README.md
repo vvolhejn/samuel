@@ -121,7 +121,11 @@ disk on the provisioned amount, not on the amount used, so headroom is paid for
 around the clock.
 
 Cold start measured locally is ~10 s: container boot, `import torch`, then the
-checkpoint load.
+checkpoint load, the warm-up pass and the text-to-speech model. The server opens
+its port before loading and answers `/api/*` with 503
+`{"detail": {"status": "loading", "stage": ...}}` until it is done, and the
+Worker gives the same answer (stage `boot`) while the container itself starts.
+The webapp shows "Waking up (up to 30s)..." and polls `/api/health` in the meantime.
 
 ## Custom domain
 

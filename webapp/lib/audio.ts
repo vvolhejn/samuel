@@ -111,14 +111,95 @@ export interface UtteranceResult {
   precomputed: boolean;
 }
 
+/** What a backend that is still waking up is busy with: "boot" (the container
+ * itself, reported by the Worker), then samuel.server's "model", "warm-up" and
+ * "tts". The container sleeps when nobody uses it, so the first request after
+ * a quiet spell finds it in one of these. */
+export type WakeStage = "boot" | "model" | "warm-up" | "tts";
+/** Called whenever a request finds the backend still waking up. */
+export type OnWaking = (stage: WakeStage) => void;
+
+/** The stages each endpoint waits out: text-to-speech loads last, and the
+ * imitation endpoint doesn't wait for it. */
+const SYNTHESIZE_WAITS: readonly WakeStage[] = ["boot", "model", "warm-up"];
+const TTS_WAITS: readonly WakeStage[] = [...SYNTHESIZE_WAITS, "tts"];
+
+const WAKE_POLL_MS = 1000;
+/** Generous: booting and loading should take well under this. */
+const WAKE_TIMEOUT_MS = 3 * 60_000;
+/** Times a request is resent after its wait. One should do; the slack is for
+ * a container that goes back to sleep in between. */
+const WAKE_ATTEMPTS = 3;
+
+const sleep = (ms: number) =>
+  new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** The stage of a 503 "still loading" answer, or null for any other answer. */
+async function wakeStage(res: Response): Promise<WakeStage | null> {
+  if (res.status !== 503) return null;
+  try {
+    const body = await res.clone().json();
+    return body?.detail?.status === "loading" ? body.detail.stage : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Poll /api/health until the backend is past every stage in `waits`. */
+async function waitUntilAwake(
+  waits: readonly WakeStage[],
+  onWaking: OnWaking,
+): Promise<void> {
+  const deadline = Date.now() + WAKE_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    await sleep(WAKE_POLL_MS);
+    let res: Response;
+    try {
+      res = await fetch("/api/health");
+    } catch {
+      continue;
+    }
+    const stage = await wakeStage(res);
+    // Any other answer, an error included, is for the real request to report.
+    if (stage === null || !waits.includes(stage)) return;
+    onWaking(stage);
+  }
+  throw new Error("The model didn't wake up. Try again in a minute.");
+}
+
+/** fetch() for a model endpoint: if the backend is still waking up, report it,
+ * wait until it is up, and send the request again. */
+async function fetchAwake(
+  path: string,
+  init: RequestInit,
+  waits: readonly WakeStage[],
+  onWaking: OnWaking,
+): Promise<Response> {
+  for (let attempt = 1; ; attempt++) {
+    const res = await fetch(path, init);
+    const stage = await wakeStage(res);
+    if (stage === null || attempt === WAKE_ATTEMPTS) return res;
+    onWaking(stage);
+    await waitUntilAwake(waits, onWaking);
+  }
+}
+
 /** Send one audio file to the model backend, which sniffs the format itself
  * (WAV from the mic, MP3 for the pre-recorded clips). */
-async function synthesizeBlob(blob: Blob): Promise<UtteranceResult> {
-  const res = await fetch("/api/synthesize", {
-    method: "POST",
-    headers: { "Content-Type": blob.type || "application/octet-stream" },
-    body: blob,
-  });
+async function synthesizeBlob(
+  blob: Blob,
+  onWaking: OnWaking,
+): Promise<UtteranceResult> {
+  const res = await fetchAwake(
+    "/api/synthesize",
+    {
+      method: "POST",
+      headers: { "Content-Type": blob.type || "application/octet-stream" },
+      body: blob,
+    },
+    SYNTHESIZE_WAITS,
+    onWaking,
+  );
   if (!res.ok) {
     throw new Error(`backend error ${res.status}: ${await res.text()}`);
   }
@@ -134,20 +215,29 @@ async function synthesizeBlob(blob: Blob): Promise<UtteranceResult> {
 /** Send one VAD utterance (Float32Array at 16 kHz) to the model backend. */
 export function synthesizeUtterance(
   audio: Float32Array,
+  onWaking: OnWaking,
 ): Promise<UtteranceResult> {
   // defaults: 32-bit float WAV, 16 kHz mono — matches what MicVAD emits
   const wav = utils.encodeWAV(trimSilence(audio));
-  return synthesizeBlob(new Blob([wav], { type: "audio/wav" }));
+  return synthesizeBlob(new Blob([wav], { type: "audio/wav" }), onWaking);
 }
 
 /** Have the text-to-speech model say `text`. Same answer as for audio, minus
  * an original: there is no recording behind it. */
-export async function synthesizeText(text: string): Promise<SynthResponse> {
-  const res = await fetch("/api/tts", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text }),
-  });
+export async function synthesizeText(
+  text: string,
+  onWaking: OnWaking,
+): Promise<SynthResponse> {
+  const res = await fetchAwake(
+    "/api/tts",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    },
+    TTS_WAITS,
+    onWaking,
+  );
   if (!res.ok) {
     throw new Error(`backend error ${res.status}: ${await res.text()}`);
   }
@@ -211,6 +301,7 @@ async function fetchPrecomputedClip(
 export async function synthesizeDatasetClip(
   clip: DatasetClip,
   modelFingerprint: string | null | undefined,
+  onWaking: OnWaking,
 ): Promise<UtteranceResult> {
   const res = await fetch(`/clips/${clip.name}`);
   if (!res.ok) throw new Error(`clip ${clip.name}: ${res.status}`);
@@ -224,12 +315,12 @@ export async function synthesizeDatasetClip(
       precomputed: true,
     };
   }
-  return synthesizeBlob(blob);
+  return synthesizeBlob(blob, onWaking);
 }
 
 /** Response of GET /api/health. */
 export interface HealthResponse {
-  status: string;
+  status: "ok";
   frame_rate: number;
   device: string;
   /** Wandb run URL, or the resolved local .pt path. */
@@ -241,12 +332,34 @@ export interface HealthResponse {
   tts: boolean;
 }
 
+/** /api/health of a backend that is still waking up. */
+export interface WakingResponse {
+  status: "loading";
+  stage: WakeStage;
+}
+
 /** null when the backend is unreachable or not serving a model. */
-export async function fetchHealth(): Promise<HealthResponse | null> {
+export async function fetchHealth(): Promise<
+  HealthResponse | WakingResponse | null
+> {
   try {
     const res = await fetch("/api/health");
+    const stage = await wakeStage(res);
+    if (stage !== null) return { status: "loading", stage };
     return res.ok ? await res.json() : null;
   } catch {
     return null;
   }
+}
+
+/** The health of a backend that is waking up, once it has: null if it never
+ * does, or comes up broken. */
+export async function waitForHealth(): Promise<HealthResponse | null> {
+  try {
+    await waitUntilAwake(TTS_WAITS, () => {});
+  } catch {
+    return null;
+  }
+  const health = await fetchHealth();
+  return health?.status === "ok" ? health : null;
 }

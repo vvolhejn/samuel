@@ -10,6 +10,7 @@ import {
 import {
   fetchDatasetClips,
   fetchHealth,
+  waitForHealth,
   fetchPrecomputedIndex,
   synthesizeDatasetClip,
   synthesizeText,
@@ -123,6 +124,10 @@ export default function Home() {
    * it on load: waking the container costs memory for as long as it stays
    * awake, and the clips are answered from the committed responses. */
   const [health, setHealth] = useState<HealthResponse | null>(null);
+  /** Set while a request waits for the backend to wake up from scale-to-zero,
+   * so the wait says so instead of looking like a very long "Thinking...". */
+  const [waking, setWaking] = useState(false);
+  const onWaking = useCallback(() => setWaking(true), []);
   /** The model's last answer. `lastResponse` is the copy the callbacks read;
    * refs must not be read in render, so the state is what the panel shows. */
   const [viewResponse, lastResponse, setResponse] =
@@ -208,7 +213,10 @@ export default function Home() {
           "Model backend unreachable — run: uv run --extra server python -m samuel.server --no-frontend",
         );
       }
-      setHealth(current);
+      // Waking up: listen anyway, since saying something takes a while too.
+      // The utterance waits for the rest when it gets there.
+      if (current.status === "ok") setHealth(current);
+      else void waitForHealth().then((h) => h && setHealth(h));
       await trombone.resume(); // we're in a user gesture
     },
     isBusy,
@@ -425,6 +433,8 @@ export default function Home() {
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
         await restoreMic();
+      } finally {
+        setWaking(false);
       }
     },
     [playSamuel, restoreMic, original, remember, setResponse, setSource, claim],
@@ -436,9 +446,9 @@ export default function Home() {
       // Your own voice is now what the transport holds, so no clip button stays
       // filled in and no clip is credited under the bar.
       setPlayedClip("");
-      await imitate("mic", () => synthesizeUtterance(audio));
+      await imitate("mic", () => synthesizeUtterance(audio, onWaking));
     },
-    [imitate, isBusy],
+    [imitate, isBusy, onWaking],
   );
 
   // Leaving shouldn't leave a live mic — or a held note — behind, and coming
@@ -491,6 +501,7 @@ export default function Home() {
         const answer = await synthesizeDatasetClip(
           clip,
           health?.model_fingerprint,
+          onWaking,
         );
         // A committed answer is there instantly; hold it for a beat so the
         // clips behave like the mic rather than firing on mousedown.
@@ -498,7 +509,7 @@ export default function Home() {
         return answer;
       });
     },
-    [clips, health, trombone, imitate, ownerRef],
+    [clips, health, trombone, imitate, ownerRef, onWaking],
   );
 
   /** Say what's typed in the text-to-speech box. Holds off, like a clip, only
@@ -510,14 +521,14 @@ export default function Home() {
     setPlayedClip("");
     await imitate("tts", async () => {
       await trombone.resume(); // we're in a user gesture
-      const response = await synthesizeText(text);
+      const response = await synthesizeText(text, onWaking);
       return {
         response,
         inputUrl: null,
         inputBlob: new Blob([text], { type: "text/plain" }),
       };
     });
-  }, [ttsText, trombone, imitate, ownerRef]);
+  }, [ttsText, trombone, imitate, ownerRef, onWaking]);
 
   /** Start whichever source is selected, from `frac`. */
   const playFrom = useCallback(
@@ -1097,7 +1108,16 @@ export default function Home() {
                   {/* Solid strip behind the words: the tract is all thin dark lines,
                     and the wash alone doesn't hide enough of them to read over. */}
                   <span className="w-full bg-white py-2 text-center text-2xl text-neutral-600">
-                    Thinking...
+                    {waking ? (
+                      <>
+                        Waking up (up to 30s)...
+                        <span className="block text-base">
+                          The model sleeps when nobody&apos;s using it.
+                        </span>
+                      </>
+                    ) : (
+                      "Thinking..."
+                    )}
                   </span>
                 </div>
               )}

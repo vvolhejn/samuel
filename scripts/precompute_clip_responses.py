@@ -62,6 +62,11 @@ def _post_audio(url: str, path: Path) -> dict:
 def _server_fingerprint(server: str) -> str:
     try:
         health = _get(f"{server}/api/health")
+    except urllib.error.HTTPError as e:
+        raise SystemExit(
+            f"{server}/api/health answered {e.code} — if the server has just "
+            "started, it is still loading the model; try again in a few seconds"
+        )
     except (urllib.error.URLError, TimeoutError) as e:
         raise SystemExit(
             f"no backend at {server} ({e}) — start one with "
