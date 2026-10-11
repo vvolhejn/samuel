@@ -140,6 +140,20 @@ export function synthesizeUtterance(
   return synthesizeBlob(new Blob([wav], { type: "audio/wav" }));
 }
 
+/** Have the text-to-speech model say `text`. Same answer as for audio, minus
+ * an original: there is no recording behind it. */
+export async function synthesizeText(text: string): Promise<SynthResponse> {
+  const res = await fetch("/api/tts", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  if (!res.ok) {
+    throw new Error(`backend error ${res.status}: ${await res.text()}`);
+  }
+  return (await res.json()) as SynthResponse;
+}
+
 /** What the model answers with for each committed clip, computed ahead of time
  * by scripts/precompute_clip_responses.py. `clips` are sources.json names;
  * `model_fingerprint` is the checkpoint these were computed from. */
@@ -223,6 +237,8 @@ export interface HealthResponse {
   /** Content hash of the loaded weights — the same string wherever they are
    * loaded from, so the committed clip responses can be checked against it. */
   model_fingerprint: string;
+  /** Whether POST /api/tts is served. */
+  tts: boolean;
 }
 
 /** null when the backend is unreachable or not serving a model. */

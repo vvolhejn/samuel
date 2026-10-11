@@ -12,6 +12,7 @@ import {
   fetchHealth,
   fetchPrecomputedIndex,
   synthesizeDatasetClip,
+  synthesizeText,
   synthesizeUtterance,
   wavBlob,
   DatasetClip,
@@ -56,17 +57,44 @@ const subscribeNever = () => () => {};
  * ~250 kB per side, and nothing else evicts them. */
 const MAX_HISTORY = 50;
 
-/** What `imitate` needs back from a request: the answer, plus the audio that
- * was sent, for the transport and the session download. */
+/** What `imitate` needs back from a request: the answer, plus what was sent,
+ * for the transport and the session download. `inputUrl` is the audio to play
+ * as the original, or null when there is none (text-to-speech). */
 type SynthRequest = {
   response: SynthResponse;
-  inputUrl: string;
+  inputUrl: string | null;
   inputBlob: Blob;
 };
 
+/** The headings over the three ways in: microphone, clips, text. */
+const INPUT_HEADING = "text-center text-sm font-semibold text-neutral-500";
+
+/** What the text-to-speech box starts out saying, one picked per page load. */
+const TTS_EXAMPLES = [
+  "When the train goes above ground she rests her head against the glass and looks out.",
+  "The next morning he did everything very systematically.",
+  "This sort of train station stands humbly on the side track, keeping a low profile.",
+  "He must have been confused.",
+  "So once more the miracle has happened, of a machine as big as a building slipping gracefully out of Earth's grasp, soaring gently up and up.",
+];
+
+let ttsExample: string | null = null;
+
+/** This page load's pick from TTS_EXAMPLES. Read through useSyncExternalStore
+ * because it is client-only: the exported HTML can't know it, and picking in
+ * render would differ between the server and the client. */
+function ttsExampleSnapshot(): string {
+  ttsExample ??= TTS_EXAMPLES[Math.floor(Math.random() * TTS_EXAMPLES.length)];
+  return ttsExample;
+}
+
+/** Longest text the box takes; the server refuses more (TTS_MAX_CHARS). */
+const TTS_MAX_CHARS = 300;
+
 interface Recording {
-  kind: "mic" | "dataset";
-  /** Audio the model was given: a WAV from the mic, an MP3 for a clip. */
+  kind: "mic" | "dataset" | "tts";
+  /** What the model was given: a WAV from the mic, an MP3 for a clip, plain
+   * text for text-to-speech. */
   input: Blob;
   /** WAV of the model's output, rendered by the Python synth. Null for a
    * precomputed clip: those responses drop the reference audio. */
@@ -108,6 +136,16 @@ export default function Home() {
    * is the button left filled in). */
   const [clips, setClips] = useState<DatasetClip[]>([]);
   const [playedClip, setPlayedClip] = useState<string>("");
+  /** What's typed in the text-to-speech box, or null until you type: it
+   * starts out on an example line. Kept after sending, so the same line can be
+   * sent again for another take. */
+  const [ttsTyped, setTtsText] = useState<string | null>(null);
+  const ttsExampleLine = useSyncExternalStore(
+    subscribeNever,
+    ttsExampleSnapshot,
+    () => "",
+  );
+  const ttsText = ttsTyped ?? ttsExampleLine;
   /** The committed clip answers, if any were generated for this checkpoint. */
   const [precomputed, setPrecomputed] = useState<PrecomputedIndex | null>(null);
   /** Is the mouth yours to play? While it is, the voicebox pad under the tract
@@ -340,7 +378,12 @@ export default function Home() {
     const entries = await Promise.all(
       historyRef.current.flatMap((recording, i) => {
         const stem = `${String(i + 1).padStart(2, "0")}-${recording.kind}`;
-        const inputExt = recording.input.type === "audio/mpeg" ? "mp3" : "wav";
+        const inputExt =
+          recording.input.type === "audio/mpeg"
+            ? "mp3"
+            : recording.input.type.startsWith("text/")
+              ? "txt"
+              : "wav";
         const files: Array<[string, Blob]> = [
           [`${stem}-input.${inputExt}`, recording.input],
         ];
@@ -364,7 +407,10 @@ export default function Home() {
       try {
         const { response, inputUrl, inputBlob } = await send();
         setResponse(response);
-        original.set(inputUrl);
+        // Clearing matters too: the previous recording is not the original of
+        // a text-to-speech answer, and "Play original" would offer it.
+        if (inputUrl) original.set(inputUrl);
+        else original.clear();
         remember({
           kind,
           input: inputBlob,
@@ -454,6 +500,24 @@ export default function Home() {
     },
     [clips, health, trombone, imitate, ownerRef],
   );
+
+  /** Say what's typed in the text-to-speech box. Holds off, like a clip, only
+   * while a request to the model is already in flight. */
+  const speakText = useCallback(async () => {
+    const text = ttsText.trim();
+    if (!text || ownerRef.current === "model") return;
+    setError(null);
+    setPlayedClip("");
+    await imitate("tts", async () => {
+      await trombone.resume(); // we're in a user gesture
+      const response = await synthesizeText(text);
+      return {
+        response,
+        inputUrl: null,
+        inputBlob: new Blob([text], { type: "text/plain" }),
+      };
+    });
+  }, [ttsText, trombone, imitate, ownerRef]);
 
   /** Start whichever source is selected, from `frac`. */
   const playFrom = useCallback(
@@ -631,6 +695,8 @@ export default function Home() {
   // synth into your own microphone. Turning the mic off hands the page over.
   const canPlay = hasSource && notBusy && !micOn;
   const canScrub = hasSource && owner !== "model" && !micOn;
+  // The transport holds a text-to-speech answer: the only kind with no original.
+  const isTts = viewResponse !== null && !original.loaded;
   // Who read the audio the transport holds, or null while it holds your voice.
   const clipCredit = clips.find((c) => c.name === playedClip)?.librivox ?? null;
   // The drawing is grey until something has a claim on it: the mic is on, a
@@ -720,93 +786,162 @@ export default function Home() {
             less
           </button>
         )}
-        {/* Two columns: talk to it on the left, or pick a canned clip on the
-            right. They split the row evenly and are allowed to shrink under
-            their text, so what governs the width is the buttons (~130px each)
-            and the labels wrap over them — which is what keeps these side by
-            side down to a 320px screen instead of stacking. */}
+        {/* Everything that hands the model something, in one box: talk to it
+            or pick a canned clip in two columns, and type below them. The
+            columns split the row evenly and are allowed to shrink under their
+            text, so what governs the width is the buttons (~130px each) and
+            the headings wrap over them — which is what keeps these side by side
+            down to a 320px screen instead of stacking. */}
         <div
-          className={`flex items-center gap-4 md:gap-6 ${STRIP} ${sectionBox(section === "input")}`}
+          className={`flex flex-col gap-3 ${STRIP} ${sectionBox(section === "input")}`}
         >
-          <div className="flex min-w-0 flex-1 flex-col items-center gap-1.5">
-            {/* One button, two labels: it is the same thing you press to start
-                and to be done, so it stays in one place and says which. */}
-            <button
-              onClick={toggleMic}
-              disabled={insecure !== null || micStarting}
-              title={insecure ? "Unavailable on an insecure origin" : undefined}
-              /* Fixed width so the two labels don't resize it, and outlined
-                 while recording: the filled pill is an invitation, and there is
-                 nothing left to invite once you're being listened to. Both
-                 declare a border, or the outlined one would stand 2px taller. */
-              className={`w-32 rounded-full border py-1.5 text-sm ${
-                micOn
-                  ? "border-highlight-300 bg-white font-medium text-highlight-700 hover:bg-highlight-50"
-                  : "border-transparent bg-highlight-600 font-semibold text-white hover:bg-highlight-700 disabled:opacity-40 disabled:hover:bg-highlight-600"
-              }`}
-            >
-              {micStarting ? "Starting…" : micOn ? "Stop" : "Microphone"}
-            </button>
-
-            {/* Both faces share one grid cell, so the column is always as tall
-                as the taller of them and toggling the mic can't move the page.
-                The hidden one is `invisible`, which still takes up space but
-                drops out of hit-testing and the tab order. */}
-            <div className="grid w-full">
-              <div
-                className={`col-start-1 row-start-1 flex items-center justify-center ${micOn ? "" : "invisible"}`}
-                aria-hidden={!micOn}
+          {/* On a phone the columns reach most of the way into the box's side
+              padding, and sit closer to the divider, so the note under Record
+              still fits on two lines at 360px. */}
+          <div className="-mx-3 flex items-stretch gap-2 md:mx-0 md:gap-4">
+            <div className="flex min-w-0 flex-1 flex-col items-center gap-1.5">
+              <span className={INPUT_HEADING}>Microphone</span>
+              {/* One button, two labels: it is the same thing you press to start
+                  and to be done, so it stays in one place and says which. */}
+              <button
+                onClick={toggleMic}
+                disabled={insecure !== null || micStarting}
+                title={
+                  insecure ? "Unavailable on an insecure origin" : undefined
+                }
+                /* Fixed width so the two labels don't resize it, and outlined
+                   while recording: the filled pill is an invitation, and there is
+                   nothing left to invite once you're being listened to. Both
+                   declare a border, or the outlined one would stand 2px taller. */
+                className={`w-32 rounded-full border py-1.5 text-sm ${
+                  micOn
+                    ? "border-highlight-300 bg-white font-medium text-highlight-700 hover:bg-highlight-50"
+                    : "border-transparent bg-highlight-600 font-semibold text-white hover:bg-highlight-700 disabled:opacity-40 disabled:hover:bg-highlight-600"
+                }`}
               >
-                <LevelMeter store={levelStore} active={heard} />
-              </div>
+                {micStarting ? "Starting…" : micOn ? "Stop" : "Record"}
+              </button>
 
-              {/* Reassurance, not an action: recordings go to the server only
-                  to be mimicked back, and nothing is written to disk there.
-                  Only the "self-host" escape hatch is clickable. */}
-              <span
-                className={`col-start-1 row-start-1 text-center text-xs text-neutral-500 ${micOn ? "invisible" : ""}`}
-                aria-hidden={micOn}
-              >
-                Your audio is not stored.
-                <br />
-                <TextLink href="https://github.com/vvolhejn/samuel" muted>
-                  Self-host
-                </TextLink>{" "}
-                if you don&apos;t trust me
-              </span>
-            </div>
-          </div>
-
-          <div className="flex min-w-0 flex-1 flex-col items-center gap-1.5">
-            <span className="text-center text-sm text-neutral-500">
-              or use pre-recorded audio
-            </span>
-
-            {/* One button per committed clip, numbered rather than named: which
-                recording is which only matters once you've heard them. */}
-            <div className="grid grid-cols-3 gap-1.5">
-              {clips.map((clip, i) => (
-                <button
-                  key={clip.name}
-                  onClick={() => void playClip(clip.name)}
-                  disabled={!notBusy || micOn}
-                  title={
-                    insecure ? "Unavailable on an insecure origin" : undefined
-                  }
-                  className={
-                    clip.name === playedClip
-                      ? "rounded-md bg-highlight-600 px-3 py-1 text-sm font-semibold text-white disabled:opacity-40"
-                      : /* White like the Play pill, not transparent: these keep
-                           their own ground when the box behind them lights
-                           up. */
-                        "rounded-md border border-highlight-300 bg-white px-3 py-1 text-sm font-medium text-highlight-700 hover:bg-highlight-50 disabled:opacity-40 disabled:hover:bg-white"
-                  }
+              {/* Both faces share one grid cell, so the column is always as tall
+                  as the taller of them and toggling the mic can't move the page.
+                  The hidden one is `invisible`, which still takes up space but
+                  drops out of hit-testing and the tab order. */}
+              <div className="grid w-full">
+                <div
+                  className={`col-start-1 row-start-1 flex items-center justify-center ${micOn ? "" : "invisible"}`}
+                  aria-hidden={!micOn}
                 >
-                  {i + 1}
-                </button>
-              ))}
+                  <LevelMeter store={levelStore} active={heard} />
+                </div>
+
+                {/* Reassurance, not an action: recordings go to the server only
+                    to be mimicked back, and nothing is written to disk there.
+                    Only the "self-host" escape hatch is clickable. */}
+                <span
+                  className={`col-start-1 row-start-1 text-center text-xs text-neutral-500 ${micOn ? "invisible" : ""}`}
+                  aria-hidden={micOn}
+                >
+                  Your audio is not stored.
+                  <br />
+                  <TextLink href="https://github.com/vvolhejn/samuel" muted>
+                    Self-host
+                  </TextLink>{" "}
+                  if you don&apos;t trust me
+                </span>
+              </div>
+            </div>
+
+            {/* Both dividers run out to the box's edges and meet: this one up
+                through the top padding and down through the gap to the rule,
+                the rule out through the side padding. The margins undo STRIP's
+                (px-4 py-3, p-3 from md) and the column gap. */}
+            <div
+              aria-hidden
+              className="-mt-3 -mb-3 w-px shrink-0 bg-neutral-200"
+            />
+
+            <div className="flex min-w-0 flex-1 flex-col items-center gap-1.5">
+              <span className={INPUT_HEADING}>Pre-recorded audio</span>
+
+              {/* One button per committed clip, numbered rather than named: which
+                  recording is which only matters once you've heard them. */}
+              <div className="grid grid-cols-3 gap-1.5">
+                {clips.map((clip, i) => (
+                  <button
+                    key={clip.name}
+                    onClick={() => void playClip(clip.name)}
+                    disabled={!notBusy || micOn}
+                    title={
+                      insecure ? "Unavailable on an insecure origin" : undefined
+                    }
+                    className={
+                      clip.name === playedClip
+                        ? "rounded-md bg-highlight-600 w-9 py-1 text-sm font-semibold text-white disabled:opacity-40"
+                        : /* White like the Play pill, not transparent: these keep
+                             their own ground when the box behind them lights
+                             up. */
+                          "rounded-md border border-highlight-300 bg-white w-9 py-1 text-sm font-medium text-highlight-700 hover:bg-highlight-50 disabled:opacity-40 disabled:hover:bg-white"
+                    }
+                  >
+                    {i + 1}
+                  </button>
+                ))}
+              </div>
             </div>
           </div>
+
+          <hr className="-mx-4 border-neutral-200 md:-mx-3" />
+
+          {/* Type instead of talk. Under the columns rather than a third one,
+              since a text field wants the width. */}
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              void speakText();
+            }}
+            className="flex flex-col gap-1.5"
+          >
+            <label htmlFor="tts-text" className={INPUT_HEADING}>
+              Text-to-speech <span className="font-normal">(new!)</span>
+            </label>
+            <div className="relative">
+              <textarea
+                id="tts-text"
+                value={ttsText}
+                onChange={(e) => setTtsText(e.currentTarget.value)}
+                /* Enter sends, as in a chat; Shift+Enter still breaks the line. */
+                onKeyDown={(e) => {
+                  if (
+                    e.key === "Enter" &&
+                    !e.shiftKey &&
+                    !e.nativeEvent.isComposing
+                  ) {
+                    e.preventDefault();
+                    e.currentTarget.form?.requestSubmit();
+                  }
+                }}
+                rows={2}
+                maxLength={TTS_MAX_CHARS}
+                placeholder="Type here"
+                disabled={insecure !== null}
+                /* Right padding keeps the text clear of the send button. */
+                className="block w-full resize-none rounded-md border border-neutral-300 bg-white py-1.5 pr-12 pl-2 text-sm text-neutral-800 placeholder:text-neutral-400 focus:border-highlight-300 focus:outline-none disabled:opacity-40"
+              />
+              {/* Same shape and width as the clip buttons, since it does the
+                  same thing: hands the model something to say. */}
+              <button
+                type="submit"
+                disabled={!notBusy || micOn || ttsText.trim() === ""}
+                aria-label="Say it"
+                title={
+                  insecure ? "Unavailable on an insecure origin" : "Say it"
+                }
+                className="absolute right-1.5 bottom-1.5 w-9 rounded-md border border-highlight-300 bg-white py-1 text-sm font-medium text-highlight-700 hover:bg-highlight-50 disabled:opacity-40 disabled:hover:bg-white"
+              >
+                →
+              </button>
+            </div>
+          </form>
         </div>
         {/* Same grey-until-there's-something rule as the tract, done in one
             place: with nothing to play, every accent inside the transport —
@@ -868,10 +1003,15 @@ export default function Home() {
               sits under the bar it belongs to rather than by the buttons, since
               what it names is the audio now loaded, not the button you pressed. */}
           <div className="flex items-start justify-between gap-3 text-xs text-neutral-500">
+            {/* Gone for a text-to-speech answer, which has no original: an
+                answer without one can only have come from text. `invisible`
+                rather than unmounted, so the box keeps its height. */}
             <button
               onClick={() => void playOther()}
               disabled={!original.loaded || !transportLive}
-              className={`${MUTED_LINK} shrink-0 disabled:opacity-50 disabled:hover:text-inherit`}
+              aria-hidden={isTts}
+              tabIndex={isTts ? -1 : undefined}
+              className={`${MUTED_LINK} shrink-0 disabled:opacity-50 disabled:hover:text-inherit ${isTts ? "invisible" : ""}`}
             >
               {source === "samuel" ? "Play original" : "Play imitated"}
             </button>

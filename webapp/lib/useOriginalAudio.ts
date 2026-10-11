@@ -16,6 +16,8 @@ export interface OriginalAudioHandle {
   /** Remember the audio a response was made from, so it can be replayed. Takes
    * ownership of the object URL and revokes the one it replaces. */
   set: (url: string) => void;
+  /** Forget the original: the response has none (text-to-speech). */
+  clear: () => void;
   /** Start playing from `startFrac`. Rejects if the browser refuses. */
   play: (startFrac: number) => Promise<void>;
   pause: () => void;
@@ -108,6 +110,21 @@ export function useOriginalAudio(
     [trombone],
   );
 
+  const clear = useCallback(() => {
+    const previous = urlRef.current;
+    urlRef.current = null;
+    tokenRef.current++; // a decode still in flight must not land
+    bufferRef.current = null;
+    const audio = audioRef.current;
+    if (audio) {
+      audio.pause();
+      audio.removeAttribute("src");
+      audio.load();
+    }
+    if (previous) URL.revokeObjectURL(previous);
+    setLoaded(false);
+  }, []);
+
   const seek = useCallback(
     (frac: number) => {
       const audio = audioRef.current;
@@ -191,6 +208,7 @@ export function useOriginalAudio(
     () => ({
       loaded,
       set,
+      clear,
       play,
       pause,
       paused,
@@ -203,6 +221,7 @@ export function useOriginalAudio(
     [
       loaded,
       set,
+      clear,
       play,
       pause,
       paused,

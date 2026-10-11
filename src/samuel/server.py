@@ -62,6 +62,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 
 import librosa
@@ -71,6 +72,7 @@ import torch
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from samuel.data import fill_unvoiced
 from samuel.model import PinkTromboneController, PinkTromboneControllerConfig
@@ -84,6 +86,17 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 # checkpoints/last.pt plus the run's config.json (staged by deploy/stage-model.sh,
 # see deploy/README.md). Default so a clone without runs/ still works.
 _DEFAULT_CHECKPOINT = "hf:vvolhejn/samuel"
+
+# The text-to-speech model (Pocket TTS generating Samuel's trajectories, see
+# scripts/tts/say.py), served unless SAMUEL_TTS is set to "". Optional: when it
+# can't be loaded the rest of the server runs as usual and /api/tts answers 503.
+_DEFAULT_TTS = "hf:vvolhejn/samuel-tts"
+# Longest text /api/tts takes, and the longest it lets the model talk for.
+TTS_MAX_CHARS = 300
+TTS_MAX_SEC = 20.0
+# Sampling settings the model was evaluated with (see its model card).
+TTS_TEMP = 0.3
+TTS_CFG = 2.0
 
 # Next.js frontend: `pnpm build` (output: "export") emits the static site here.
 _WEBAPP_DIR = _REPO_ROOT / "webapp"
@@ -375,6 +388,10 @@ app.add_middleware(
 )
 
 _model: PinkTromboneController | None = None
+# (FlowLM, SamuelCodec) of the text-to-speech model, or None if it isn't served.
+_tts: tuple | None = None
+# Generation keeps per-call state on the model; one request at a time.
+_tts_lock = threading.Lock()
 
 
 def _build_frontend() -> Path | None:
@@ -437,11 +454,31 @@ def _warm_up() -> None:
         logger.info("warm-up pass done")
 
 
+def _load_tts() -> tuple | None:
+    """The text-to-speech model, or None if it is disabled or can't be loaded."""
+    ref = os.environ.get("SAMUEL_TTS", _DEFAULT_TTS)
+    if not ref:
+        logger.info("text-to-speech disabled")
+        return None
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        # The pocket-tts training package; absent from the deployed image.
+        from training.eval.librispeech import load_run
+
+        model, codec, _ = load_run(ref, device)
+    except Exception as e:  # noqa: BLE001 - an extra; never block startup
+        logger.warning("text-to-speech unavailable (%s: %s)", type(e).__name__, e)
+        return None
+    logger.info("loaded text-to-speech model %s on %s", ref, device)
+    return model, codec
+
+
 @app.on_event("startup")
 def _startup() -> None:
-    global _model
+    global _model, _tts
     _model = _load_model()
     _warm_up()
+    _tts = _load_tts()
 
     # Mount the built frontend last, so the explicit /api/* routes (registered
     # at import time) still take precedence over the catch-all mount at "/".
@@ -461,6 +498,7 @@ def health() -> dict:
         "device": str(next(_model.parameters()).device),
         "checkpoint": _checkpoint,
         "model_fingerprint": _fingerprint,
+        "tts": _tts is not None,
     }
 
 
@@ -526,6 +564,67 @@ async def synthesize(request: Request) -> dict:
     return _mimic(audio.astype(np.float32, copy=False))
 
 
+class TtsRequest(BaseModel):
+    text: str
+
+
+@app.post("/api/tts")
+def tts(request: TtsRequest) -> dict:
+    """Speak ``text``: the same response as /api/synthesize, but the trajectories
+    come from the text-to-speech model instead of from imitating audio."""
+    if _tts is None:
+        raise HTTPException(
+            status_code=503, detail="text-to-speech is not available on this server"
+        )
+    text = request.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="empty text")
+    if len(text) > TTS_MAX_CHARS:
+        raise HTTPException(
+            status_code=400, detail=f"text longer than {TTS_MAX_CHARS} characters"
+        )
+    from pocket_tts.models.text_chunking import prepare_text_prompt
+
+    model, codec = _tts
+    # Same text clean-up as Pocket TTS inference, with this model's settings
+    # (config.yaml on the Hub): capitalised, terminal punctuation added.
+    prompt, _ = prepare_text_prompt(
+        text, pad_with_spaces_for_short_inputs=False, remove_semicolons=False
+    )
+    tokens = torch.tensor(
+        model.flow_lm.conditioner.tokenizer.sp.encode(prompt), dtype=torch.long
+    )
+    device = model.flow_lm.bos_emb.device
+    with _tts_lock, torch.no_grad():
+        # No voice prompt: there is only one voice anyway.
+        (latents,) = model.generate(
+            [tokens],
+            [torch.zeros(0, codec.latent_dim, device=device)],
+            max_frames=int(TTS_MAX_SEC * codec.frame_rate),
+            temp=TTS_TEMP,
+            cfg_coef=TTS_CFG,
+        )
+        if latents.shape[0] < codec.min_decode_frames:
+            raise HTTPException(
+                status_code=500, detail="the model said nothing; try again"
+            )
+        latents = latents[None].to(device)
+        params = codec.latents_to_params(latents)[0].cpu().numpy()
+        synth = codec.decode_to_audio(latents)[0, 0].cpu().numpy()
+
+    frame_rate = SAMPLE_RATE / codec.samples_per_frame
+    voiceness = params[:, PARAM_NAMES.index("voiceness")]
+    return {
+        "frame_rate": frame_rate,
+        "n_frames": len(params),
+        "duration_s": len(params) / frame_rate,
+        "params": {name: params[:, i].tolist() for i, name in enumerate(PARAM_NAMES)},
+        # There is no pyin track for generated speech; voiceness stands in.
+        "voiced": (voiceness >= 0.5).tolist(),
+        "synth_audio_b64": _encode_wav_b64(synth.astype(np.float32)),
+    }
+
+
 # Uncommon default port (avoids clashing with the usual 8000/8080/3000). The
 # dev proxy in webapp/next.config.ts points here too — keep them in sync.
 DEFAULT_PORT = 8471
@@ -557,6 +656,12 @@ def _parse_args() -> None:
         help="run config.json to build the model from; by default found next to "
         "the checkpoint (only needed for a bare wandb artifact)",
     )
+    parser.add_argument(
+        "--tts",
+        default=os.environ.get("SAMUEL_TTS", _DEFAULT_TTS),
+        help='text-to-speech model: hf:<repo-id>[@<revision>] or a local run dir; "" '
+        "disables it",
+    )
     parser.add_argument("--host", default=os.environ.get("SAMUEL_HOST", "127.0.0.1"))
     parser.add_argument(
         "--port", type=int, default=int(os.environ.get("SAMUEL_PORT", DEFAULT_PORT))
@@ -578,6 +683,7 @@ def _parse_args() -> None:
     os.environ["SAMUEL_CHECKPOINT"] = args.checkpoint
     if args.run_config:
         os.environ["SAMUEL_RUN_CONFIG"] = args.run_config
+    os.environ["SAMUEL_TTS"] = args.tts
     os.environ["SAMUEL_HOST"] = args.host
     os.environ["SAMUEL_PORT"] = str(args.port)
     os.environ["SAMUEL_SERVE_FRONTEND"] = "0" if args.no_frontend else "1"
