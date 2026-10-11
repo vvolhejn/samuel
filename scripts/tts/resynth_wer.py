@@ -6,8 +6,8 @@ and reports corpus WER against the reference transcripts. Any TTS on this
 codec inherits this error floor, so read TTS WERs relative to it.
 
 Usage:
-    uv run python scripts/tts/resynth_wer.py configs/tts/a_unstacked.yaml \\
-        --librispeech-root /lustre/scwpod02/client/kyutai/datasets/LibriSpeech/test-clean
+    uv run python scripts/tts/resynth_wer.py configs/tts/base_2000h.yaml \\
+        --librispeech-root <LibriSpeech test-clean dir>
 """
 
 from __future__ import annotations

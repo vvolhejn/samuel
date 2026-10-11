@@ -1,7 +1,7 @@
 """Synthesize text with a Samuel-codec TTS run: text -> trajectories -> wav.
 
 Usage:
-    uv run python scripts/tts/say.py runs/tts/b_stack8 "Hello there." out.wav \\
+    uv run python scripts/tts/say.py hf:vvolhejn/samuel-tts "Hello there." out.wav \\
         [--voice prompt.wav] [--use-ema] [--temp 0.3] [--cfg 2.0] [--params out.json]
 """
 

@@ -1,7 +1,7 @@
 """Parameter counts of FlowLM variants, for sizing the shrunken TTS runs.
 
 Usage:
-    uv run python scripts/tts/count_params.py configs/tts/b_stack8.yaml \\
+    uv run python scripts/tts/count_params.py configs/tts/s_d256_2000h.yaml \\
         --override flow_lm.transformer.d_model=512 flow_lm.transformer.num_layers=4 ...
 """
 

@@ -1055,11 +1055,10 @@ def main(hydra_cfg: DictConfig) -> None:
         rest_loss = _rest_pose_loss(
             params, module, cfg.loss.rest_targets, cfg.loss.rest_weights
         )
-        ramp_step = max(0, step - cfg.loss.reg_start_steps)
         reg_scale = (
-            min(1.0, ramp_step / cfg.loss.reg_ramp_steps)
+            min(1.0, step / cfg.loss.reg_ramp_steps)
             if cfg.loss.reg_ramp_steps > 0
-            else float(step >= cfg.loss.reg_start_steps)
+            else 1.0
         )
         loss = (
             recon_loss

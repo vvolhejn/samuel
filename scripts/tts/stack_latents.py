@@ -8,7 +8,7 @@ the same audio manifest; this writes the destination's per-utterance files,
 training.train_utils.ensure_train_latents looks for.
 
 Usage:
-    uv run python scripts/tts/stack_latents.py configs/tts/a_unstacked.yaml configs/tts/b_stack8.yaml
+    uv run python scripts/tts/stack_latents.py configs/tts/base_2000h.yaml configs/tts/base_2000h_s8.yaml
 """
 
 from __future__ import annotations
