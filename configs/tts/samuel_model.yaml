@@ -1,0 +1,22 @@
+# Pocket TTS model config with Samuel (samuel.tts.codec.SamuelCodec) as the
+# codec instead of Mimi: same 6-layer FlowLM as the released English model,
+# same text tokenizer, no Mimi section. The latent size comes from the codec.
+default_temperature: 0.3
+
+flow_lm:
+  insert_bos_before_voice: true
+  dtype: float32
+  flow:
+    depth: 6
+    dim: 512
+  transformer:
+    d_model: 1024
+    hidden_scale: 4
+    max_period: 10000
+    num_heads: 16
+    num_layers: 6
+  lookup_table:
+    dim: 1024
+    n_bins: 4000
+    tokenizer: sentencepiece
+    tokenizer_path: hf://kyutai/pocket-tts-without-voice-cloning/languages/english/tokenizer.model@d29db7978e464fb90cb3359ee0c69a273b9142cc
