@@ -23,6 +23,12 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir \
       einops fastapi librosa omegaconf pydantic soundfile tqdm "uvicorn[standard]"
 
+# What the text-to-speech model adds: the vendored Pocket TTS code (copied in
+# below, not pip-installed, which would also pull in its CLI and web server)
+# imports these.
+RUN pip install --no-cache-dir \
+      pyyaml requests safetensors sentencepiece
+
 # Weights come from the Hub rather than the build context, so the image builds
 # from a git checkout alone — runs/ is 64 GB and never leaves the cluster. The
 # repo is public, so no credentials are needed here.
@@ -40,12 +46,26 @@ RUN pip install --no-cache-dir huggingface_hub \
 snapshot_download(sys.argv[1], revision=sys.argv[2], local_dir='/app/model')" \
       "$MODEL_REPO" "$MODEL_REVISION"
 
+# The text-to-speech model, baked in the same way (SAMUEL_TTS points at it).
+# Same pinning rule as MODEL_REVISION.
+ARG TTS_REPO=vvolhejn/samuel-tts
+ARG TTS_REVISION=main
+RUN python -c "import sys; from huggingface_hub import snapshot_download; \
+snapshot_download(sys.argv[1], revision=sys.argv[2], local_dir='/app/tts-model', \
+allow_patterns=['*.yaml', '*.safetensors', 'tokenizer.model'])" \
+      "$TTS_REPO" "$TTS_REVISION"
+
 # After the weights, since src/ changes more often — an edit here then re-pushes
 # only this layer rather than the ~14 MB above it.
 #
 # Source on PYTHONPATH rather than pip-installed, so server.py's _REPO_ROOT
 # (Path(__file__).parents[2]) resolves to /app.
 COPY src/ /app/src/
+# The vendored Pocket TTS, and the model config the text-to-speech run names
+# (repo-relative, resolved against /app).
+COPY pocket-tts/pocket_tts/ /app/pocket-tts/pocket_tts/
+COPY pocket-tts/training/ /app/pocket-tts/training/
+COPY configs/tts/samuel_model.yaml /app/configs/tts/samuel_model.yaml
 
 # Match the vcpu of instance_type in webapp/wrangler.jsonc. A container sees
 # the *host's* core count, not its CPU quota, so torch and numba would
@@ -57,9 +77,10 @@ ENV OMP_NUM_THREADS=1 \
 
 # No SAMUEL_ALLOW_ORIGINS: the Worker serves the frontend from this same
 # origin, so /api/* is never a cross-origin request.
-ENV PYTHONPATH=/app/src \
+ENV PYTHONPATH=/app/src:/app/pocket-tts \
     SAMUEL_SERVE_FRONTEND=0 \
     SAMUEL_CHECKPOINT=/app/model/checkpoints/last.pt \
+    SAMUEL_TTS=/app/tts-model \
     SAMUEL_HOST=0.0.0.0 \
     SAMUEL_PORT=8080
 

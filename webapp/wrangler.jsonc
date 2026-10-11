@@ -31,7 +31,9 @@
       // would be silently ignored.
       "image_vars": {
         "MODEL_REPO": "vvolhejn/samuel",
-        "MODEL_REVISION": "cfd4ba3b0ea411d40f404d226022bc70f9e06139"
+        "MODEL_REVISION": "cfd4ba3b0ea411d40f404d226022bc70f9e06139",
+        "TTS_REPO": "vvolhejn/samuel-tts",
+        "TTS_REVISION": "6d48466fcce70a8d418581a9207e6741c354a50a"
       },
       // Sized from the measured peak: 2.14 GB memory, 1.62 GB disk. Memory and
       // disk are billed on what is *provisioned*, so the headroom above was

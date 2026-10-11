@@ -30,16 +30,12 @@ from typing import Any
 import huggingface_hub
 import jiwer
 import numpy.typing as npt
-import safetensors.torch
 import sphn
 import torch
 from pydantic import BaseModel
 
-from training.args import load_args
-from training.checkpointing import EMA, latest_checkpoint, load_checkpoint
 from training.codec import LatentCodec
-from training.modules.builders import build_models
-from training.modules.model import TrainableTTS
+from training.load import load_run
 
 logger = logging.getLogger("eval_librispeech")
 DEFAULT_ASR = "ibm-granite/granite-speech-4.1-2b"
@@ -187,65 +183,6 @@ def build_transcriber(
         return [o["text"] for o in outs]
 
     return transcribe
-
-
-def load_run(
-    run_dir: str | Path,
-    device: torch.device,
-    use_ema: bool = False,
-    checkpoint: str | Path | None = None,
-) -> tuple[TrainableTTS, LatentCodec, int]:
-    """(model, codec, step) from a run dir, weights on `device`, in eval mode.
-
-    `run_dir` may also be a published Hugging Face repo, `hf:<user>/<repo>[@revision]`
-    (e.g. `hf:vvolhejn/samuel-tts`), holding `args.yaml` and the exported
-    `model.safetensors`; the returned step is then -1.
-    """
-    if str(run_dir).startswith("hf:"):
-        return _load_hf_run(str(run_dir), device)
-    run_dir = Path(run_dir)
-    args = load_args(run_dir / "args.yaml")
-    # Inference never needs the distillation teacher: it only shapes the training
-    # loss, and the student's weights come from the checkpoint loaded below.
-    # Building it would require the teacher checkpoint to still sit at the
-    # relative path recorded at training time.
-    args.distill_cfg_coef = 0.0
-    model, codec, _ = build_models(args)
-    ckpt = Path(checkpoint) if checkpoint else latest_checkpoint(run_dir)
-    assert ckpt is not None and ckpt.exists(), f"no checkpoint in {run_dir}"
-    ema = EMA(model, 1.0) if use_ema else None
-    step = load_checkpoint(ckpt, model, ema=ema)
-    if ema is not None:
-        model.load_state_dict(ema.shadow, strict=False)
-    model.to(device).eval()
-    codec.to(device)
-    return model, codec, step
-
-
-def _load_hf_run(spec: str, device: torch.device) -> tuple[TrainableTTS, LatentCodec, int]:
-    """Load an exported run (`args.yaml` + `model.safetensors`) from the HF Hub."""
-    repo_id, _, revision = spec.removeprefix("hf:").removeprefix("//").partition("@")
-    local = Path(
-        huggingface_hub.snapshot_download(
-            repo_id, revision=revision or None, allow_patterns=["*.yaml", "*.safetensors"]
-        )
-    )
-    args = load_args(local / "args.yaml")
-    args.distill_cfg_coef = 0.0
-    # args.yaml records model_config relative to the repo root it was trained from.
-    model_config = Path(args.model_config)
-    if not model_config.is_absolute() and not model_config.exists():
-        model_config = Path(__file__).resolve().parents[3] / model_config
-    args.model_config = str(model_config)
-    model, codec, _ = build_models(args)
-    state = safetensors.torch.load_file(str(local / "model.safetensors"))
-    flow_state = {
-        k.removeprefix("flow_lm."): v for k, v in state.items() if k.startswith("flow_lm.")
-    }
-    model.flow_lm.load_state_dict(flow_state, strict=True)
-    model.to(device).eval()
-    codec.to(device)
-    return model, codec, -1
 
 
 def load_mono(path: str, sample_rate: int) -> torch.Tensor:

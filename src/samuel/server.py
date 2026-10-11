@@ -88,8 +88,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_CHECKPOINT = "hf:vvolhejn/samuel"
 
 # The text-to-speech model (Pocket TTS generating Samuel's trajectories, see
-# scripts/tts/say.py), served unless SAMUEL_TTS is set to "". Optional: when it
-# can't be loaded the rest of the server runs as usual and /api/tts answers 503.
+# scripts/tts/say.py): hf:<repo>[@rev] or a local copy of one, served unless
+# SAMUEL_TTS is set to "". Optional: when it can't be loaded the rest of the
+# server runs as usual and /api/tts answers 503.
 _DEFAULT_TTS = "hf:vvolhejn/samuel-tts"
 # Longest text /api/tts takes, and the longest it lets the model talk for.
 TTS_MAX_CHARS = 300
@@ -462,10 +463,17 @@ def _load_tts() -> tuple | None:
         return None
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     try:
-        # The pocket-tts training package; absent from the deployed image.
-        from training.eval.librispeech import load_run
+        # The vendored pocket-tts training package.
+        from training.load import load_run
 
-        model, codec, _ = load_run(ref, device)
+        # The codec gets the controller this server already runs rather than
+        # loading its own copy (and downloading it, in the container). Turning
+        # trajectories into sound only reads its config.
+        model, codec, _ = load_run(
+            ref,
+            device,
+            codec_kwargs={"checkpoint": _model, "target_rms": _target_rms()},
+        )
     except Exception as e:  # noqa: BLE001 - an extra; never block startup
         logger.warning("text-to-speech unavailable (%s: %s)", type(e).__name__, e)
         return None

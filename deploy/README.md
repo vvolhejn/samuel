@@ -67,6 +67,11 @@ script's docstring.
 
 `deploy/model/` is gitignored — it is only a staging area for the upload.
 
+The text-to-speech model, `vvolhejn/samuel-tts`, is baked in the same way and
+pinned by `TTS_REVISION`. Its codec is whichever Samuel checkpoint the server
+runs, so a new checkpoint with different parameter ranges needs a retrained
+text-to-speech model (`scripts/tts/reproduce.sh`).
+
 ## Deploying
 
 ```bash

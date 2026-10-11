@@ -14,6 +14,7 @@ scripts/
 webapp/
 Pink-Trombone/
 train.log
+pocket-tts/training/tests/
 **/__pycache__/
 **/.ruff_cache/
 **/.pytest_cache/

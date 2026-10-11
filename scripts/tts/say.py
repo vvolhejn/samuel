@@ -13,7 +13,8 @@ from pathlib import Path
 
 import sphn
 import torch
-from training.eval.librispeech import load_mono, load_run
+from training.eval.librispeech import load_mono
+from training.load import load_run
 
 from samuel.pink_trombone import PARAM_NAMES
 
