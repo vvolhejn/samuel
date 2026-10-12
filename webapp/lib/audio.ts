@@ -131,6 +131,18 @@ const WAKE_TIMEOUT_MS = 3 * 60_000;
  * a container that goes back to sleep in between. */
 const WAKE_ATTEMPTS = 3;
 
+/** A model request that failed on the backend's side. `code` is the HTTP
+ * status, or "wake-timeout" if the backend never woke up; it is what
+ * analytics reports, since the message can carry the server's own text. */
+export class BackendError extends Error {
+  constructor(
+    message: string,
+    readonly code: string,
+  ) {
+    super(message);
+  }
+}
+
 const sleep = (ms: number) =>
   new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -164,7 +176,10 @@ async function waitUntilAwake(
     if (stage === null || !waits.includes(stage)) return;
     onWaking(stage);
   }
-  throw new Error("The model didn't wake up. Try again in a minute.");
+  throw new BackendError(
+    "The model didn't wake up. Try again in a minute.",
+    "wake-timeout",
+  );
 }
 
 /** fetch() for a model endpoint: if the backend is still waking up, report it,
@@ -201,7 +216,10 @@ async function synthesizeBlob(
     onWaking,
   );
   if (!res.ok) {
-    throw new Error(`backend error ${res.status}: ${await res.text()}`);
+    throw new BackendError(
+      `backend error ${res.status}: ${await res.text()}`,
+      String(res.status),
+    );
   }
   // URL only on success, so a failed request leaves nothing to revoke.
   return {
@@ -239,7 +257,10 @@ export async function synthesizeText(
     onWaking,
   );
   if (!res.ok) {
-    throw new Error(`backend error ${res.status}: ${await res.text()}`);
+    throw new BackendError(
+      `backend error ${res.status}: ${await res.text()}`,
+      String(res.status),
+    );
   }
   return (await res.json()) as SynthResponse;
 }

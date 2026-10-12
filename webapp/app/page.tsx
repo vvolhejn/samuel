@@ -8,6 +8,7 @@ import {
   useSyncExternalStore,
 } from "react";
 import {
+  BackendError,
   fetchDatasetClips,
   fetchHealth,
   waitForHealth,
@@ -20,7 +21,9 @@ import {
   HealthResponse,
   PrecomputedIndex,
   SynthResponse,
+  WakeStage,
 } from "@/lib/audio";
+import { trackEvent, waitBucket } from "@/lib/analytics";
 import { insecureContextMessage } from "@/lib/secureContext";
 import { setAudioSessionType } from "@/lib/audioSession";
 import { downloadBlob, makeZip } from "@/lib/zip";
@@ -127,7 +130,13 @@ export default function Home() {
   /** Set while a request waits for the backend to wake up from scale-to-zero,
    * so the wait says so instead of looking like a very long "Thinking...". */
   const [waking, setWaking] = useState(false);
-  const onWaking = useCallback(() => setWaking(true), []);
+  /** When the current request first found the backend asleep, and in which
+   * stage, for the "Cold start" event. */
+  const wakeRef = useRef<{ since: number; stage: WakeStage } | null>(null);
+  const onWaking = useCallback((stage: WakeStage) => {
+    wakeRef.current ??= { since: Date.now(), stage };
+    setWaking(true);
+  }, []);
   /** The model's last answer. `lastResponse` is the copy the callbacks read;
    * refs must not be read in render, so the state is what the panel shows. */
   const [viewResponse, lastResponse, setResponse] =
@@ -209,6 +218,7 @@ export default function Home() {
     onBeforeStart: async () => {
       const current = await fetchHealth();
       if (!current) {
+        trackEvent("Backend error", { source: "mic", code: "unreachable" });
         throw new Error(
           "Model backend unreachable — run: uv run --extra server python -m samuel.server --no-frontend",
         );
@@ -412,8 +422,11 @@ export default function Home() {
   const imitate = useCallback(
     async (kind: Recording["kind"], send: () => Promise<SynthRequest>) => {
       claim("model");
+      trackEvent("Synthesize", { source: kind });
+      let answered = false;
       try {
         const { response, inputUrl, inputBlob } = await send();
+        answered = true;
         setResponse(response);
         // Clearing matters too: the previous recording is not the original of
         // a text-to-speech answer, and "Play original" would offer it.
@@ -431,9 +444,29 @@ export default function Home() {
         setSource("samuel");
         await playSamuel(response);
       } catch (e) {
+        // Past the answer, a failure is the page's own, not the backend's.
+        if (!answered) {
+          const code =
+            e instanceof BackendError
+              ? e.code
+              : e instanceof TypeError // what fetch() throws when offline
+                ? "network"
+                : "other";
+          trackEvent("Backend error", { source: kind, code });
+        }
         setError(e instanceof Error ? e.message : String(e));
         await restoreMic();
       } finally {
+        const wake = wakeRef.current;
+        if (wake) {
+          trackEvent("Cold start", {
+            source: kind,
+            stage: wake.stage,
+            wait: waitBucket(Date.now() - wake.since),
+            outcome: answered ? "woke" : "failed",
+          });
+        }
+        wakeRef.current = null;
         setWaking(false);
       }
     },
