@@ -12,6 +12,7 @@
   "dependencies": {
     "@cloudflare/containers": "^0.3.7",
     "@ricky0123/vad-web": "^0.0.30",
+    "fix-webm-duration": "^1.0.6",
     "next": "16.2.10",
     "react": "19.2.4",
     "react-dom": "19.2.4"

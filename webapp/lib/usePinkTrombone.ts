@@ -4,6 +4,19 @@ import type {
   PinkTromboneElement,
 } from "@/types/pink-trombone";
 import type { SynthResponse } from "@/lib/audio";
+import {
+  startVideoRecording,
+  type VideoRecorder,
+  type VideoRecording,
+} from "@/lib/videoRecorder";
+import { createPcmTap, type PcmTap } from "@/lib/pcmTap";
+
+/** One recorded playback: the tract as a video (with sound), and the sound on
+ * its own as a WAV. Either is null when the browser can't record it. */
+export interface Capture {
+  video: VideoRecording | null;
+  audio: Blob | null;
+}
 
 /** Headroom between scheduling and curve start; also the voicing fade-in. */
 const LEAD_S = 0.15;
@@ -59,6 +72,12 @@ export interface PinkTromboneHandle {
   /** The synth's AudioContext, or null before init(). Shared so callers can
    * decode and play their own audio on the same clock and device. */
   audioContext: () => AudioContext | null;
+  /** Start capturing the tract visualization and the synth's output. No-op if
+   * a capture is already running. */
+  startRecording: () => void;
+  /** Finish the capture started by startRecording(); null if there wasn't one
+   * or the browser recorded nothing at all. */
+  stopRecording: () => Promise<Capture | null>;
   ready: () => boolean;
 }
 
@@ -168,6 +187,14 @@ export function usePinkTrombone(): PinkTromboneHandle {
   const playTokenRef = useRef(0);
   /** Non-null only while an utterance is scheduled and unfinished. */
   const playbackRef = useRef<Playback | null>(null);
+  /** Recording taps, set up in init(): what the synth outputs, and the stacked
+   * canvases the tract is drawn on (bottom first). */
+  const recordDestRef = useRef<MediaStreamAudioDestinationNode | null>(null);
+  const canvasesRef = useRef<HTMLCanvasElement[]>([]);
+  const pcmTapRef = useRef<PcmTap | null>(null);
+  /** The capture in progress, if any. `video` is null when the browser can't
+   * record one; the audio tap may still be running. */
+  const captureRef = useRef<{ video: VideoRecorder | null } | null>(null);
 
   const init = useCallback(async (element: PinkTromboneElement) => {
     if (elementRef.current) return;
@@ -220,10 +247,23 @@ export function usePinkTrombone(): PinkTromboneHandle {
     element.connect(masterGain);
     masterGain.connect(ctx.destination);
     masterGainRef.current = masterGain;
+    // Second tap on the same signal, for the video's soundtrack. Always
+    // connected — a destination node nobody records from costs nothing.
+    recordDestRef.current = ctx.createMediaStreamDestination();
+    masterGain.connect(recordDestRef.current);
+    // Third tap, for the audio download: the same signal as raw samples. A
+    // browser without AudioWorklet just gets no audio file.
+    pcmTapRef.current = await createPcmTap(masterGain).catch(() => null);
 
     element.start();
     element.enableUI();
     element.startUI();
+    // enableUI() has now appended TractUI's canvases. They are transparent and
+    // stacked by z-index (background 0, tract 1), which is the order the video
+    // recorder has to composite them in — DOM order is the other way round.
+    canvasesRef.current = Array.from(element.querySelectorAll("canvas")).sort(
+      (a, b) => Number(a.style.zIndex || 0) - Number(b.style.zIndex || 0),
+    );
     elementRef.current = element;
   }, []);
 
@@ -514,6 +554,29 @@ export function usePinkTrombone(): PinkTromboneHandle {
     [],
   );
 
+  const startRecording = useCallback(() => {
+    if (captureRef.current || !elementRef.current) return;
+    pcmTapRef.current?.start();
+    captureRef.current = {
+      video: startVideoRecording(
+        elementRef.current,
+        canvasesRef.current,
+        recordDestRef.current?.stream ?? null,
+      ),
+    };
+  }, []);
+
+  const stopRecording = useCallback(async (): Promise<Capture | null> => {
+    const capture = captureRef.current;
+    captureRef.current = null;
+    if (!capture) return null;
+    const [video, audio] = await Promise.all([
+      capture.video?.stop() ?? null,
+      pcmTapRef.current?.stop() ?? null,
+    ]);
+    return video || audio ? { video, audio } : null;
+  }, []);
+
   const ready = useCallback(() => elementRef.current !== null, []);
 
   // Stable handle: effects depending on it must not re-run on re-render.
@@ -530,6 +593,8 @@ export function usePinkTrombone(): PinkTromboneHandle {
       startVoice,
       endVoice: fadeVoicing,
       audioContext,
+      startRecording,
+      stopRecording,
       ready,
     }),
     [
@@ -543,6 +608,8 @@ export function usePinkTrombone(): PinkTromboneHandle {
       voice,
       startVoice,
       audioContext,
+      startRecording,
+      stopRecording,
       ready,
     ],
   );

@@ -37,6 +37,7 @@ import { MUTED_LINK, STRIP, TextLink, sectionBox } from "@/components/ui";
 import { LevelMeter } from "@/components/LevelMeter";
 import { TractStage } from "@/components/TractStage";
 import { DebugPanel } from "@/components/DebugPanel";
+import type { Capture } from "@/lib/usePinkTrombone";
 import type {
   PinkTromboneElement,
   VoiceboxEventDetail,
@@ -98,12 +99,68 @@ const TTS_MAX_CHARS = 300;
 
 interface Recording {
   kind: "mic" | "dataset" | "tts";
+  /** What goes in this utterance's filenames to tell it apart: "clip-3" for
+   * the third pre-recorded clip, "tts-" and the start of the text for
+   * text-to-speech, plain "mic" for the mic. */
+  label: string;
+  /** When the utterance was made — stamped as the mtime on every file for this
+   * utterance in a zip, so a downloaded set keeps its wall-clock order after
+   * being extracted. */
+  timestamp: Date;
   /** What the model was given: a WAV from the mic, an MP3 for a clip, plain
    * text for text-to-speech. */
   input: Blob;
   /** WAV of the model's output, rendered by the Python synth. Null for a
    * precomputed clip: those responses drop the reference audio. */
   output: Blob | null;
+  /** The browser synth's first playback of this response: the tract as a
+   * video, and the sound as a WAV. Filled in once that playback finishes. */
+  capture?: Capture;
+}
+
+/** What the Download box hands you: the tract moving, or Samuel's voice. */
+type DownloadMedia = "video" | "audio";
+type DownloadScope = "last" | "all";
+
+/** The file for one utterance in `media`, or null if there isn't one (yet).
+ * Both are what the browser played, not the Python synth's reference WAV: that
+ * is what you heard, and what the video's soundtrack is. */
+function mediaFile(
+  recording: Recording,
+  media: DownloadMedia,
+): { blob: Blob; extension: string } | null {
+  if (media === "video") return recording.capture?.video ?? null;
+  const audio = recording.capture?.audio;
+  return audio ? { blob: audio, extension: "wav" } : null;
+}
+
+/** Most characters of typed text that go into a filename. */
+const MAX_LABEL_TEXT = 40;
+
+/** A filename-safe version of `text`: accents dropped, lowercase ASCII words
+ * joined by dashes, cut at a word boundary to MAX_LABEL_TEXT characters. */
+function slugify(text: string): string {
+  const slug = text
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "");
+  if (slug.length <= MAX_LABEL_TEXT) return slug;
+  const cut = slug.slice(0, MAX_LABEL_TEXT + 1);
+  const lastDash = cut.lastIndexOf("-");
+  return lastDash > 0 ? cut.slice(0, lastDash) : cut.slice(0, MAX_LABEL_TEXT);
+}
+
+/** Local-time YYYY-MM-DDTHH-MM-SS stamp for download filenames: ISO order for
+ * sorting, colons swapped for dashes so it survives every filesystem, local
+ * because that's what a human reads on the file. */
+function filenameStamp(d: Date = new Date()): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return (
+    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` +
+    `T${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`
+  );
 }
 
 /** How long a precomputed clip pretends to think, in ms. The answer is on disk
@@ -117,6 +174,40 @@ const sleep = (ms: number) =>
 function fakeThinking(): Promise<void> {
   const [lo, hi] = FAKE_THINKING_MS;
   return sleep(lo + Math.random() * (hi - lo));
+}
+
+/** A column of radio buttons, for the Download box. */
+function RadioGroup<T extends string>({
+  name,
+  value,
+  onChange,
+  options,
+}: {
+  name: string;
+  value: T;
+  onChange: (value: T) => void;
+  options: Array<[T, string]>;
+}) {
+  return (
+    <div role="radiogroup" className="flex flex-col gap-1">
+      {options.map(([option, label]) => (
+        <label
+          key={option}
+          className="flex cursor-pointer items-center gap-1.5"
+        >
+          <input
+            type="radio"
+            name={name}
+            value={option}
+            checked={value === option}
+            onChange={() => onChange(option)}
+            className="accent-highlight-600"
+          />
+          {label}
+        </label>
+      ))}
+    </div>
+  );
 }
 
 export default function Home() {
@@ -202,6 +293,17 @@ export default function Home() {
   /** Every utterance this session, for the debug panel's download. */
   const historyRef = useRef<Recording[]>([]);
   const [historyCount, setHistoryCount] = useState(0);
+  /** The Download box: whether it's open, and what its two choices are on. */
+  const [downloadOpen, setDownloadOpen] = useState(false);
+  const [downloadKind, setDownloadKind] = useState<DownloadMedia>("video");
+  const [downloadScope, setDownloadScope] = useState<DownloadScope>("last");
+  /** Which of the four choices there is a file for — see refreshDownloadable. */
+  const [downloadable, setDownloadable] = useState<
+    Record<DownloadMedia, Record<DownloadScope, boolean>>
+  >({
+    audio: { last: false, all: false },
+    video: { last: false, all: false },
+  });
   /** Pointer is down on the voicebox pad, i.e. the synth is sounding by hand. */
   const voicingRef = useRef(false);
   /** Bumped whenever a playback starts or is cut short, so the completion of a
@@ -346,11 +448,21 @@ export default function Home() {
     [restoreMic],
   );
 
+  /** With `record`, the tract animation and the synth's audio are captured for
+   * the duration of the playback and returned. Only the first,
+   * automatic playback of a response is recorded — replays and scrubs would
+   * otherwise keep overwriting the session's copy. */
   const playSamuel = useCallback(
-    async (response: SynthResponse, startFrac = 0) => {
+    async (
+      response: SynthResponse,
+      startFrac = 0,
+      record = false,
+    ): Promise<Capture | null> => {
       claim("playback"); // stops the mic too, so the synth can't retrigger it
       const id = playIdRef.current;
       setIsPlaying(true);
+      if (record) trombone.startRecording();
+      let capture: Capture | null = null;
       try {
         await trombone.speak(response, {
           startFrac,
@@ -359,8 +471,12 @@ export default function Home() {
           },
         });
       } finally {
+        // In the finally so a failed speak() can't leave a capture running:
+        // startRecording() would then refuse the next one.
+        if (record) capture = await trombone.stopRecording();
         await finishPlayback(id);
       }
+      return capture;
     },
     [trombone, claim, finishPlayback, setScrubFrac],
   );
@@ -400,19 +516,79 @@ export default function Home() {
     [original, claim, finishPlayback, setScrubFrac],
   );
 
-  const remember = useCallback((recording: Recording) => {
+  /** Re-read what the Download box can offer. History lives in a ref, which
+   * render may not read, so this copies the answer into state. */
+  const refreshDownloadable = useCallback(() => {
     const history = historyRef.current;
-    history.push(recording);
-    if (history.length > MAX_HISTORY)
-      history.splice(0, history.length - MAX_HISTORY);
-    setHistoryCount(history.length);
+    const last = history.at(-1);
+    const has = (media: DownloadMedia, scope: DownloadScope) =>
+      scope === "last"
+        ? !!last && mediaFile(last, media) !== null
+        : history.some((r) => mediaFile(r, media) !== null);
+    setDownloadable({
+      audio: { last: has("audio", "last"), all: has("audio", "all") },
+      video: { last: has("video", "last"), all: has("video", "all") },
+    });
   }, []);
 
-  /** One zip of every input/output pair this session. */
+  /** Returns the stored entry, which the caller may still fill in (the capture
+   * only exists once the response has finished playing). */
+  const remember = useCallback(
+    (recording: Recording) => {
+      const history = historyRef.current;
+      history.push(recording);
+      if (history.length > MAX_HISTORY)
+        history.splice(0, history.length - MAX_HISTORY);
+      setHistoryCount(history.length);
+      refreshDownloadable();
+      return recording;
+    },
+    [refreshDownloadable],
+  );
+
+  /** The Download box's button: one file for the last utterance, or a zip of
+   * every utterance that has one. Numbered by position in the session, so the
+   * zip lines up with the debug panel's. */
+  const downloadMedia = useCallback(async () => {
+    const history = historyRef.current;
+    if (downloadScope === "last") {
+      const last = history.at(-1);
+      const file = last && mediaFile(last, downloadKind);
+      if (!file) return;
+      // A mic utterance needs no label: "samuel-<time>" says it all.
+      const label = last.kind === "mic" ? "" : `-${last.label}`;
+      downloadBlob(
+        file.blob,
+        `samuel-${filenameStamp(last.timestamp)}${label}.${file.extension}`,
+      );
+      return;
+    }
+    const entries = await Promise.all(
+      history.flatMap((recording, i) => {
+        const file = mediaFile(recording, downloadKind);
+        if (!file) return [];
+        const name = `${String(i + 1).padStart(2, "0")}-${recording.label}.${file.extension}`;
+        return [
+          file.blob.arrayBuffer().then((b) => ({
+            name,
+            bytes: new Uint8Array(b),
+            mtime: recording.timestamp,
+          })),
+        ];
+      }),
+    );
+    downloadBlob(
+      makeZip(entries),
+      `samuel-${downloadKind}-${filenameStamp()}.zip`,
+    );
+  }, [downloadKind, downloadScope]);
+
+  /** One zip of every input/output pair this session, plus the tract video for
+   * each. */
   const downloadHistory = useCallback(async () => {
     const entries = await Promise.all(
       historyRef.current.flatMap((recording, i) => {
-        const stem = `${String(i + 1).padStart(2, "0")}-${recording.kind}`;
+        const stem = `${String(i + 1).padStart(2, "0")}-${recording.label}`;
         const inputExt =
           recording.input.type === "audio/mpeg"
             ? "mp3"
@@ -425,19 +601,29 @@ export default function Home() {
         // Absent for a precomputed clip — see Recording.output.
         if (recording.output)
           files.push([`${stem}-output.wav`, recording.output]);
+        const video = recording.capture?.video;
+        if (video) files.push([`${stem}-tract.${video.extension}`, video.blob]);
         return files.map(([name, blob]) =>
-          blob.arrayBuffer().then((b) => ({ name, bytes: new Uint8Array(b) })),
+          blob.arrayBuffer().then((b) => ({
+            name,
+            bytes: new Uint8Array(b),
+            mtime: recording.timestamp,
+          })),
         );
       }),
     );
-    downloadBlob(makeZip(entries), "samuel-session.zip");
+    downloadBlob(makeZip(entries), `samuel-session-${filenameStamp()}.zip`);
   }, []);
 
   /** One round trip through the model: send it some audio, keep what comes
    * back, and play the imitation. `send` is whatever gets the answer, and the
    * wait for it is the one thing nothing else may interrupt. */
   const imitate = useCallback(
-    async (kind: Recording["kind"], send: () => Promise<SynthRequest>) => {
+    async (
+      kind: Recording["kind"],
+      label: string,
+      send: () => Promise<SynthRequest>,
+    ) => {
       claim("model");
       trackEvent("Synthesize", { source: kind });
       let answered = false;
@@ -449,8 +635,10 @@ export default function Home() {
         // a text-to-speech answer, and "Play original" would offer it.
         if (inputUrl) original.set(inputUrl);
         else original.clear();
-        remember({
+        const entry = remember({
           kind,
+          label,
+          timestamp: new Date(),
           input: inputBlob,
           output: response.synth_audio_b64
             ? wavBlob(response.synth_audio_b64)
@@ -459,7 +647,11 @@ export default function Home() {
         // A fresh imitation is what you want to hear, whatever the toggle was
         // left on.
         setSource("samuel");
-        await playSamuel(response);
+        const capture = await playSamuel(response, 0, true);
+        if (capture) {
+          entry.capture = capture;
+          refreshDownloadable();
+        }
       } catch (e) {
         // Past the answer, a failure is the page's own, not the backend's.
         if (!answered) {
@@ -487,7 +679,16 @@ export default function Home() {
         setWaking(false);
       }
     },
-    [playSamuel, restoreMic, original, remember, setResponse, setSource, claim],
+    [
+      playSamuel,
+      restoreMic,
+      original,
+      remember,
+      refreshDownloadable,
+      setResponse,
+      setSource,
+      claim,
+    ],
   );
 
   const onUtterance = useCallback(
@@ -496,7 +697,7 @@ export default function Home() {
       // Your own voice is now what the transport holds, so no clip button stays
       // filled in and no clip is credited under the bar.
       setPlayedClip("");
-      await imitate("mic", () => synthesizeUtterance(audio, onWaking));
+      await imitate("mic", "mic", () => synthesizeUtterance(audio, onWaking));
     },
     [imitate, isBusy, onWaking],
   );
@@ -545,7 +746,9 @@ export default function Home() {
       if (!clip || ownerRef.current === "model") return;
       setError(null);
       setPlayedClip(name);
-      await imitate("dataset", async () => {
+      // Numbered as on its button.
+      const label = `clip-${clips.indexOf(clip) + 1}`;
+      await imitate("dataset", label, async () => {
         await trombone.resume(); // we're in a user gesture
         console.log(`${clip.name}: ${clip.source} @${clip.offset_s}s`);
         const answer = await synthesizeDatasetClip(
@@ -569,7 +772,9 @@ export default function Home() {
     if (!text || ownerRef.current === "model") return;
     setError(null);
     setPlayedClip("");
-    await imitate("tts", async () => {
+    // Text with nothing ASCII in it slugs to nothing; then it's just "tts".
+    const slug = slugify(text);
+    await imitate("tts", slug ? `tts-${slug}` : "tts", async () => {
       await trombone.resume(); // we're in a user gesture
       const response = await synthesizeText(text, onWaking);
       return {
@@ -1060,11 +1265,9 @@ export default function Home() {
 
           {/* The other take of the same utterance, as an aside rather than a
               switch: the imitation is what you came for, and a lit-up control
-              next to Play only competed with it. The clip's credit shares this
-              row, pushed to the far end, so crediting costs no height — and it
-              sits under the bar it belongs to rather than by the buttons, since
-              what it names is the audio now loaded, not the button you pressed. */}
-          <div className="flex items-start justify-between gap-3 text-xs text-neutral-500">
+              next to Play only competed with it. Download closes the row: an
+              aside too, opening a box below. */}
+          <div className="flex items-start gap-3 text-xs text-neutral-500">
             {/* Gone for a text-to-speech answer, which has no original: an
                 answer without one can only have come from text. `invisible`
                 rather than unmounted, so the box keeps its height. */}
@@ -1078,20 +1281,89 @@ export default function Home() {
               {source === "samuel" ? "Play original" : "Play imitated"}
             </button>
 
-            {clipCredit && (
-              <span className="min-w-0 text-right">
-                <TextLink href={clipCredit.url} muted>
-                  {clipCredit.title}
-                </TextLink>{" "}
-                by {clipCredit.author}, read by {clipCredit.reader} (
-                <TextLink href="https://librivox.org/" muted>
-                  LibriVox
-                </TextLink>
-                )
-              </span>
-            )}
+            {/* The arrow is what says it opens something rather than
+                downloading on the spot. */}
+            <button
+              onClick={() => setDownloadOpen((v) => !v)}
+              disabled={historyCount === 0}
+              aria-expanded={downloadOpen}
+              aria-controls="download-box"
+              className={`${MUTED_LINK} ml-auto shrink-0 disabled:opacity-50 disabled:hover:text-inherit`}
+            >
+              Download {downloadOpen ? "▾" : "▸"}
+            </button>
           </div>
+
+          {/* A pre-recorded clip's credit, on a line of its own under the
+              transport rather than by the buttons, since what it names is the
+              audio now loaded, not the button you pressed. */}
+          {clipCredit && (
+            <p className="w-full text-xs text-neutral-500">
+              <TextLink href={clipCredit.url} muted>
+                {clipCredit.title}
+              </TextLink>{" "}
+              by {clipCredit.author}, read by {clipCredit.reader} (
+              <TextLink href="https://librivox.org/" muted>
+                LibriVox
+              </TextLink>
+              )
+            </p>
+          )}
         </div>
+        {/* Under the transport it was opened from, in the same box style. The
+            two choices side by side, each a column, then the same filled pill
+            as Record: the one button in the box that actually does something.
+            The dividers run through the box's padding to its edges, like the
+            input box's. STRIP's bleed but not its side padding: the spare width
+            is shared evenly between the edges and both sides of each divider,
+            which padding at the edges would throw off. */}
+        {downloadOpen && (
+          <div
+            id="download-box"
+            className={`-mx-4 flex items-center justify-evenly self-stretch py-3 text-sm text-neutral-600 md:mx-0 ${sectionBox(false)}`}
+          >
+            <RadioGroup
+              name="download-kind"
+              value={downloadKind}
+              onChange={setDownloadKind}
+              options={[
+                ["video", "Video"],
+                ["audio", "Audio"],
+              ]}
+            />
+            <div
+              aria-hidden
+              className="-my-3 w-px self-stretch bg-neutral-200"
+            />
+            <RadioGroup
+              name="download-scope"
+              value={downloadScope}
+              onChange={setDownloadScope}
+              options={[
+                ["last", "Last clip"],
+                ["all", "All clips"],
+              ]}
+            />
+            <div
+              aria-hidden
+              className="-my-3 w-px self-stretch bg-neutral-200"
+            />
+            <button
+              onClick={() => void downloadMedia()}
+              disabled={!downloadable[downloadKind][downloadScope]}
+              title={
+                downloadable[downloadKind][downloadScope]
+                  ? undefined
+                  : historyCount > 0
+                    ? "Ready once the clip has finished playing"
+                    : "Nothing to download yet"
+              }
+              className="w-32 shrink-0 rounded-full border border-transparent bg-highlight-600 py-1.5 text-sm font-semibold text-white hover:bg-highlight-700 disabled:opacity-40 disabled:hover:bg-highlight-600"
+            >
+              Download
+            </button>
+          </div>
+        )}
         {insecure && (
           <p className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">
             {insecure}

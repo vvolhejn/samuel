@@ -29,6 +29,26 @@ export interface ZipEntry {
   /** Path inside the archive. ASCII only — we don't set the UTF-8 flag. */
   name: string;
   bytes: Uint8Array<ArrayBuffer>;
+  /** Modification time to stamp in the entry's headers. Local time, since
+   * DOS date/time has no timezone. Defaults to 1980-01-01 (the epoch of the
+   * DOS format) when the caller doesn't have one. */
+  mtime?: Date;
+}
+
+/** MS-DOS date/time pair used in the local file and central directory headers.
+ * Two seconds of resolution, and clamped to 1980-01-01 — the format cannot
+ * represent anything earlier. */
+function dosDateTime(date: Date | undefined): { time: number; date: number } {
+  if (!date) return { time: 0, date: 0x21 };
+  const y = date.getFullYear();
+  if (y < 1980) return { time: 0, date: 0x21 };
+  const time =
+    (date.getHours() << 11) |
+    (date.getMinutes() << 5) |
+    (date.getSeconds() >>> 1);
+  const dateField =
+    ((y - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate();
+  return { time, date: dateField };
 }
 
 /** Build a .zip blob from in-memory entries. */
@@ -42,6 +62,7 @@ export function makeZip(entries: ZipEntry[]): Blob {
     const name = encoder.encode(entry.name);
     const crc = crc32(entry.bytes);
     const size = entry.bytes.length;
+    const { time: modTime, date: modDate } = dosDateTime(entry.mtime);
 
     const local = new Uint8Array(30 + name.length);
     const lv = new DataView(local.buffer);
@@ -49,8 +70,8 @@ export function makeZip(entries: ZipEntry[]): Blob {
     lv.setUint16(4, 20, true); // version needed
     lv.setUint16(6, 0, true); // flags
     lv.setUint16(8, 0, true); // method: stored
-    lv.setUint16(10, 0, true); // mod time (we have no clock we care about)
-    lv.setUint16(12, 0x21, true); // mod date: 1980-01-01
+    lv.setUint16(10, modTime, true);
+    lv.setUint16(12, modDate, true);
     lv.setUint32(14, crc, true);
     lv.setUint32(18, size, true); // compressed size
     lv.setUint32(22, size, true); // uncompressed size
@@ -65,8 +86,8 @@ export function makeZip(entries: ZipEntry[]): Blob {
     dv.setUint16(6, 20, true); // version needed
     dv.setUint16(8, 0, true); // flags
     dv.setUint16(10, 0, true); // method: stored
-    dv.setUint16(12, 0, true); // mod time
-    dv.setUint16(14, 0x21, true); // mod date
+    dv.setUint16(12, modTime, true);
+    dv.setUint16(14, modDate, true);
     dv.setUint32(16, crc, true);
     dv.setUint32(20, size, true);
     dv.setUint32(24, size, true);
