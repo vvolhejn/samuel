@@ -59,6 +59,9 @@ export interface PinkTromboneHandle {
   scrub: (response: SynthResponse, frac: number) => void;
   /** Fade the voicing after scrubbing (the tract pose stays in place). */
   endScrub: () => void;
+  /** Like scrub, but silent: moves the tract to the frame without voicing it,
+   * and leaves the gate as it is. */
+  pose: (response: SynthResponse, frac: number) => void;
   /** Hold the glottis at one (frequency, voiceness) and sound it — the
    * voicebox pad, played by hand. Freezes any automation in progress but
    * leaves the tract pose alone, so the shape on screen, whether the model or
@@ -196,8 +199,10 @@ export function usePinkTrombone(): PinkTromboneHandle {
    * record one; the audio tap may still be running. */
   const captureRef = useRef<{ video: VideoRecorder | null } | null>(null);
 
-  const init = useCallback(async (element: PinkTromboneElement) => {
-    if (elementRef.current) return;
+  /** The first init() call's promise, shared by any later ones. */
+  const initRef = useRef<Promise<void> | null>(null);
+
+  const load = useCallback(async (element: PinkTromboneElement) => {
     // Load the vendored bundle outside the bundler's module graph; for module
     // scripts "load" fires after evaluation, i.e. after customElements.define.
     if (!document.querySelector("script[data-pink-trombone]")) {
@@ -266,6 +271,14 @@ export function usePinkTrombone(): PinkTromboneHandle {
     );
     elementRef.current = element;
   }, []);
+
+  // Once only, even when called again before the first call finishes (React
+  // runs mount effects twice in development): two overlapping
+  // setAudioContext() calls on the element leave it half-built.
+  const init = useCallback(
+    (element: PinkTromboneElement) => (initRef.current ??= load(element)),
+    [load],
+  );
 
   const resume = useCallback(async () => {
     const element = elementRef.current;
@@ -453,35 +466,50 @@ export function usePinkTrombone(): PinkTromboneHandle {
     scheduleEndRef.current = now;
   }, []);
 
-  const scrub = useCallback((response: SynthResponse, frac: number) => {
-    playTokenRef.current++;
-    playbackRef.current = null;
-    const element = elementRef.current;
-    const constriction = constrictionRef.current;
-    const lipConstriction = lipConstrictionRef.current;
-    const masterGain = masterGainRef.current;
-    if (!element || !constriction || !lipConstriction || !masterGain) return;
-    const ctx = element.audioContext;
-    void ctx.resume(); // called from a user gesture
+  /** Jump the params to one frame of a response, opening the gate only when
+   * `sound` (scrub) — silently, it just moves the drawing (pose). */
+  const setFrame = useCallback(
+    (response: SynthResponse, frac: number, sound: boolean) => {
+      playTokenRef.current++;
+      playbackRef.current = null;
+      const element = elementRef.current;
+      const constriction = constrictionRef.current;
+      const lipConstriction = lipConstrictionRef.current;
+      const masterGain = masterGainRef.current;
+      if (!element || !constriction || !lipConstriction || !masterGain) return;
+      const ctx = element.audioContext;
+      if (sound) void ctx.resume(); // called from a user gesture
 
-    const values = curveValues(response);
-    const nFrames = response.params.voiceness.length;
-    const frame = Math.min(
-      nFrames - 1,
-      Math.max(0, Math.round(frac * (nFrames - 1))),
-    );
-    const now = ctx.currentTime;
-    const params = automatedParams(element, constriction, lipConstriction);
-    params.forEach((param, i) => {
-      cancelAndHold(param, now);
-      param.setTargetAtTime(values[i][frame], now, SCRUB_TAU_S);
-    });
-    // Open the gate; the scrubbed frame's own intensity is set by the loop
-    // above, so a silent frame stays silent.
-    cancelAndHold(masterGain.gain, now);
-    masterGain.gain.setTargetAtTime(1, now, 0.03);
-    scheduleEndRef.current = now;
-  }, []);
+      const values = curveValues(response);
+      const nFrames = response.params.voiceness.length;
+      const frame = Math.min(
+        nFrames - 1,
+        Math.max(0, Math.round(frac * (nFrames - 1))),
+      );
+      const now = ctx.currentTime;
+      const params = automatedParams(element, constriction, lipConstriction);
+      params.forEach((param, i) => {
+        cancelAndHold(param, now);
+        param.setTargetAtTime(values[i][frame], now, SCRUB_TAU_S);
+      });
+      scheduleEndRef.current = now;
+      if (!sound) return;
+      // Open the gate; the scrubbed frame's own intensity is set by the loop
+      // above, so a silent frame stays silent.
+      cancelAndHold(masterGain.gain, now);
+      masterGain.gain.setTargetAtTime(1, now, 0.03);
+    },
+    [],
+  );
+
+  const scrub = useCallback(
+    (response: SynthResponse, frac: number) => setFrame(response, frac, true),
+    [setFrame],
+  );
+  const pose = useCallback(
+    (response: SynthResponse, frac: number) => setFrame(response, frac, false),
+    [setFrame],
+  );
 
   const voice = useCallback((frequency: number, voiceness: number) => {
     playTokenRef.current++;
@@ -589,6 +617,7 @@ export function usePinkTrombone(): PinkTromboneHandle {
       stop,
       scrub,
       endScrub: fadeVoicing,
+      pose,
       voice,
       startVoice,
       endVoice: fadeVoicing,
@@ -605,6 +634,7 @@ export function usePinkTrombone(): PinkTromboneHandle {
       stop,
       scrub,
       fadeVoicing,
+      pose,
       voice,
       startVoice,
       audioContext,
