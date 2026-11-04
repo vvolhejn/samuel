@@ -17,7 +17,7 @@ import {
   poseResponse,
   pairSlice,
   sampleAt,
-  viridis,
+  lossColor,
   type Landscape,
 } from "@/lib/lossLandscape";
 import type { PinkTromboneElement } from "@/types/pink-trombone";
@@ -37,8 +37,8 @@ const DESCENT_STEPS = 25;
 
 const subscribeNever = () => () => {};
 
-/** Hover the heatmap to move two of the three swept params, and hold it down to
- * hear the pose; it shows the precomputed MFCC loss of every pose in that
+/** Hover the heatmap to move two of the three swept params, and click it to
+ * toggle hearing the pose; it shows the precomputed MFCC loss of every pose in that
  * plane against the target sound, the third param held at the target. */
 export default function LossLandscapePage() {
   const insecure = useSyncExternalStore(
@@ -51,7 +51,7 @@ export default function LossLandscapePage() {
   const [values, setValues] = useState<Record<string, number> | null>(null);
   /** The pair on the heatmap, as an index into landscape.slices. */
   const [pair, setPair] = useState(0);
-  /** Sounding: while the heatmap (or space) is held down. */
+  /** Sounding: toggled by clicking the heatmap (or space). */
   const [isPlaying, setIsPlaying] = useState(false);
   const [hovering, setHovering] = useState(false);
   const [ready, setReady] = useState(false);
@@ -84,30 +84,11 @@ export default function LossLandscapePage() {
     else trombone.pose(poseResponse(values), 0);
   }, [ready, isPlaying, values, trombone]);
 
-  /** Set by the first hold; the hint is gone for good after it. */
-  const [played, setPlayed] = useState(false);
-
-  const play = useCallback(() => {
+  const togglePlay = useCallback(() => {
     if (!trombone.ready()) return;
-    setIsPlaying(true);
-    setPlayed(true);
-  }, [trombone]);
-
-  // Fading an already silent voice is harmless, so this needn't check.
-  const stopPlaying = useCallback(() => {
-    trombone.endScrub();
-    setIsPlaying(false);
-  }, [trombone]);
-
-  // A hold ends wherever the pointer is let go, on the map or not.
-  useEffect(() => {
-    window.addEventListener("pointerup", stopPlaying);
-    window.addEventListener("pointercancel", stopPlaying);
-    return () => {
-      window.removeEventListener("pointerup", stopPlaying);
-      window.removeEventListener("pointercancel", stopPlaying);
-    };
-  }, [stopPlaying]);
+    if (isPlaying) trombone.endScrub();
+    setIsPlaying(!isPlaying);
+  }, [isPlaying, trombone]);
 
   const slice = landscape?.slices[pair];
 
@@ -183,13 +164,13 @@ export default function LossLandscapePage() {
     };
   }, [set]);
 
-  // Holding space plays too, from anywhere on the page.
+  // Space toggles too, from anywhere on the page. It's handled on keyup as
+  // well, or a focused button would take the same press as a click.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== " ") return;
       e.preventDefault();
-      if (e.type === "keyup") stopPlaying();
-      else if (!e.repeat) play();
+      if (e.type === "keydown" && !e.repeat) togglePlay();
     };
     window.addEventListener("keydown", onKey);
     window.addEventListener("keyup", onKey);
@@ -197,7 +178,7 @@ export default function LossLandscapePage() {
       window.removeEventListener("keydown", onKey);
       window.removeEventListener("keyup", onKey);
     };
-  }, [play, stopPlaying]);
+  }, [togglePlay]);
 
   /** Switching pairs puts the param that leaves the map back at its target:
    * the map is the slice through the target. */
@@ -228,13 +209,12 @@ export default function LossLandscapePage() {
           </TractStage>
         )}
 
-        {/* Hidden rather than removed once played, so nothing below moves. */}
         <p
           className={`text-center text-sm text-neutral-500 ${
-            played ? "invisible" : ""
-          } ${hovering ? "font-semibold" : ""}`}
+            hovering ? "font-semibold" : ""
+          }`}
         >
-          Click and hold the map to play audio
+          Click the map to {isPlaying ? "stop" : "play"} audio
         </p>
 
         {landscape && (
@@ -261,7 +241,7 @@ export default function LossLandscapePage() {
       {landscape && values && (
         <div className="flex w-full min-w-0 max-w-2xl flex-1 flex-col gap-2 text-xs text-neutral-500 select-none">
           <p className="text-sm text-neutral-600">
-            MFCC loss vs. the target:{" "}
+            MFCC loss:{" "}
             <span className="font-semibold tabular-nums text-neutral-800">
               {loss?.toFixed(3)}
             </span>
@@ -275,7 +255,7 @@ export default function LossLandscapePage() {
               hovering={hovering}
               onHoverChange={setHovering}
               onHover={set}
-              onPress={play}
+              onPress={togglePlay}
             />
           )}
         </div>
@@ -329,7 +309,7 @@ function Heatmap({
     const img = ctx.createImageData(ax.n, ay.n);
     for (let iy = 0; iy < ay.n; iy++) {
       for (let ix = 0; ix < ax.n; ix++) {
-        const [r, g, b] = viridis((data[iy * ax.n + ix] - lo) / (hi - lo));
+        const [r, g, b] = lossColor((data[iy * ax.n + ix] - lo) / (hi - lo));
         // Canvas rows run top-down; the y axis runs bottom-up.
         const o = ((ay.n - 1 - iy) * ax.n + ix) * 4;
         img.data.set([r, g, b, 255], o);
@@ -379,10 +359,8 @@ function Heatmap({
         <div
           className="relative aspect-square w-full cursor-crosshair touch-none"
           onPointerMove={onMove}
-          onPointerDown={(e) => {
-            onMove(e);
-            onPress();
-          }}
+          onPointerDown={onMove}
+          onClick={onPress}
           onPointerEnter={() => onHoverChange(true)}
           onPointerLeave={() => onHoverChange(false)}
         >
@@ -499,7 +477,7 @@ function Marker({
           <path d="M2,2L12,12M12,2L2,12" strokeWidth={2} className="stroke-white" />
         </svg>
       ) : (
-        <div className="h-3.5 w-3.5 rounded-full border-2 border-white bg-highlight-600 shadow" />
+        <div className="h-3.5 w-3.5 rounded-full border-2 border-white bg-neutral-900 shadow" />
       )}
     </div>
   );
@@ -515,7 +493,7 @@ function Colorbar({
   bottom: number;
 }) {
   const stops = Array.from({ length: 9 }, (_, i) => {
-    const [r, g, b] = viridis(i / 8);
+    const [r, g, b] = lossColor(i / 8);
     return `rgb(${r},${g},${b}) ${(i / 8) * 100}%`;
   });
   return (
