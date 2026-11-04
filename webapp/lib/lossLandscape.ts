@@ -163,24 +163,22 @@ export function poseResponse(values: Record<string, number>): SynthResponse {
   };
 }
 
-/** Viridis, sampled at 9 even stops. */
-const VIRIDIS = [
-  [68, 1, 84],
-  [71, 44, 122],
-  [59, 81, 139],
-  [44, 113, 142],
-  [33, 144, 141],
-  [39, 173, 129],
-  [92, 200, 99],
-  [170, 220, 50],
-  [253, 231, 37],
+/** Loss colormap: dark indigo where the pose matches the target, through
+ * magenta to the site's pink and a pale pink where it's furthest off.
+ * Lightness rises steadily, so it still reads in greyscale. */
+const STOPS = [
+  [20, 14, 54],
+  [74, 22, 110],
+  [150, 35, 125],
+  [222, 70, 125],
+  [250, 175, 200],
 ];
 
-export function viridis(t: number): [number, number, number] {
-  const f = Math.min(1, Math.max(0, t)) * (VIRIDIS.length - 1);
-  const i = Math.min(VIRIDIS.length - 2, Math.floor(f));
+export function lossColor(t: number): [number, number, number] {
+  const f = Math.min(1, Math.max(0, t)) * (STOPS.length - 1);
+  const i = Math.min(STOPS.length - 2, Math.floor(f));
   const s = f - i;
-  const [a, b] = [VIRIDIS[i], VIRIDIS[i + 1]];
+  const [a, b] = [STOPS[i], STOPS[i + 1]];
   return [0, 1, 2].map((c) => Math.round(a[c] + (b[c] - a[c]) * s)) as [
     number,
     number,
