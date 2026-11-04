@@ -868,7 +868,7 @@ def _tract_ola(
     constriction_index: Tensor,  # [B, T]
     constriction_diameter: Tensor,  # [B, T]
     lip_diameter: Tensor,  # [B, T]
-    ir_length: int = 4096,
+    ir_length: int = 256,
     samples_per_frame: int = SAMPLES_PER_FRAME,
 ) -> Tensor:  # [B, S]
     """One FIR per control frame; frame ``t``'s filter comes from frame ``t``.
@@ -1045,7 +1045,7 @@ def pink_trombone(
 def pink_trombone_ola(
     params: Tensor,
     seed: int | Tensor | None = None,
-    ir_length: int = 4096,
+    ir_length: int = 256,
     control_rate: float = CONTROL_RATE,
 ) -> Tensor:
     """OLA FIR approximation of the Pink Trombone vocal synthesizer.
@@ -1061,9 +1061,9 @@ def pink_trombone_ola(
         params:    [B, T, 12] at ``control_rate`` Hz (same as ``pink_trombone``).
         seed:      Same semantics as ``pink_trombone``: scalar, ``[B]`` tensor,
                    or ``None`` for fresh per-sample seeds.
-        ir_length: FIR approximation length in samples.  Default 4096 (~93 ms
-                   at 44.1 kHz).  Larger → more accurate but slower and more
-                   memory.
+        ir_length: FIR approximation length in samples.  Default 256 (~6 ms
+                   at 44.1 kHz, as in training).  Larger → more accurate but
+                   slower and more memory.
         control_rate: Frames-per-second of ``params``. Default 12.5 Hz.
 
     Returns:
