@@ -14,19 +14,38 @@ import { insecureContextMessage } from "@/lib/secureContext";
 import {
   descend,
   loadLandscape,
+  lossRange,
   poseResponse,
   pairSlice,
   sampleAt,
   lossColor,
   type Landscape,
+  type LossKind,
+  type TargetKind,
 } from "@/lib/lossLandscape";
 import type { PinkTromboneElement } from "@/types/pink-trombone";
 
+const LOSS_LABELS: Record<LossKind, string> = {
+  mfcc: "MFCC",
+  mel: "Mel",
+  stft: "STFT",
+  ssl: "wav2vec2",
+};
+const TARGET_LABELS: Record<TargetKind, string> = {
+  synth: "Synth",
+  ah: "“ah”",
+  "e-1": "“e” 110 Hz",
+  "e-2": "“e” 132 Hz",
+};
 const LABELS: Record<string, string> = {
   tongueIndex: "tongue index",
-  tongueDiameter: "tongue diameter",
+  tongueDiameter: "tongue height",
   lipDiameter: "lip diameter",
 };
+/** Params shown reversed: a smaller tongue diameter (the gap under the
+ * palate) is a higher tongue, so it runs from high values to low, as "tongue
+ * height". */
+const REVERSED = new Set(["tongueDiameter"]);
 /** Tract index from which a drag on the mouth is the lips (as on /curves). */
 const LIP_FROM = 41;
 /** Space the axes take around the heatmap. */
@@ -38,8 +57,9 @@ const DESCENT_STEPS = 25;
 const subscribeNever = () => () => {};
 
 /** Hover the heatmap to move two of the three swept params, and click it to
- * toggle hearing the pose; it shows the precomputed MFCC loss of every pose in that
- * plane against the target sound, the third param held at the target. */
+ * toggle hearing the pose; it shows the precomputed loss (as picked) of every
+ * pose in that plane against the target sound -- the synth's own or a
+ * recording -- the third param held at the reference pose. */
 export default function LossLandscapePage() {
   const insecure = useSyncExternalStore(
     subscribeNever,
@@ -47,24 +67,45 @@ export default function LossLandscapePage() {
     () => null,
   );
   const trombone = usePinkTrombone();
-  const [landscape, setLandscape] = useState<Landscape | null>(null);
+  const [target, setTarget] = useState<TargetKind>("synth");
+  const [kind, setKind] = useState<LossKind>("mfcc");
+  /** Each target and loss's landscape, by `${target}-${kind}`, fetched the
+   * first time it's picked. */
+  const [landscapes, setLandscapes] = useState<Record<string, Landscape>>({});
+  const landscapeKey = `${target}-${kind}`;
+  const landscape = landscapes[landscapeKey] ?? null;
   const [values, setValues] = useState<Record<string, number> | null>(null);
   /** The pair on the heatmap, as an index into landscape.slices. */
   const [pair, setPair] = useState(0);
   /** Sounding: toggled by clicking the heatmap (or space). */
   const [isPlaying, setIsPlaying] = useState(false);
   const [hovering, setHovering] = useState(false);
+  /** A target's own audio is playing, while its button is held. */
+  const [hearingTarget, setHearingTarget] = useState(false);
+  const targetAudio = useRef<HTMLAudioElement | null>(null);
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    loadLandscape()
+    if (landscapes[landscapeKey]) return;
+    loadLandscape(target, kind)
       .then((l) => {
-        setLandscape(l);
-        setValues(l.reference);
+        setLandscapes((ls) => ({ ...ls, [landscapeKey]: l }));
+        // A target's losses share its reference; values are reset to null on
+        // switching targets, so only the first load sets them.
+        setValues((v) => v ?? l.reference);
+        setError(null);
       })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
-  }, []);
+  }, [target, kind, landscapeKey, landscapes]);
+
+  /** A new target starts from its reference pose. */
+  const pickTarget = (t: TargetKind) => {
+    if (t === target) return;
+    const loaded = Object.values(landscapes).find((l) => l.target === t);
+    setValues(loaded?.reference ?? null);
+    setTarget(t);
+  };
 
   useEffect(() => {
     const element = insecureContextMessage()
@@ -77,12 +118,33 @@ export default function LossLandscapePage() {
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
   }, [trombone]);
 
-  // The mouth follows the values: sounding while playing, silently otherwise.
+  // The mouth follows the values: sounding while playing (unless the target is
+  // playing instead), silently otherwise.
   useEffect(() => {
     if (!ready || !values) return;
-    if (isPlaying) trombone.scrub(poseResponse(values), 0);
+    if (isPlaying && !hearingTarget) trombone.scrub(poseResponse(values), 0);
     else trombone.pose(poseResponse(values), 0);
-  }, [ready, isPlaying, values, trombone]);
+  }, [ready, isPlaying, hearingTarget, values, trombone]);
+
+  /** A target's 2 s, looped while its button is held. */
+  const startTarget = (t: TargetKind) => {
+    const src = `/loss-landscape-${t}.wav`;
+    if (!targetAudio.current?.src.endsWith(src)) {
+      targetAudio.current?.pause();
+      targetAudio.current = new Audio(src);
+      targetAudio.current.loop = true;
+    }
+    targetAudio.current.currentTime = 0;
+    targetAudio.current
+      .play()
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+    if (isPlaying) trombone.endScrub();
+    setHearingTarget(true);
+  };
+  const stopTarget = () => {
+    targetAudio.current?.pause();
+    setHearingTarget(false);
+  };
 
   const togglePlay = useCallback(() => {
     if (!trombone.ready()) return;
@@ -101,14 +163,21 @@ export default function LossLandscapePage() {
     [landscape, slice],
   );
 
+  /** Moves the mapped params, kept within the map. */
   const set = useCallback(
     (changes: Record<string, number>) => {
+      if (!landscape) return;
       const allowed = Object.fromEntries(
-        Object.entries(changes).filter(([key]) => mapped.includes(key)),
+        landscape.params
+          .filter(({ key }) => mapped.includes(key) && key in changes)
+          .map(({ key, lo, hi }) => [
+            key,
+            Math.min(hi, Math.max(lo, changes[key])),
+          ]),
       );
       setValues((v) => v && { ...v, ...allowed });
     },
-    [mapped],
+    [landscape, mapped],
   );
 
   // Drags on the mouth move the mapped params rather than the synth directly
@@ -119,16 +188,14 @@ export default function LossLandscapePage() {
       document.querySelector<PinkTromboneElement>("pink-trombone");
     if (!element) return;
     const lip = (e: Event) =>
-      set({
-        lipDiameter: Math.min(3, Math.max(0, (e as CustomEvent).detail.diameter)),
-      });
+      set({ lipDiameter: (e as CustomEvent).detail.diameter });
     const handlers: Record<string, (e: Event) => void> = {
       setParameter: (e) => {
         const { parameterName, newValue } = (e as CustomEvent).detail;
         if (parameterName === "tongue.index")
-          set({ tongueIndex: Math.min(35, Math.max(10, Number(newValue))) });
+          set({ tongueIndex: Number(newValue) });
         else if (parameterName === "tongue.diameter")
-          set({ tongueDiameter: Math.min(3.5, Math.max(1.5, Number(newValue))) });
+          set({ tongueDiameter: Number(newValue) });
       },
       newConstriction: (e) => {
         const { index, touchIdentifier } = (e as CustomEvent).detail;
@@ -180,8 +247,8 @@ export default function LossLandscapePage() {
     };
   }, [togglePlay]);
 
-  /** Switching pairs puts the param that leaves the map back at its target:
-   * the map is the slice through the target. */
+  /** Switching pairs puts the param that leaves the map back at the reference:
+   * the map is the slice through it. */
   const pickPair = (i: number) => {
     if (!landscape) return;
     const next = landscape.slices[i];
@@ -240,12 +307,37 @@ export default function LossLandscapePage() {
 
       {landscape && values && (
         <div className="flex w-full min-w-0 max-w-2xl flex-1 flex-col gap-2 text-xs text-neutral-500 select-none">
-          <p className="text-sm text-neutral-600">
-            MFCC loss:{" "}
-            <span className="font-semibold tabular-nums text-neutral-800">
-              {loss?.toFixed(3)}
-            </span>
-          </p>
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-sm text-neutral-600">
+              {LOSS_LABELS[kind]} loss:{" "}
+              <span className="font-semibold tabular-nums text-neutral-800">
+                {loss?.toFixed(3)}
+              </span>
+            </p>
+            <Segmented
+              options={Object.keys(LOSS_LABELS) as LossKind[]}
+              labels={LOSS_LABELS}
+              value={kind}
+              onChange={setKind}
+            />
+          </div>
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-sm text-neutral-600">
+              Target{" "}
+              <span className="text-xs text-neutral-400">(hold to hear)</span>
+            </p>
+            <Segmented
+              options={Object.keys(TARGET_LABELS) as TargetKind[]}
+              labels={TARGET_LABELS}
+              value={target}
+              onChange={pickTarget}
+              onHold={(t) => {
+                pickTarget(t);
+                startTarget(t);
+              }}
+              onRelease={stopTarget}
+            />
+          </div>
           {slice && (
             <Heatmap
               landscape={landscape}
@@ -257,6 +349,12 @@ export default function LossLandscapePage() {
               onHover={set}
               onPress={togglePlay}
             />
+          )}
+          {landscape.target !== "synth" && (
+            <p className="text-center">
+              The target is a recording, so the ring marks the published
+              model&apos;s fit to it rather than a true pose.
+            </p>
           )}
         </div>
       )}
@@ -289,17 +387,7 @@ function Heatmap({
   const ay = landscape.params[y];
 
   // One color scale for all three maps, so a color means the same loss on each.
-  const [lo, hi] = useMemo(() => {
-    let lo = Infinity;
-    let hi = -Infinity;
-    for (const { loss } of landscape.slices) {
-      for (const v of loss) {
-        lo = Math.min(lo, v);
-        hi = Math.max(hi, v);
-      }
-    }
-    return [lo, hi];
-  }, [landscape]);
+  const [lo, hi] = useMemo(() => lossRange(landscape), [landscape]);
 
   const data = pairSlice(landscape, x, y).loss;
 
@@ -310,45 +398,58 @@ function Heatmap({
     for (let iy = 0; iy < ay.n; iy++) {
       for (let ix = 0; ix < ax.n; ix++) {
         const [r, g, b] = lossColor((data[iy * ax.n + ix] - lo) / (hi - lo));
-        // Canvas rows run top-down; the y axis runs bottom-up.
-        const o = ((ay.n - 1 - iy) * ax.n + ix) * 4;
+        // Canvas rows run top-down; the y axis runs bottom-up, unless reversed.
+        const col = REVERSED.has(ax.key) ? ax.n - 1 - ix : ix;
+        const row = REVERSED.has(ay.key) ? iy : ay.n - 1 - iy;
+        const o = (row * ax.n + col) * 4;
         img.data.set([r, g, b, 255], o);
       }
     }
     ctx.putImageData(img, 0, 0);
-  }, [data, ax.n, ay.n, lo, hi]);
+  }, [data, ax.n, ay.n, ax.key, ay.key, lo, hi]);
 
   // Cells are centered on the grid points, so the map reaches half a cell
-  // past lo and hi on each side.
-  const extent = (a: typeof ax) => {
+  // past lo and hi on each side. Fraction of the way along an axis (from the
+  // left, or the bottom) of a value, and back.
+  const frac = (a: typeof ax, v: number) => {
     const half = (a.hi - a.lo) / (a.n - 1) / 2;
-    return [a.lo - half, a.hi + half] as const;
+    const f = (v - (a.lo - half)) / (a.hi - a.lo + 2 * half);
+    return REVERSED.has(a.key) ? 1 - f : f;
   };
-  const [x0, x1] = extent(ax);
-  const [y0, y1] = extent(ay);
-  const pctX = (v: number) => ((v - x0) / (x1 - x0)) * 100;
-  const pctY = (v: number) => (1 - (v - y0) / (y1 - y0)) * 100;
+  const value = (a: typeof ax, f: number) => {
+    const half = (a.hi - a.lo) / (a.n - 1) / 2;
+    const g = REVERSED.has(a.key) ? 1 - f : f;
+    const v = a.lo - half + g * (a.hi - a.lo + 2 * half);
+    return Math.min(a.hi, Math.max(a.lo, v));
+  };
+  const pctX = (v: number) => frac(ax, v) * 100;
+  const pctY = (v: number) => (1 - frac(ay, v)) * 100;
 
   const onMove = (e: React.PointerEvent<HTMLDivElement>) => {
     const rect = e.currentTarget.getBoundingClientRect();
-    const fx = (e.clientX - rect.left) / rect.width;
-    const fy = 1 - (e.clientY - rect.top) / rect.height;
-    const clamp = (v: number, a: typeof ax) =>
-      Math.min(a.hi, Math.max(a.lo, v));
     onHover({
-      [ax.key]: clamp(x0 + fx * (x1 - x0), ax),
-      [ay.key]: clamp(y0 + fy * (y1 - y0), ay),
+      [ax.key]: value(ax, (e.clientX - rect.left) / rect.width),
+      [ay.key]: value(ay, 1 - (e.clientY - rect.top) / rect.height),
     });
   };
 
   const path = useMemo(
-    () =>
-      hovering ? descend(landscape, x, y, values, DESCENT_STEPS) : null,
+    () => (hovering ? descend(landscape, x, y, values, DESCENT_STEPS) : null),
     [hovering, landscape, x, y, values],
   );
 
-  const ticks = (a: typeof ax) =>
-    Array.from({ length: 5 }, (_, i) => a.lo + ((a.hi - a.lo) * i) / 4);
+  /** Values and labels; a reversed axis's values run backwards, so it gets
+   * words at its ends instead. */
+  const ticks = (a: typeof ax): [number, string][] =>
+    REVERSED.has(a.key)
+      ? [
+          [a.hi, "low"],
+          [a.lo, "high"],
+        ]
+      : Array.from({ length: 5 }, (_, i) => {
+          const v = a.lo + ((a.hi - a.lo) * i) / 4;
+          return [v, v.toFixed(1)];
+        });
 
   return (
     <div className="flex gap-3">
@@ -376,7 +477,7 @@ function Heatmap({
           <Marker
             left={pctX(landscape.reference[ax.key])}
             top={pctY(landscape.reference[ay.key])}
-            kind="target"
+            kind={landscape.target === "synth" ? "target" : "fit"}
           />
           {path && (
             <DescentPath
@@ -388,22 +489,22 @@ function Heatmap({
             top={pctY(values[ay.key])}
             kind="current"
           />
-          {ticks(ax).map((v) => (
+          {ticks(ax).map(([v, label]) => (
             <span
               key={v}
               className="absolute top-full mt-1 -translate-x-1/2 tabular-nums"
               style={{ left: `${pctX(v)}%` }}
             >
-              {v.toFixed(1)}
+              {label}
             </span>
           ))}
-          {ticks(ay).map((v) => (
+          {ticks(ay).map(([v, label]) => (
             <span
               key={v}
               className="absolute right-full mr-1.5 -translate-y-1/2 tabular-nums"
               style={{ top: `${pctY(v)}%` }}
             >
-              {v.toFixed(1)}
+              {label}
             </span>
           ))}
           <span className="absolute top-full left-1/2 mt-5 -translate-x-1/2 text-sm text-neutral-600">
@@ -460,7 +561,9 @@ function Marker({
 }: {
   left: number;
   top: number;
-  kind: "target" | "current";
+  /** The synth target's pose, the model's fit to a recording, or the
+   * hovered pose. */
+  kind: "target" | "fit" | "current";
 }) {
   return (
     <div
@@ -474,11 +577,61 @@ function Marker({
             strokeWidth={4}
             className="stroke-black/60"
           />
-          <path d="M2,2L12,12M12,2L2,12" strokeWidth={2} className="stroke-white" />
+          <path
+            d="M2,2L12,12M12,2L2,12"
+            strokeWidth={2}
+            className="stroke-white"
+          />
         </svg>
+      ) : kind === "fit" ? (
+        <div className="h-4 w-4 rounded-full border-2 border-white shadow" />
       ) : (
         <div className="h-3.5 w-3.5 rounded-full border-2 border-white bg-neutral-900 shadow" />
       )}
+    </div>
+  );
+}
+
+function Segmented<T extends string>({
+  options,
+  labels,
+  value,
+  onChange,
+  onHold,
+  onRelease,
+}: {
+  options: T[];
+  labels: Record<T, string>;
+  value: T;
+  onChange: (value: T) => void;
+  /** Pressing an option down, and letting go of it (or leaving it). */
+  onHold?: (value: T) => void;
+  onRelease?: () => void;
+}) {
+  const held = onHold && onRelease;
+  return (
+    <div className="flex overflow-hidden rounded-full border border-neutral-300 text-sm">
+      {options.map((o) => (
+        <button
+          key={o}
+          onClick={() => onChange(o)}
+          {...(held && {
+            onPointerDown: () => onHold(o),
+            onPointerUp: onRelease,
+            onPointerLeave: onRelease,
+            onPointerCancel: onRelease,
+            onContextMenu: (e: React.MouseEvent) => e.preventDefault(),
+          })}
+          aria-pressed={value === o}
+          className={`px-3 py-1 whitespace-nowrap ${held ? "touch-none select-none " : ""}${
+            value === o
+              ? "bg-highlight-600 font-semibold text-white"
+              : "bg-white text-neutral-600 hover:bg-neutral-50"
+          }`}
+        >
+          {labels[o]}
+        </button>
+      ))}
     </div>
   );
 }
