@@ -31,23 +31,24 @@ const LOSS_LABELS: Record<LossKind, string> = {
   stft: "STFT",
   ssl: "wav2vec2",
 };
-const TARGET_LABELS: Record<TargetKind, string> = {
-  synth: "Synth",
+/** The targets offered: two of the recordings (the data also has the synth
+ * target and the 132 Hz "e"). */
+const TARGET_LABELS = {
   ah: "“ah”",
-  "e-1": "“e” 110 Hz",
-  "e-2": "“e” 132 Hz",
-};
+  "e-1": "“e”",
+} satisfies Partial<Record<TargetKind, string>>;
+type ShownTarget = keyof typeof TARGET_LABELS;
 const LABELS: Record<string, string> = {
   tongueIndex: "tongue index",
   tongueDiameter: "tongue height",
-  lipDiameter: "lip diameter",
 };
+/** The map: tongueIndex × tongueDiameter, of the three swept params' pairs
+ * (the data also has each with lipDiameter). */
+const [MAP_X, MAP_Y] = [0, 1];
 /** Params shown reversed: a smaller tongue diameter (the gap under the
  * palate) is a higher tongue, so it runs from high values to low, as "tongue
  * height". */
 const REVERSED = new Set(["tongueDiameter"]);
-/** Tract index from which a drag on the mouth is the lips (as on /curves). */
-const LIP_FROM = 41;
 /** Space the axes take around the heatmap. */
 const AXIS_L = 44;
 const AXIS_B = 36;
@@ -56,10 +57,9 @@ const DESCENT_STEPS = 25;
 
 const subscribeNever = () => () => {};
 
-/** Hover the heatmap to move two of the three swept params, and click it to
- * toggle hearing the pose; it shows the precomputed loss (as picked) of every
- * pose in that plane against the target sound -- the synth's own or a
- * recording -- the third param held at the reference pose. */
+/** Hover the heatmap to move the tongue, and click it to toggle hearing the
+ * pose; it shows the precomputed loss (as picked) of every tongue pose against
+ * a recorded vowel, the other params held at the published model's fit. */
 export default function LossLandscapePage() {
   const insecure = useSyncExternalStore(
     subscribeNever,
@@ -67,7 +67,7 @@ export default function LossLandscapePage() {
     () => null,
   );
   const trombone = usePinkTrombone();
-  const [target, setTarget] = useState<TargetKind>("synth");
+  const [target, setTarget] = useState<ShownTarget>("ah");
   const [kind, setKind] = useState<LossKind>("mfcc");
   /** Each target and loss's landscape, by `${target}-${kind}`, fetched the
    * first time it's picked. */
@@ -75,13 +75,9 @@ export default function LossLandscapePage() {
   const landscapeKey = `${target}-${kind}`;
   const landscape = landscapes[landscapeKey] ?? null;
   const [values, setValues] = useState<Record<string, number> | null>(null);
-  /** The pair on the heatmap, as an index into landscape.slices. */
-  const [pair, setPair] = useState(0);
   /** Sounding: toggled by clicking the heatmap (or space). */
   const [isPlaying, setIsPlaying] = useState(false);
   const [hovering, setHovering] = useState(false);
-  /** A target's own audio is playing, while its button is held. */
-  const [hearingTarget, setHearingTarget] = useState(false);
   const targetAudio = useRef<HTMLAudioElement | null>(null);
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -100,7 +96,7 @@ export default function LossLandscapePage() {
   }, [target, kind, landscapeKey, landscapes]);
 
   /** A new target starts from its reference pose. */
-  const pickTarget = (t: TargetKind) => {
+  const pickTarget = (t: ShownTarget) => {
     if (t === target) return;
     const loaded = Object.values(landscapes).find((l) => l.target === t);
     setValues(loaded?.reference ?? null);
@@ -118,13 +114,20 @@ export default function LossLandscapePage() {
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
   }, [trombone]);
 
-  // The mouth follows the values: sounding while playing (unless the target is
-  // playing instead), silently otherwise.
+  // The mouth follows the values: sounding while playing and the pointer is on
+  // the map, silently otherwise (so leaving the map pauses the sound without
+  // turning it off).
+  const sounding = isPlaying && hovering;
+  const wasSounding = useRef(false);
   useEffect(() => {
     if (!ready || !values) return;
-    if (isPlaying && !hearingTarget) trombone.scrub(poseResponse(values), 0);
-    else trombone.pose(poseResponse(values), 0);
-  }, [ready, isPlaying, hearingTarget, values, trombone]);
+    if (sounding) trombone.scrub(poseResponse(values), 0);
+    else {
+      if (wasSounding.current) trombone.endScrub();
+      trombone.pose(poseResponse(values), 0);
+    }
+    wasSounding.current = sounding;
+  }, [ready, sounding, values, trombone]);
 
   /** A target's 2 s, looped while its button is held. */
   const startTarget = (t: TargetKind) => {
@@ -138,29 +141,18 @@ export default function LossLandscapePage() {
     targetAudio.current
       .play()
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
-    if (isPlaying) trombone.endScrub();
-    setHearingTarget(true);
   };
-  const stopTarget = () => {
-    targetAudio.current?.pause();
-    setHearingTarget(false);
-  };
+  const stopTarget = () => targetAudio.current?.pause();
 
   const togglePlay = useCallback(() => {
     if (!trombone.ready()) return;
-    if (isPlaying) trombone.endScrub();
     setIsPlaying(!isPlaying);
   }, [isPlaying, trombone]);
 
-  const slice = landscape?.slices[pair];
-
   /** Keys of the two params on the map: the only ones that can move. */
   const mapped = useMemo(
-    () =>
-      landscape && slice
-        ? [slice.x, slice.y].map((i) => landscape.params[i].key)
-        : [],
-    [landscape, slice],
+    () => (landscape ? [MAP_X, MAP_Y].map((i) => landscape.params[i].key) : []),
+    [landscape],
   );
 
   /** Moves the mapped params, kept within the map. */
@@ -180,15 +172,13 @@ export default function LossLandscapePage() {
     [landscape, mapped],
   );
 
-  // Drags on the mouth move the mapped params rather than the synth directly
-  // (the element's own handlers are skipped, as on /curves): the tongue, and
-  // the lips. Everything else on the mouth is held at the target.
+  // Drags on the tongue move the mapped params rather than the synth directly
+  // (the element's own handlers are skipped, as on /curves). Everything else
+  // on the mouth is held at the reference.
   useEffect(() => {
     const element =
       document.querySelector<PinkTromboneElement>("pink-trombone");
     if (!element) return;
-    const lip = (e: Event) =>
-      set({ lipDiameter: (e as CustomEvent).detail.diameter });
     const handlers: Record<string, (e: Event) => void> = {
       setParameter: (e) => {
         const { parameterName, newValue } = (e as CustomEvent).detail;
@@ -197,19 +187,8 @@ export default function LossLandscapePage() {
         else if (parameterName === "tongue.diameter")
           set({ tongueDiameter: Number(newValue) });
       },
-      newConstriction: (e) => {
-        const { index, touchIdentifier } = (e as CustomEvent).detail;
-        if (index < LIP_FROM) return;
-        lip(e);
-        e.target?.dispatchEvent(
-          new CustomEvent("didNewConstriction", {
-            detail: { touchIdentifier, constrictionIndex: "lip" },
-          }),
-        );
-      },
-      setConstriction: (e) => {
-        if ((e as CustomEvent).detail.constrictionIndex === "lip") lip(e);
-      },
+      newConstriction: () => {},
+      setConstriction: () => {},
       removeConstriction: () => {},
       voicebox: (e) => e.preventDefault(),
     };
@@ -247,21 +226,8 @@ export default function LossLandscapePage() {
     };
   }, [togglePlay]);
 
-  /** Switching pairs puts the param that leaves the map back at the reference:
-   * the map is the slice through it. */
-  const pickPair = (i: number) => {
-    if (!landscape) return;
-    const next = landscape.slices[i];
-    const off = 3 - next.x - next.y;
-    const key = landscape.params[off].key;
-    setValues((v) => v && { ...v, [key]: landscape.reference[key] });
-    setPair(i);
-  };
-
   const loss =
-    landscape && values && slice
-      ? sampleAt(landscape, slice.x, slice.y, values)
-      : null;
+    landscape && values ? sampleAt(landscape, MAP_X, MAP_Y, values) : null;
 
   return (
     <main className="flex flex-1 flex-col items-start gap-6 px-4 py-4 md:flex-row md:gap-8 md:p-8">
@@ -283,79 +249,52 @@ export default function LossLandscapePage() {
         >
           Click the map to {isPlaying ? "stop" : "play"} audio
         </p>
-
-        {landscape && (
-          <div className="flex flex-col gap-2 text-sm">
-            {landscape.slices.map((sl, i) => (
-              <button
-                key={i}
-                onClick={() => pickPair(i)}
-                aria-pressed={pair === i}
-                className={`rounded-full border px-4 py-1.5 text-left ${
-                  pair === i
-                    ? "border-transparent bg-highlight-600 font-semibold text-white"
-                    : "border-neutral-300 bg-white text-neutral-600 hover:bg-neutral-50"
-                }`}
-              >
-                {LABELS[landscape.params[sl.x].key]} ×{" "}
-                {LABELS[landscape.params[sl.y].key]}
-              </button>
-            ))}
-          </div>
-        )}
       </div>
 
       {landscape && values && (
         <div className="flex w-full min-w-0 max-w-2xl flex-1 flex-col gap-2 text-xs text-neutral-500 select-none">
-          <div className="flex items-center justify-between gap-3">
-            <p className="text-sm text-neutral-600">
-              {LOSS_LABELS[kind]} loss:{" "}
+          {/* Labels right-aligned left of the center, buttons left-aligned
+              right of it. */}
+          <div className="grid grid-cols-2 items-center gap-x-3 gap-y-2 text-sm text-neutral-600">
+            <p className="justify-self-end">
+              Loss{" "}
               <span className="font-semibold tabular-nums text-neutral-800">
                 {loss?.toFixed(3)}
               </span>
             </p>
-            <Segmented
-              options={Object.keys(LOSS_LABELS) as LossKind[]}
-              labels={LOSS_LABELS}
-              value={kind}
-              onChange={setKind}
-            />
+            <div className="justify-self-start">
+              <Segmented
+                options={Object.keys(LOSS_LABELS) as LossKind[]}
+                labels={LOSS_LABELS}
+                value={kind}
+                onChange={setKind}
+              />
+            </div>
+            <p className="justify-self-end">Target</p>
+            <div className="justify-self-start">
+              <Segmented
+                options={Object.keys(TARGET_LABELS) as ShownTarget[]}
+                labels={TARGET_LABELS}
+                value={target}
+                onChange={pickTarget}
+                onHold={(t) => {
+                  pickTarget(t);
+                  startTarget(t);
+                }}
+                onRelease={stopTarget}
+              />
+            </div>
           </div>
-          <div className="flex items-center justify-between gap-3">
-            <p className="text-sm text-neutral-600">
-              Target{" "}
-              <span className="text-xs text-neutral-400">(hold to hear)</span>
-            </p>
-            <Segmented
-              options={Object.keys(TARGET_LABELS) as TargetKind[]}
-              labels={TARGET_LABELS}
-              value={target}
-              onChange={pickTarget}
-              onHold={(t) => {
-                pickTarget(t);
-                startTarget(t);
-              }}
-              onRelease={stopTarget}
-            />
-          </div>
-          {slice && (
-            <Heatmap
-              landscape={landscape}
-              x={slice.x}
-              y={slice.y}
-              values={values}
-              hovering={hovering}
-              onHoverChange={setHovering}
-              onHover={set}
-              onPress={togglePlay}
-            />
-          )}
-          {landscape.target !== "synth" && (
-            <p className="text-center">
-              The target is a recording, so the ring marks the published
-              model&apos;s fit to it rather than a true pose.
-            </p>
-          )}
+          <Heatmap
+            landscape={landscape}
+            x={MAP_X}
+            y={MAP_Y}
+            values={values}
+            hovering={hovering}
+            onHoverChange={setHovering}
+            onHover={set}
+            onPress={togglePlay}
+          />
         </div>
       )}
     </main>
