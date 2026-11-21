@@ -96,3 +96,49 @@ def test_gradients_reach_the_controls(doc):
     loss.backward()
     for g in [lung.grad, open_.grad]:
         assert g is not None and torch.isfinite(g) and g != 0
+
+
+def test_geometry_matches_rust():
+    """Articulations of "Peter picked." and copies jittered by up to 60 % of each range
+    (``chimera dump-geometry`` with ``CHIMERA_GEO_JITTER=0.6``)."""
+    from samuel.chimera.geometry import VocalTract
+
+    with gzip.open(
+        Path(__file__).parent / "fixtures" / "chimera_geometry.json.gz", "rt"
+    ) as f:
+        d = json.load(f)
+    items = d["items"]
+    art = torch.tensor(
+        [i["artic"] for i in items], dtype=torch.float64, requires_grad=True
+    )
+    g = VocalTract().compute(art, d["n_ph"], d["n_or"])
+    for key in [
+        "ph_areas",
+        "or_areas",
+        "ph_min",
+        "or_min",
+        "ph_len",
+        "or_len",
+        "teeth_s",
+        "lip_s",
+        "velum_port",
+        "contact_tip",
+        "contact_body",
+    ]:
+        np.testing.assert_allclose(
+            getattr(g, key).detach().numpy(),
+            [i[key] for i in items],
+            rtol=0,
+            atol=1e-11,
+            err_msg=key,
+        )
+    for key in ["d", "area", "s"]:
+        np.testing.assert_allclose(
+            g.grid[key].detach().numpy(),
+            [i["grid"][key] for i in items],
+            rtol=0,
+            atol=1e-11,
+            err_msg=key,
+        )
+    (g.ph_areas.sum() + g.or_areas.sum() + g.or_len.sum()).backward()
+    assert torch.isfinite(art.grad).all() and (art.grad.abs().sum(0) > 0).sum() >= 12

@@ -10,6 +10,7 @@ The output limiter is left out (it is off in the trace too).
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -69,47 +70,53 @@ def render(
     topo: Topology,
     k: VoiceConstants,
     init: dict[str, Tensor],
-    blocks: list[Block],
+    blocks: list[Block] | Callable[[int, Network], Block],
     n_out: int,
     trace: bool = False,
+    glottis_blocks: dict[str, Tensor] | None = None,
+    noise: str = "rust",
+    generator: torch.Generator | None = None,
 ) -> dict[str, Tensor]:
-    """Run the voice over ``blocks`` and return ``out`` ``[B, n_out]`` (and, with ``trace``, the
-    per-internal-sample ``net_out``, ``glottal_area`` and ``glottal_flow``)."""
-    B = blocks[0].p_lung.shape[0]
+    """Run the voice and return ``out`` ``[B, n_out]`` (and, with ``trace``, the per-internal-sample
+    ``net_out``, ``glottal_area`` and ``glottal_flow``).
+
+    ``blocks``: the control blocks, or a function giving block ``i`` from the network's state at
+    its start (the teeth source's band follows the jet's speed then). ``glottis_blocks``: the
+    glottis's ``vibrato_rate``, ``vibrato_depth`` and ``drift`` per block, ``[B, n_blocks]``,
+    needed up front for the pitch modulation (taken from ``blocks`` when it is a list).
+
+    ``noise``: ``"rust"`` draws the turbulence from CHIMERA's one shared stream, one draw per
+    active source per sample in list order, so the output matches the Rust; every batch item then
+    needs the same number of sources per block. ``"independent"``: each source slot of each batch
+    item draws its own noise from ``generator``.
+    """
     dt = topo.port_len.dtype
     dev = topo.port_len.device
     m, ce = k.oversample, k.ctrl_every
     n_int = n_out * m
+    n_blocks = (n_int + ce - 1) // ce
+    get = blocks if callable(blocks) else (lambda i, _net: blocks[i])
+    if glottis_blocks is None:
+        assert not callable(blocks), "pass glottis_blocks with a block function"
+        assert len(blocks) >= n_blocks, (len(blocks), n_blocks)
+        glottis_blocks = {
+            key: torch.stack([blocks[i].glottis[key] for i in range(n_blocks)], dim=-1)
+            for key in ("vibrato_rate", "vibrato_depth", "drift")
+        }
+    B = glottis_blocks["drift"].shape[0]
     net = Network(topo, B, init["area"], init["amin"], init["dx"], init["port_area"])
     glo = Glottis(k.fs, B, dtype=dt, device=dev)
-    # per-sample block parameters for the pitch modulation (which steps every 32 samples)
-    n_blocks = (n_int + ce - 1) // ce
-    assert len(blocks) >= n_blocks, (len(blocks), n_blocks)
-
-    def per_sample(key):
-        v = torch.stack(
-            [blocks[i].glottis[key] for i in range(n_blocks)], dim=-1
-        )  # [B, n_blocks]
-        return v.repeat_interleave(ce, dim=-1)[:, :n_int]
-
+    # the pitch modulation steps every 32 samples, from the block's parameters
+    per_sample = {
+        key: v[:, :n_blocks].repeat_interleave(ce, dim=-1)[:, :n_int]
+        for key, v in glottis_blocks.items()
+    }
     pf = pitch_factors(
         k.fs,
         n_int,
-        per_sample("vibrato_rate"),
-        per_sample("vibrato_depth"),
-        per_sample("drift"),
-    )
-    # the network's noise stream: one draw per active source per sample, in list order
-    n_act = [int(blocks[i].noise_active[0].sum()) for i in range(n_blocks)]
-    assert all(
-        bool((blocks[i].noise_active.sum(-1) == n_act[i]).all())
-        for i in range(n_blocks)
-    ), "the noise stream is shared: every batch item needs the same source count"
-    lens = [min(ce, n_int - i * ce) for i in range(n_blocks)]
-    white_all = torch.tensor(
-        rng.bipolar(NETWORK_SEED, sum(a * n for a, n in zip(n_act, lens))),
-        dtype=dt,
-        device=dev,
+        per_sample["vibrato_rate"],
+        per_sample["vibrato_depth"],
+        per_sample["drift"],
     )
 
     p_lung_now = torch.zeros(B, dtype=dt, device=dev)
@@ -119,23 +126,46 @@ def render(
     pos = 0
     wpos = 0
     for bi in range(n_blocks):
-        b = blocks[bi]
+        b = get(bi, net)
+        L = min(ce, n_int - bi * ce)
         p_lung_step = (b.p_lung - p_lung_now) / ce
         net.begin_block(ce, b.area_target, b.amin_target, b.dx_target, b.port_target)
         S = b.noise_src.shape[1]
-        keep = torch.full((B, S), S, dtype=torch.long, device=dev)
-        if prev_noise is not None:
-            ps, pf_, pa = prev_noise
-            same = (
-                (b.noise_src[:, :, None] == ps[:, None, :])
-                & (b.noise_fwd[:, :, None] == pf_[:, None, :])
-                & pa[:, None, :]
-                & b.noise_active[:, :, None]
+        if noise == "rust":
+            # a source keeps its band filter's state if the last block had one at the same
+            # branch, injecting at the same place
+            keep = torch.full((B, S), S, dtype=torch.long, device=dev)
+            if prev_noise is not None:
+                ps, pfw, pa = prev_noise
+                same = (
+                    (b.noise_src[:, :, None] == ps[:, None, :])
+                    & (b.noise_fwd[:, :, None] == pfw[:, None, :])
+                    & pa[:, None, :]
+                    & b.noise_active[:, :, None]
+                )
+                keep = torch.where(same.any(-1), same.float().argmax(-1), keep)
+            prev_noise = (b.noise_src, b.noise_fwd, b.noise_active)
+            na = int(b.noise_active[0].sum())
+            assert bool((b.noise_active.sum(-1) == na).all()), (
+                "the noise stream is shared: every batch item needs the same source count"
             )
-            first = torch.where(
-                same.any(-1), same.float().argmax(-1), torch.full_like(keep, S)
+            white_blk = (
+                torch.tensor(
+                    rng.bipolar(NETWORK_SEED, na * L, start=wpos), dtype=dt, device=dev
+                )
+                .view(L, 1, na)
+                .expand(L, B, na)
             )
-            keep = first
+            wpos += na * L
+            white_blk = F.pad(white_blk, (0, S - na))
+        else:
+            keep = torch.arange(S, device=dev).expand(
+                B, S
+            )  # each slot keeps its own state
+            white_blk = (
+                torch.rand(L, B, S, generator=generator, dtype=dt, device=dev) * 2.0
+                - 1.0
+            )
         net.set_noise(
             b.noise_src,
             b.noise_fwd,
@@ -146,12 +176,6 @@ def render(
             b.noise_active,
             keep,
         )
-        prev_noise = (b.noise_src, b.noise_fwd, b.noise_active)
-        na = n_act[bi]
-        L = lens[bi]
-        white_blk = white_all[wpos : wpos + na * L].view(L, na)
-        wpos += na * L
-        white_blk = F.pad(white_blk, (0, S - na))
         for i in range(L):
             p_lung_now = p_lung_now + p_lung_step
             lung_flow = lung_flow + k.lung_port_coef * (
@@ -162,7 +186,7 @@ def render(
                 net.p[:, k.sub_node] - net.p[:, k.supra_node], b.glottis, pf[:, pos]
             )
             net.set_port_area(k.glottis_port, a)
-            y = net.step(white_blk[i].expand(B, -1))
+            y = net.step(white_blk[i])
             ys.append(y)
             if trace:
                 areas.append(a)
