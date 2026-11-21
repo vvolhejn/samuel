@@ -9,7 +9,7 @@ with ~25 ms warm-up per chunk was measured to be indistinguishable from the full
 ## Where things are
 
 - **This branch** (`chimera-synth` in samuel, worktree `/Users/vaclav/prog/samuel-chimera`):
-  `src/samuel/chimera/`, tests in `tests/test_chimera.py` (5 tests, ~28 s).
+  `src/samuel/chimera/`, tests in `tests/test_chimera.py` (9 tests, ~65 s).
 - **Rust reference tools**: vvolhejn/chimera-vocal-synth branch `experiment/torch-port-dump`
   (worktree `/Users/vaclav/prog/chimera-torch-dump`, built with `cargo build --release -p chimera-cli`):
   - `chimera dump <out.json> <fs_out> <oversample> "Text."`: a full trace of an utterance. Per
@@ -34,6 +34,7 @@ with ~25 ms warm-up per chunk was measured to be indistinguishable from the full
 | `voice.py` | `HumanVoice::render` minus the limiter; FIR decimator, DC blocker. `render(blocks=list or fn(i, net) -> Block, noise="rust"/"independent")` | same replay |
 | `geometry.py` | `HumanVocalTract::compute` + `resample` (articulators → areas, minima, lengths, teeth/lip position, contacts) | 1232 articulations incl. ±60 % range jitter: ≤1.4e-13; gradients reach ≥12 articulators |
 | `control.py` | `HumanAirway::commit` (slew limits, tube targets with the stretch, velum port), `update_noise` (three slots, the junction skip), `apply_source` + the score's abduction/closure; `replay_articulated` drives the voice from a trace's `artic` and source settings alone | whole phrase, with and without noise: every block's targets, noise sources and glottis parameters ≤3e-13, network output 9e-13, output 5e-8 (the f32 reference) |
+| `synth.py` | the samuel API: `chimera(params [B, T, 25], seed, control_rate) -> [B, T·spf]`, `PARAM_NAMES`, `DEFAULT_PARAM_SPEC` / `DEFAULT_FROZEN_VALUES`, `default_params`; the voice's constants and decimator built without a trace | its block renderer from the trace's articulators: constants equal, output 5e-8 on the 200 ms fixture. Through `chimera()` at the block rate (first frame's pose, independent noise): 1.1 % RMS from the Rust |
 
 ## Next steps
 
@@ -42,22 +43,12 @@ with ~25 ms warm-up per chunk was measured to be indistinguishable from the full
    area), so comparisons leave that port out. Not checked whether this phrase exercises them:
    blocks where `enforce_contacts` moved the tongue (the Rust sets the noise list twice there) and
    the junction skip in `_noise` (written to match the Rust's `to_branch` → −1).
-2. **The samuel-style API** (`synth.py`), following `pink_trombone.py` / `model.py`:
-   `chimera(params [B, T, P], seed=None, control_rate=...) -> [B, T·spf]` at 44.1 kHz (airway at
-   2×), `PARAM_NAMES`, and a `(lo, hi, init)` spec per parameter like `_DEFAULT_PARAM_SPEC`.
-   - Parameters: the 17 articulators (`geometry.ARTIC_NAMES`, ranges `ARTIC_RANGES`, init
-     `NEUTRAL`), plus source `f0` (Hz), `pressure` (0..~15 cmH₂O, 7.2 typical), `abduction`
-     (0..0.5; the planner uses 0.1–0.36), `closure` (0..1), `breathiness`, `tension`,
-     `brightness` (0..1). Freeze the rarely used ones (dorsum, ttCurl, lateral, epilarynx,
-     ventricular, labiodental?) by default.
-   - Upsample like `_upsample_params`: frame t starts at sample t·spf and ramps to frame t+1;
-     sample the ramp at each CHIMERA control block start (every 64 output samples).
-   - No articulator dynamics (the controller sets positions directly), no f0 glide, no
-     `enforce_contacts` (the tongue can sink into the palate; the contact model still seals).
-     Say so in the docstring.
-   - `noise="independent"` with a `torch.Generator` from `seed`; all three noise slots always
-     present with gain faded to 0 when off (already in `control.py`'s `exact=False`).
-   - Start from the first frame's geometry, snapped (no transient from neutral).
+2. ~~The samuel-style API~~: done (`synth.py`). 17 articulators + `f0`, `pressure`, `abduction`,
+   `closure`, `breathiness`, `tension`, `brightness`, `roughness`; frozen by default: ttCurl,
+   labiodental, epilarynx, ventricular, lateral, dorsum, roughness. Simulates in float64 and casts
+   back to the params' dtype. ~6 s per 100 ms of audio per batch of 1–2 on CPU. The noise draws
+   depend on the batch size (one `rand(L, B, 3)` per block), unlike Pink Trombone's per-item seeds.
+   Not wired into `model.py` / training.
 3. **Gradient sanity**: backprop a loss on a short render to every parameter; look for NaNs at
    closures (`sqrt` at 0 in `close_r` slew, `pow(d, 1.4)` at 0, `acos` near 1, divisions guarded by
    `torch.where`; prefer `safe_div` patterns already in `geometry.py`).

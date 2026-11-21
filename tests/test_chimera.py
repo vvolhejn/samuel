@@ -195,3 +195,80 @@ def test_replay_from_articulators_matches_rust(doc):
         assert len(x) == len(ref), key
         err = np.abs(x - ref).max() / np.abs(ref).max()
         assert err < rtol, f"{key}: relative error {err:.2e}"
+
+
+def _trace_blocks(doc):
+    """The trace's per-block articulators and source settings as ``synth`` parameters."""
+    from samuel.chimera.control import DEFAULT_SOURCE
+    from samuel.chimera.network import CM_H2O
+
+    rows = []
+    for c in doc["ctrl"]:
+        g = c["glottis"]
+        rows.append(
+            c["artic"]
+            + [
+                g["f0"],
+                c["p_lung"] / CM_H2O,
+                g["abduction"] - 0.1 * DEFAULT_SOURCE["breathiness"] ** 2,
+                g["closure"],
+            ]
+            + [
+                DEFAULT_SOURCE[n]
+                for n in ("breathiness", "tension", "brightness", "roughness")
+            ]
+        )
+    return torch.tensor(rows, dtype=torch.float64)[None]
+
+
+def test_synth_renders_the_trace_as_rust(doc):
+    """``synth``'s renderer (constants built without a trace), started from the Rust's neutral pose
+    with the Rust's noise, reproduces the trace."""
+    from samuel.chimera.geometry import NEUTRAL_START
+    from samuel.chimera.synth import Voice, render_blocks
+
+    voice = Voice.build()
+    _, k, _, _ = from_trace(doc)
+    for f in dataclasses.fields(k):
+        a, b = getattr(voice.k, f.name), getattr(k, f.name)
+        if isinstance(a, torch.Tensor):
+            np.testing.assert_allclose(a, b, atol=1e-15, err_msg=f.name)
+        else:
+            assert a == pytest.approx(b, rel=1e-12), f.name
+    with torch.no_grad():
+        r = render_blocks(
+            voice,
+            _trace_blocks(doc),
+            doc["header"]["n_out"],
+            start=torch.tensor([NEUTRAL_START], dtype=torch.float64),
+            noise="rust",
+        )
+    ref = np.asarray(doc["out"])
+    err = np.abs(r["out"][0].numpy() - ref).max() / np.abs(ref).max()
+    assert err < 1e-6, err
+
+
+def test_synth_params_ramp_between_frames():
+    from samuel.chimera.synth import params_at_blocks
+
+    p = torch.tensor([[[0.0], [1.0], [3.0]]])  # 3 frames, 256 samples each
+    got = params_at_blocks(p, 256, 3 * 256)[0, :, 0]
+    expect = torch.tensor([0, 0.25, 0.5, 0.75, 1, 1.5, 2, 2.5, 3, 3, 3, 3])
+    torch.testing.assert_close(got, expect)
+
+
+def test_synth_api():
+    """``chimera(params)``: shape, dtype, a voiced schwa, noise seeded per call and per item
+    (the draws depend on the batch size: item 0 of a batch of 1 sounds different)."""
+    from samuel.chimera.synth import N_PARAMS, chimera, default_params
+
+    p = default_params(2, 4)  # 40 ms at 100 Hz
+    assert p.shape == (2, 4, N_PARAMS)
+    with torch.no_grad():
+        a = chimera(p, seed=1, control_rate=100.0)
+        b = chimera(p, seed=1, control_rate=100.0)
+    assert a.shape == (2, 4 * 441) and a.dtype == torch.float32
+    assert torch.isfinite(a).all() and a[:, 441:].std() > 1e-3
+    torch.testing.assert_close(a, b, rtol=0, atol=0)  # same seed, same noise
+    diff = (a[0] - a[1]).std() / a[0].std()
+    assert 0 < diff < 0.1, diff  # independent noise, the same voice
