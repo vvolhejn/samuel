@@ -305,7 +305,9 @@ class Network:
         d = self.dx
         ia = 1.0 / torch.clamp(a, min=1e-6)
         inv_amin = 1.0 / torch.clamp(amk, min=1e-6)
-        sa = torch.sqrt(a)
+        # sqrt's slope is infinite at a sealed node (a = 0); keep it out of the graph (exact forward)
+        a_pos = a > 0
+        sa = torch.where(a_pos, torch.sqrt(torch.where(a_pos, a, 1.0)), 0.0)
         half_l = d * ia
         half_r = t.wall_perim * d * sa * ia * ia * t.visc_f
         v = torch.clamp(a, min=min_a) * d

@@ -272,3 +272,48 @@ def test_synth_api():
     torch.testing.assert_close(a, b, rtol=0, atol=0)  # same seed, same noise
     diff = (a[0] - a[1]).std() / a[0].std()
     assert 0 < diff < 0.1, diff  # independent noise, the same voice
+
+
+def test_synth_gradients_through_a_lip_closure():
+    """The lips seal (the last oral node's area reaches exactly 0): every trainable parameter but
+    the shut velum gets a finite, nonzero gradient. ``sqrt(area)`` at a sealed node used to send
+    inf·0 = NaN back to every articulator."""
+    from samuel.chimera.synth import (
+        DEFAULT_PARAM_SPEC,
+        PARAM_NAMES,
+        chimera,
+        default_params,
+    )
+
+    p = default_params(1, 8, dtype=torch.float64)  # 80 ms at 100 Hz
+    p[0, :, PARAM_NAMES.index("lipAp")] = torch.tensor([0.6] + [-0.4] * 7)
+    p.requires_grad_(True)
+    (chimera(p, seed=0, control_rate=100.0) ** 2).mean().backward()
+    assert torch.isfinite(p.grad).all()
+    reached = {n for i, n in enumerate(PARAM_NAMES) if p.grad[0, :, i].abs().sum() > 0}
+    # velum < 0 is a seal with no slope (port area = max(velum, 0))
+    assert set(DEFAULT_PARAM_SPEC) - reached == {"velum"}
+
+
+def test_synth_gradients_match_finite_differences():
+    """From a moving pose, per frame. (At a perfectly static pose, e.g. ``default_params``, the
+    network's branch conditions sit on their switch points: the gradient is one-sided there and a
+    central difference averages both sides.)"""
+    from samuel.chimera.synth import PARAM_NAMES, chimera, default_params
+
+    p0 = default_params(1, 3, dtype=torch.float64)
+    for n, vals in {"lipAp": [0.5, 0.9, 0.7], "tbY": [6.6, 7.1, 6.9]}.items():
+        p0[0, :, PARAM_NAMES.index(n)] = torch.tensor(vals, dtype=torch.float64)
+
+    def loss(p):
+        return (chimera(p, seed=0, control_rate=100.0) ** 2).mean()
+
+    p = p0.clone().requires_grad_(True)
+    loss(p).backward()
+    eps = 1e-6
+    for name, frame in [("lipAp", 1), ("tbY", 2), ("pressure", 0)]:
+        d = torch.zeros_like(p0)
+        d[0, frame, PARAM_NAMES.index(name)] = 1.0
+        with torch.no_grad():
+            fd = (loss(p0 + eps * d) - loss(p0 - eps * d)) / (2 * eps)
+        assert (p.grad * d).sum().item() == pytest.approx(fd.item(), rel=1e-6), name

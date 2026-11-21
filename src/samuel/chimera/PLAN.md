@@ -9,7 +9,7 @@ with ~25 ms warm-up per chunk was measured to be indistinguishable from the full
 ## Where things are
 
 - **This branch** (`chimera-synth` in samuel, worktree `/Users/vaclav/prog/samuel-chimera`):
-  `src/samuel/chimera/`, tests in `tests/test_chimera.py` (9 tests, ~65 s).
+  `src/samuel/chimera/`, tests in `tests/test_chimera.py` (11 tests, ~100 s).
 - **Rust reference tools**: vvolhejn/chimera-vocal-synth branch `experiment/torch-port-dump`
   (worktree `/Users/vaclav/prog/chimera-torch-dump`, built with `cargo build --release -p chimera-cli`):
   - `chimera dump <out.json> <fs_out> <oversample> "Text."`: a full trace of an utterance. Per
@@ -49,9 +49,17 @@ with ~25 ms warm-up per chunk was measured to be indistinguishable from the full
    back to the params' dtype. ~6 s per 100 ms of audio per batch of 1–2 on CPU. The noise draws
    depend on the batch size (one `rand(L, B, 3)` per block), unlike Pink Trombone's per-item seeds.
    Not wired into `model.py` / training.
-3. **Gradient sanity**: backprop a loss on a short render to every parameter; look for NaNs at
-   closures (`sqrt` at 0 in `close_r` slew, `pow(d, 1.4)` at 0, `acos` near 1, divisions guarded by
-   `torch.where`; prefer `safe_div` patterns already in `geometry.py`).
+3. ~~Gradient sanity~~: done. One NaN source, fixed: `sqrt(area)` in `Network.step` at a sealed
+   node (lips shut in /p/) sent inf·0 back to every articulator; now a double `where` (exact
+   forward). Checked: finite gradients on the 200 ms /p/ clip (every trainable parameter reached),
+   on geometry at 665 jittered + 4000 random/corner articulations, and on 12 random full-range
+   renders; autograd = finite differences to ~1e-8 per frame from a moving pose. Known, by design:
+   - the velum gets no gradient while shut (port area = max(velum, 0); init −0.15). If training
+     needs to discover nasals, start it at ≥ 0 or put a surrogate slope on the clamp;
+   - at a perfectly static pose (`default_params`) the network's branch conditions (e.g. the
+     radiation's "did the lip area grow") sit on their switch points, so gradients are one-sided
+     there (per-frame up to ~20 % off a central difference; their sum over frames is exact);
+   - backward costs ~2.5× the forward (200 ms: 19 s forward, 50 s backward, CPU).
 4. **Then, separately**: float32 and GPU, speed (torch.compile the step, chunked OLA with ~25 ms
    warm-up), the noise-rate scaling fix (the Rust at this commit normalises noise by √(96 kHz/fs);
    a fix to √(fs/96 kHz) was prepared in another session; `network._noise` follows the old one),
