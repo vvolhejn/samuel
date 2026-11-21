@@ -304,9 +304,13 @@ class AirwayControl:
                 or_b0 + torch.clamp(gi - n_ph, 0, n_or - 2),
             )
 
-        src = to_branch(torch.clamp(min_i, max=n_tot - 2))
-        fwd = to_branch(torch.clamp(min_i + off, max=n_tot - 2))
-        bwd = to_branch(torch.clamp(min_i - off, min=0))
+        src_i = torch.clamp(min_i, max=n_tot - 2)
+        fwd_i = torch.clamp(min_i + off, max=n_tot - 2)
+        bwd_i = torch.clamp(min_i - off, min=0)
+        # the junction between the tubes (the oral tube's first node) is no branch: the Rust
+        # registers no constriction source (nor teeth source) when one of its ends lands there
+        no_junction = (src_i != n_ph) & (fwd_i != n_ph) & (bwd_i != n_ph)
+        src, fwd, bwd = to_branch(src_i), to_branch(fwd_i), to_branch(bwd_i)
         con_gain = NOISE_GAIN["constriction"] * w_area
         s_min = torch.where(
             in_ph, (min_i + 0.5) * dx_ph, g.ph_len + (min_i - n_ph + 0.5) * dx_or
@@ -331,8 +335,8 @@ class AirwayControl:
         top = TEETH_STROUHAL * (v_jet * d_jet / (eddy * eddy))
         spread = torch.sqrt(TEETH_LEVEL_HZ / torch.clamp(top, min=TEETH_HIGHPASS_HZ))
         teeth_gain = NOISE_GAIN["teeth"] * wt * spread
-        con_on = w_area > 0
-        teeth_on = con_on & (wt > 1e-3)
+        con_on = (w_area > 0) & no_junction
+        teeth_on = con_on & (wt > 1e-3) & (teeth_i != n_ph)
         if exact:
             # the Rust's list: a source only where it is on, in order (active slots are a prefix)
             con_act, teeth_act = con_on, teeth_on
@@ -359,3 +363,101 @@ class AirwayControl:
 
 def lung_pressure(src: Source) -> Tensor:
     return src.pressure * CM_H2O
+
+
+# ---------------------------------------------------------------------- replay from articulators
+DEFAULT_SOURCE = dict(
+    breathiness=0.15, tension=0.5, brightness=0.25, roughness=0.1, fry=0.0
+)
+
+
+def geometry_at(g: Geometry, i: int) -> Geometry:
+    """Block ``i`` of a ``[n_blocks, ...]`` geometry, kept as a batch of one."""
+    return Geometry(
+        **{
+            f: (
+                v[i : i + 1]
+                if isinstance(v, Tensor)
+                else {k: x[i : i + 1] for k, x in v.items()}
+            )
+            for f, v in g.__dict__.items()
+        }
+    )
+
+
+def source_from_trace(doc: dict, dtype=torch.float64, device=None) -> list[Source]:
+    """Each block's source settings, recovered from a ``chimera dump`` trace (male body, the
+    default source, a score's abduction and closure gestures on top)."""
+    T = lambda x: torch.tensor([x], dtype=dtype, device=device)  # noqa: E731
+    out = []
+    for c in doc["ctrl"]:
+        g = c["glottis"]
+        out.append(
+            Source(
+                f0=T(g["f0"]),
+                pressure=T(c["p_lung"] / CM_H2O),
+                abduction=T(g["abduction"] - 0.1 * DEFAULT_SOURCE["breathiness"] ** 2),
+                closure=T(g["closure"]),
+                vibrato_depth=T(g["vibrato_depth"]),
+                vibrato_rate=T(g["vibrato_rate"]),
+                drift=T(g["drift"]),
+                **{k: T(v) for k, v in DEFAULT_SOURCE.items()},
+            )
+        )
+    return out
+
+
+def replay_articulated(
+    doc: dict,
+    seconds: float | None = None,
+    trace: bool = True,
+    record: list | None = None,
+    dtype=torch.float64,
+    device=None,
+) -> dict[str, Tensor]:
+    """Replay a ``chimera dump`` trace from its articulators and source settings alone: the
+    geometry, slew limits, tube targets, noise placement and glottis mapping are this port's.
+    ``record`` collects each block's inputs, to compare with the trace's."""
+    import dataclasses
+
+    from samuel.chimera.airway import build_airway
+    from samuel.chimera.geometry import NEUTRAL_START, VocalTract
+    from samuel.chimera.voice import from_trace, render
+
+    topo, k, init_ref, _ = from_trace(doc, dtype=dtype, device=device)
+    air = dataclasses.replace(build_airway(k.fs, dtype=dtype, device=device), topo=topo)
+    n_out = doc["header"]["n_out"]
+    if seconds is not None:
+        n_out = min(n_out, int(seconds * k.fs_out))
+    n_blocks = (n_out * k.oversample + k.ctrl_every - 1) // k.ctrl_every
+    ctrl = doc["ctrl"][:n_blocks]
+    vt = VocalTract(air.body, dtype=dtype, device=device)
+    artic = torch.tensor([c["artic"] for c in ctrl], dtype=dtype, device=device)
+    geo = vt.compute(artic, air.n_ph, air.n_or)
+    g0 = vt.compute(
+        torch.tensor([NEUTRAL_START], dtype=dtype, device=device), air.n_ph, air.n_or
+    )
+    ac = AirwayControl(air, k.ctrl_every)
+    ac.start(g0)
+    init = ac.init_state(g0)
+    srcs = source_from_trace({"ctrl": ctrl}, dtype=dtype, device=device)
+    gps = [glottis_params(s, air) for s in srcs]
+
+    def block(i, net):
+        b = ac.block(
+            geometry_at(geo, i), gps[i], lung_pressure(srcs[i]), net, exact_noise=True
+        )
+        if record is not None:
+            record.append(b)
+        return b
+
+    glottis_blocks = {
+        key: torch.cat([gp[key] for gp in gps])[None]
+        for key in ("vibrato_rate", "vibrato_depth", "drift")
+    }
+    res = render(
+        topo, k, init, block, n_out, trace=trace, glottis_blocks=glottis_blocks
+    )
+    res["init"] = init
+    res["init_ref"] = init_ref
+    return res

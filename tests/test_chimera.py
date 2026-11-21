@@ -142,3 +142,56 @@ def test_geometry_matches_rust():
         )
     (g.ph_areas.sum() + g.or_areas.sum() + g.or_len.sum()).backward()
     assert torch.isfinite(art.grad).all() and (art.grad.abs().sum(0) > 0).sum() >= 12
+
+
+def test_replay_from_articulators_matches_rust(doc):
+    """The same 200 ms driven by the trace's articulators and source settings only: this port's
+    geometry, slew limits, tube targets, noise placement and glottis mapping make every block."""
+    from samuel.chimera.control import replay_articulated
+    from samuel.chimera.glottis import PARAM_FIELDS
+
+    rec = []
+    with torch.no_grad():
+        r = replay_articulated(doc, record=rec)
+    assert len(rec) == len(doc["ctrl"])
+    for key in ("area", "amin", "dx", "port_area"):
+        np.testing.assert_allclose(
+            r["init"][key], r["init_ref"][key], rtol=1e-13, atol=1e-14
+        )
+    gp = doc["header"]["glottis_port"]  # the dump records its target after the block
+    for i, (b, c) in enumerate(zip(rec, doc["ctrl"])):
+        for got, key in [
+            (b.area_target, "area_target"),
+            (b.amin_target, "amin_target"),
+            (b.dx_target, "dx_target"),
+        ]:
+            np.testing.assert_allclose(
+                got[0], c[key], rtol=1e-12, atol=1e-14, err_msg=f"{key} {i}"
+            )
+        port = np.delete(b.port_target[0].numpy(), gp)
+        np.testing.assert_allclose(
+            port, np.delete(c["port_area_target"], gp), rtol=1e-12, atol=1e-14
+        )
+        for f in PARAM_FIELDS:
+            assert b.glottis[f].item() == pytest.approx(
+                c["glottis"][f], rel=1e-12, abs=1e-15
+            ), (f, i)
+        ns = c["noise"]
+        assert int(b.noise_active[0].sum()) == len(ns), i
+        for j, s in enumerate(ns):
+            assert [
+                int(b.noise_src[0, j]),
+                int(b.noise_fwd[0, j]),
+                int(b.noise_bwd[0, j]),
+            ] == [s["src"], s["fwd"], s["bwd"]], (i, j)
+            for got, key in [
+                (b.noise_gain, "gain"),
+                (b.noise_lp, "lp_coef"),
+                (b.noise_hp, "hp_coef"),
+            ]:
+                assert got[0, j].item() == pytest.approx(s[key], rel=1e-11), (key, i, j)
+    for key, rtol in [("glottal_area", 1e-12), ("net_out", 1e-10), ("out", 1e-6)]:
+        x, ref = r[key][0].numpy(), np.asarray(doc[key])
+        assert len(x) == len(ref), key
+        err = np.abs(x - ref).max() / np.abs(ref).max()
+        assert err < rtol, f"{key}: relative error {err:.2e}"

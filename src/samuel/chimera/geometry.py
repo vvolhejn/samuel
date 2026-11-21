@@ -86,6 +86,21 @@ ARTIC_RANGES = [
     (0.0, 1.0),
 ]
 
+
+def rest_tip(jaw: float, tb_x: float, tb_y: float) -> tuple[float, float]:
+    """Where the tongue tip rests for this jaw and tongue body (``anatomy/human.rs``)."""
+    cx, cy = -2.5, 10.5
+    dx, dy = 6.45 - cx, 7.35 - cy
+    ang = -jaw / 9.84
+    x = cx + dx * math.cos(ang) - dy * math.sin(ang)
+    y = cy + dx * math.sin(ang) + dy * math.cos(ang)
+    return x + 0.3 * (tb_x - NEUTRAL[1]), y + 0.35 * (tb_y - NEUTRAL[2])
+
+
+# the voice's first posture (``ArticulatorBank::new``): neutral, the tongue tip at rest
+NEUTRAL_START = list(NEUTRAL)
+NEUTRAL_START[3], NEUTRAL_START[4] = rest_tip(NEUTRAL[0], NEUTRAL[1], NEUTRAL[2])
+
 LAB_HANDOVER = 0.5
 LAB_GAP = 0.3
 LAB_FRONT_OPENS = 0.7

@@ -33,31 +33,15 @@ with ~25 ms warm-up per chunk was measured to be indistinguishable from the full
 | `airway.py` | `HumanAirway::new` (topology, index for index) | equal to the dump's |
 | `voice.py` | `HumanVoice::render` minus the limiter; FIR decimator, DC blocker. `render(blocks=list or fn(i, net) -> Block, noise="rust"/"independent")` | same replay |
 | `geometry.py` | `HumanVocalTract::compute` + `resample` (articulators → areas, minima, lengths, teeth/lip position, contacts) | 1232 articulations incl. ±60 % range jitter: ≤1.4e-13; gradients reach ≥12 articulators |
-
-## Written but not yet run: `control.py`
-
-`AirwayControl` (slew limits = `HumanAirway::commit`, `set_tube_targets` with the tube stretch,
-velum port target, `update_noise` with the three noise slots) and `glottis_params`
-(`apply_source` plus the score's abduction/closure). Imports, nothing else checked.
+| `control.py` | `HumanAirway::commit` (slew limits, tube targets with the stretch, velum port), `update_noise` (three slots, the junction skip), `apply_source` + the score's abduction/closure; `replay_articulated` drives the voice from a trace's `artic` and source settings alone | whole phrase, with and without noise: every block's targets, noise sources and glottis parameters ≤3e-13, network output 9e-13, output 5e-8 (the f32 reference) |
 
 ## Next steps
 
-1. **End-to-end parity from articulators.** Build a replay that takes the trace's per-block
-   `artic` and source settings instead of its targets, runs `VocalTract.compute` for all blocks
-   at once, then per block `AirwayControl.block(...)` inside `render` (block function form, so the
-   teeth source sees `net.u` at the block's start). Compare against the trace's targets and audio.
-   - Initial state: the Rust starts from the neutral posture with the tongue tip at rest
-     (`ArticulatorBank::new`: `NEUTRAL` with `tt_x, tt_y = rest_tip(jaw, tb_x, tb_y)`, see
-     `rest_tip` in `anatomy/human.rs`), geometry snapped (`AirwayControl.start` + `init_state`).
-   - Source from the trace: `f0` = glottis f0; `pressure` = `p_lung / CM_H2O`;
-     `abduction` = `(glottis.abduction − 0.1·0.15²)` (male, k = 1); `closure`;
-     breathiness 0.15, tension 0.5, brightness 0.25, roughness 0.1, drift 5, vibrato rate 6,
-     `vibrato_depth` from the glottis, fry 0 (the `DEFAULT_SOURCE`).
-   - Expected small mismatches: blocks where `enforce_contacts` corrected the tongue (the Rust
-     sets the noise list twice, so filter-state carry can differ), and `p_lung == 0` tiny-flushes.
-   - Check `AirwayControl.block` against Rust where it's subtle: the port-target line that keeps
-     the glottis port's current area; `lips_from` truncation; the order (slew, then mins capped by
-     the slewed areas, then clamped at 0).
+1. ~~End-to-end parity from articulators~~: done (`control.replay_articulated`, test on the
+   200 ms fixture). The dump records the glottis port's target after the block (the last glottal
+   area), so comparisons leave that port out. Not checked whether this phrase exercises them:
+   blocks where `enforce_contacts` moved the tongue (the Rust sets the noise list twice there) and
+   the junction skip in `_noise` (written to match the Rust's `to_branch` → −1).
 2. **The samuel-style API** (`synth.py`), following `pink_trombone.py` / `model.py`:
    `chimera(params [B, T, P], seed=None, control_rate=...) -> [B, T·spf]` at 44.1 kHz (airway at
    2×), `PARAM_NAMES`, and a `(lo, hi, init)` spec per parameter like `_DEFAULT_PARAM_SPEC`.
