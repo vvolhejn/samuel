@@ -182,3 +182,93 @@ class Glottis:
         vib = s.amp_sm * s.cycle_amp * s.voicing_sm * pulse
         statics = s.static_sm * (1.0 - 0.92 * s.closure_sm)
         return torch.clamp(vib + statics, min=0.0)
+
+
+def cycle_state_at(
+    fs: float,
+    f0: Tensor,
+    jitter: Tensor,
+    shimmer: Tensor,
+    diplophonia: Tensor,
+    at: Tensor,
+    seed: int = GLOTTIS_SEED,
+    max_cycles: int = 4096,
+) -> dict[str, Tensor]:
+    """The glottis's open-loop cycle state (``phase``, ``period_scale``, ``cycle_amp``,
+    ``cycle_index``) at the start of samples ``at`` (``[A]``, ascending), as ``Glottis.next``
+    would have left it after running from sample 0. ``f0``: ``[B, n]`` per sample, pitch factor
+    and fry applied; ``jitter``, ``shimmer``, ``diplophonia``: ``[B, n]`` per sample.
+
+    The phase never depends on the acoustics, so this walks it a cycle at a time (a
+    ``searchsorted`` on the summed increments) rather than a sample at a time. The same sums in
+    another order: equal to ``Glottis.next`` to rounding, and differentiable in ``f0`` and the
+    jitter. Returns each field as ``[B, A]``."""
+    B, n = f0.shape
+    dt, dev = f0.dtype, f0.device
+    g = rng.gauss(seed, 2 * max_cycles).reshape(max_cycles, 2)
+    g_period = torch.tensor(np.concatenate([[0.0], g[:, 0]]), dtype=dt, device=dev)
+    g_amp = torch.tensor(np.concatenate([[0.0], g[:, 1]]), dtype=dt, device=dev)
+    # C[j] = the increments of samples 0..j-1 summed; the phase after sample j−1 from a cycle that
+    # began after sample s (phase φ, scale ps) is φ + (C[j] − C[s]) / ps
+    C = torch.cat(
+        [torch.zeros(B, 1, dtype=dt, device=dev), torch.cumsum(f0 / fs, -1)], -1
+    )
+    rows = torch.arange(B, device=dev)
+    s = torch.zeros(
+        B, dtype=torch.long, device=dev
+    )  # samples done when the cycle began
+    phi = torch.zeros(B, dtype=dt, device=dev)
+    ps = torch.ones(B, dtype=dt, device=dev)
+    ca = torch.ones(B, dtype=dt, device=dev)
+    idx = torch.zeros(B, dtype=torch.long, device=dev)
+    A = at.shape[0]
+    out = {
+        "phase": torch.zeros(B, A, dtype=dt, device=dev),
+        "period_scale": torch.ones(B, A, dtype=dt, device=dev),
+        "cycle_amp": torch.ones(B, A, dtype=dt, device=dev),
+        "cycle_index": torch.zeros(B, A, dtype=torch.long, device=dev),
+    }
+
+    def record(upto: Tensor):
+        # chunk starts in [s, upto): this cycle's state, the phase advanced to the start
+        hit = (at[None, :] >= s[:, None]) & (at[None, :] < upto[:, None])
+        ph = (
+            phi[:, None]
+            + (C[:, at] - C[rows, torch.clamp(s, max=n)][:, None]) / ps[:, None]
+        )
+        for key, v in [
+            ("phase", ph),
+            ("period_scale", ps[:, None].expand(-1, A)),
+            ("cycle_amp", ca[:, None].expand(-1, A)),
+            ("cycle_index", idx[:, None].expand(-1, A)),
+        ]:
+            out[key] = torch.where(hit, v, out[key])
+
+    last = at.max() if A else torch.tensor(0, device=dev)
+    while bool((s <= last).any()):
+        # the first sample m (1-based count j = m + 1) whose phase reaches 1
+        target = C[rows, torch.clamp(s, max=n)] + (1.0 - phi) * ps
+        j = torch.searchsorted(C, target[:, None], side="left")[:, 0]
+        j = torch.clamp(torch.maximum(j, s + 1), max=n + 1)
+        record(j)
+        if bool((j > n).all()):
+            break
+        m = torch.clamp(j - 1, max=n - 1)
+        phi = torch.where(
+            j <= n,
+            phi
+            + (C[rows, torch.clamp(j, max=n)] - C[rows, torch.clamp(s, max=n)]) / ps
+            - 1.0,
+            phi,
+        )
+        idx = idx + (j <= n).long()
+        alt = torch.where(idx % 2 == 1, 1.0, -1.0).to(dt)
+        jit, shim, dip = jitter[rows, m], shimmer[rows, m], diplophonia[rows, m]
+        new_ps = torch.clamp(1.0 + jit * g_period[idx] + dip * 0.08 * alt, 0.55, 1.8)
+        new_ca = torch.clamp(
+            1.0 + shim * g_amp[idx] - dip * 0.35 * (alt > 0).to(dt), min=0.12
+        )
+        ps = torch.where(j <= n, new_ps, ps)
+        ca = torch.where(j <= n, new_ca, ca)
+        s = torch.where(j <= n, j, torch.full_like(j, n + 1))
+    return out

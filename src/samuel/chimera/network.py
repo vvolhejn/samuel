@@ -472,8 +472,7 @@ class Network:
         """Re²-gated band-filtered noise at each source, injected downstream of its jet."""
         t = self.t
         s = self.noise
-        # white noise of variance σ² spreads σ²/fs per Hz: the Rust at this commit normalises the
-        # wrong way round, √(96 kHz/fs) (a fix is under review), and the port follows it for now
+        # the Rust's normalisation to its 96 kHz tuning rate, kept as it is
         scale = t.noise_scale * math.sqrt(96000.0 / t.fs)
         sat = 12000.0**2 - RE_CRIT**2
         area = torch.gather(self.branch_area, 1, s["src"])

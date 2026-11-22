@@ -200,6 +200,24 @@ def _geometry_block(g: Geometry, B: int, i: int) -> Geometry:
     )
 
 
+def _source(blocks: Tensor, air: HumanAirway) -> tuple[dict[str, Tensor], Tensor]:
+    """The glottis's parameters and the lung pressure per block, each ``[B, n_blocks]``."""
+    n_art = len(ARTIC_NAMES)
+    s = {n: blocks[..., n_art + j] for j, n in enumerate(SOURCE_NAMES)}
+
+    def const(v: float) -> Tensor:
+        return torch.full_like(s["f0"], v)
+
+    src = Source(
+        **s,
+        vibrato_depth=const(VIBRATO_DEPTH),
+        vibrato_rate=const(VIBRATO_RATE),
+        drift=const(DRIFT),
+        fry=const(FRY),
+    )
+    return glottis_params(src, air), lung_pressure(src)
+
+
 def render_blocks(
     voice: Voice,
     blocks: Tensor,
@@ -208,6 +226,9 @@ def render_blocks(
     noise: str = "independent",
     generator: torch.Generator | None = None,
     trace: bool = False,
+    compile: bool = False,
+    pitch: Tensor | None = None,
+    glottis_init: dict[str, Tensor] | None = None,
 ) -> dict[str, Tensor]:
     """Render from ``[B, n_blocks, N_PARAMS]`` per-block parameters.
 
@@ -215,6 +236,7 @@ def render_blocks(
     the first block's). ``noise="rust"`` places the noise sources and draws them as the Rust does
     (every batch item needs the same number of active sources per block); ``"independent"``
     keeps all three source slots, faded to gain 0 when off, each with its own noise.
+    ``pitch``, ``glottis_init``: see ``voice.render``.
     """
     air, k, vt = voice.air, voice.k, voice.vt
     B, n_blocks, P = blocks.shape
@@ -231,20 +253,7 @@ def render_blocks(
     ac.start(g0)
     init = ac.init_state(g0)
 
-    s = {n: blocks[..., n_art + j] for j, n in enumerate(SOURCE_NAMES)}
-
-    def const(v: float) -> Tensor:
-        return torch.full_like(s["f0"], v)
-
-    src = Source(
-        **s,
-        vibrato_depth=const(VIBRATO_DEPTH),
-        vibrato_rate=const(VIBRATO_RATE),
-        drift=const(DRIFT),
-        fry=const(FRY),
-    )
-    gp = glottis_params(src, air)  # each [B, n_blocks]
-    p_lung = lung_pressure(src)
+    gp, p_lung = _source(blocks, air)
 
     def block(i, net):
         return ac.block(
@@ -268,7 +277,109 @@ def render_blocks(
         glottis_blocks=glottis_blocks,
         noise=noise,
         generator=generator,
+        compile=compile,
+        pitch=pitch,
+        glottis_init=glottis_init,
     )
+
+
+def _round_to(x: float, step: int) -> int:
+    return max(0, int(round(x / step))) * step
+
+
+def render_chunked(
+    voice: Voice,
+    blocks: Tensor,
+    n_out: int,
+    chunk: int,
+    warmup: int,
+    crossfade: int,
+    generator: torch.Generator | None = None,
+    compile: bool = False,
+) -> Tensor:
+    """``render_blocks`` cut into chunks rendered side by side in the batch, then overlap-added.
+
+    Chunk ``c ≥ 1`` covers output samples ``[c·chunk − crossfade/2, (c+1)·chunk + crossfade/2)``,
+    preceded by ``warmup`` samples that are rendered and dropped; neighbours meet in a sin²/cos²
+    crossfade. Chunk 0 is the sequential render's start (nothing comes before it to warm up). Each
+    later chunk starts with the airway at rest in its first block's posture (no pressure, no flow,
+    the lungs filling from 0), as the Rust experiment ``chimera chunked`` did. What carries over
+    exactly: the glottis's cycle phase, jitter and shimmer (``glottis.cycle_state_at``) and the
+    pitch modulation, on the sequential render's timeline, so pulses line up across the
+    crossfades and with the sequential render. Lengths in output samples, multiples of ``BLOCK``
+    (``crossfade`` of ``2·BLOCK``); ``chunk ≥ warmup + crossfade/2``.
+    """
+    from samuel.chimera.glottis import cycle_state_at, pitch_factors
+
+    air, k = voice.air, voice.k
+    m, ce = k.oversample, k.ctrl_every
+    H, W, X = chunk, warmup, crossfade
+    assert H % BLOCK == 0 and W % BLOCK == 0 and X % (2 * BLOCK) == 0, (H, W, X)
+    assert H >= W + X // 2, "chunk must be at least warmup + crossfade/2"
+    B, nb, P = blocks.shape
+    n_chunks = max(1, -(-n_out // H))
+    L = W + H + X  # each chunk's rendered length
+    starts = [0] + [c * H - X // 2 - W for c in range(1, n_chunks)]  # output samples
+    total = max(L, n_chunks * H + X // 2)  # where the last chunk ends
+    nb_total = total // BLOCK
+    if nb_total > nb:
+        blocks = torch.cat([blocks, blocks[:, -1:].expand(B, nb_total - nb, P)], 1)
+
+    # the glottis's timeline: pitch factors and cycle state at each chunk's first sample
+    gp, _ = _source(blocks[:, :nb_total], air)
+    n_int = nb_total * ce
+    per = lambda v: v.repeat_interleave(ce, dim=-1)  # noqa: E731
+    pf = pitch_factors(
+        k.fs, n_int, per(gp["vibrato_rate"]), per(gp["vibrato_depth"]), per(gp["drift"])
+    )
+    f0 = per(gp["f0"]) * pf
+    fry = per(gp["fry"])
+    f0 = f0 * (1.0 - fry) + torch.clamp(f0, max=48.0) * fry
+    dev = blocks.device
+    at = torch.tensor(starts, device=dev) * m
+    cs = cycle_state_at(
+        k.fs, f0, per(gp["jitter"]), per(gp["shimmer"]), per(gp["diplophonia"]), at
+    )
+    glottis_init = {key: v.reshape(B * n_chunks) for key, v in cs.items()}
+
+    # the chunks, side by side: [B·C, L/BLOCK, P] and their pitch factors [B·C, L·m]
+    lb = L // BLOCK
+    bi = torch.tensor(starts, device=dev)[:, None] // BLOCK + torch.arange(
+        lb, device=dev
+    )
+    cb = blocks[:, bi].reshape(B * n_chunks, lb, P)
+    si = at[:, None] + torch.arange(L * m, device=dev)
+    cpf = pf[:, si].reshape(B * n_chunks, L * m)
+    y = render_blocks(
+        voice,
+        cb,
+        L,
+        noise="independent",
+        generator=generator,
+        compile=compile,
+        pitch=cpf,
+        glottis_init=glottis_init,
+    )["out"].view(B, n_chunks, L)
+    # each chunk's part, laid out from c·chunk − crossfade/2: [B, C, H + X]
+    first = torch.nn.functional.pad(y[:, :1, : H + X // 2], (X // 2, 0))
+    y = torch.cat([first, y[:, 1:, W : W + H + X]], 1)
+
+    # crossfade: sin² in, cos² out (they sum to 1); the first chunk has no fade-in and the last
+    # no fade-out (before sample 0, after the end)
+    if X > 0:
+        t = (torch.arange(X, dtype=y.dtype, device=y.device) + 0.5) / X
+        fade_in = torch.sin(0.5 * math.pi * t) ** 2
+        win = torch.ones(n_chunks, H + X, dtype=y.dtype, device=y.device)
+        win[1:, :X] = fade_in
+        win[:-1, H:] = 1.0 - fade_in
+        y = y * win
+    out = torch.nn.functional.fold(
+        y.transpose(1, 2),  # [B, H + X, C]
+        output_size=(1, n_chunks * H + X),
+        kernel_size=(1, H + X),
+        stride=(1, H),
+    )[:, 0, 0]
+    return out[:, X // 2 : X // 2 + n_out]
 
 
 _VOICES: dict[tuple, Voice] = {}
@@ -279,6 +390,10 @@ def chimera(
     seed: int | None = None,
     control_rate: float = CONTROL_RATE,
     dtype: torch.dtype = torch.float64,
+    compile: bool = False,
+    chunk_ms: float | None = None,
+    warmup_ms: float = 25.0,
+    crossfade_ms: float = 10.0,
 ) -> Tensor:
     """Differentiable CHIMERA human voice (adult male).
 
@@ -291,6 +406,12 @@ def chimera(
         seed: seeds the turbulence noise; ``None`` draws fresh noise.
         control_rate: frames per second of ``params``.
         dtype: the simulation's precision. Only float64 is checked against the Rust.
+        compile: ``torch.compile`` the per-sample step (compiles once per batch size, dtype,
+            device and grad mode).
+        chunk_ms: render in chunks of this length side by side in the batch, each after
+            ``warmup_ms`` of settling, joined by ``crossfade_ms`` crossfades (``render_chunked``);
+            lengths round to multiples of 64 samples. Not the same output as the default
+            sequential render: each chunk's airway starts at rest.
 
     Returns:
         ``[B, T · round(44100 / control_rate)]`` audio at 44.1 kHz, in ``params``'s dtype.
@@ -309,5 +430,20 @@ def chimera(
     else:
         gen.manual_seed(seed)
     blocks = params_at_blocks(params.to(dtype), spf, n_out)
-    out = render_blocks(voice, blocks, n_out, noise="independent", generator=gen)["out"]
+    if chunk_ms is None:
+        out = render_blocks(
+            voice, blocks, n_out, noise="independent", generator=gen, compile=compile
+        )["out"]
+    else:
+        ms = SAMPLE_RATE / 1000.0
+        out = render_chunked(
+            voice,
+            blocks,
+            n_out,
+            chunk=max(BLOCK, _round_to(chunk_ms * ms, BLOCK)),
+            warmup=_round_to(warmup_ms * ms, BLOCK),
+            crossfade=_round_to(crossfade_ms * ms, 2 * BLOCK),
+            generator=gen,
+            compile=compile,
+        )
     return out.to(params.dtype)

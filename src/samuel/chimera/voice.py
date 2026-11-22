@@ -9,6 +9,7 @@ The output limiter is left out (it is off in the trace too).
 
 from __future__ import annotations
 
+import functools
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -76,6 +77,9 @@ def render(
     glottis_blocks: dict[str, Tensor] | None = None,
     noise: str = "rust",
     generator: torch.Generator | None = None,
+    compile: bool = False,
+    pitch: Tensor | None = None,
+    glottis_init: dict[str, Tensor] | None = None,
 ) -> dict[str, Tensor]:
     """Run the voice and return ``out`` ``[B, n_out]`` (and, with ``trace``, the per-internal-sample
     ``net_out``, ``glottal_area`` and ``glottal_flow``).
@@ -89,6 +93,14 @@ def render(
     active source per sample in list order, so the output matches the Rust; every batch item then
     needs the same number of sources per block. ``"independent"``: each source slot of each batch
     item draws its own noise from ``generator``.
+
+    ``compile``: run each sample's lungs, glottis and airway step as one ``torch.compile``d function
+    (the same arithmetic; it compiles once per batch size, dtype, device and grad mode).
+
+    ``pitch``: the pitch factor per internal sample ``[B, n_int]``, in place of vibrato and drift
+    computed from this render's start. ``glottis_init``: the glottis's cycle state to start from
+    (``glottis.cycle_state_at``'s fields, each ``[B]``). Both let a render be one chunk of a longer
+    one (``synth.chimera(chunk_ms=...)``).
     """
     dt = topo.port_len.dtype
     dev = topo.port_len.device
@@ -106,19 +118,26 @@ def render(
     B = glottis_blocks["drift"].shape[0]
     net = Network(topo, B, init["area"], init["amin"], init["dx"], init["port_area"])
     glo = Glottis(k.fs, B, dtype=dt, device=dev)
-    # the pitch modulation steps every 32 samples, from the block's parameters
-    per_sample = {
-        key: v[:, :n_blocks].repeat_interleave(ce, dim=-1)[:, :n_int]
-        for key, v in glottis_blocks.items()
-    }
-    pf = pitch_factors(
-        k.fs,
-        n_int,
-        per_sample["vibrato_rate"],
-        per_sample["vibrato_depth"],
-        per_sample["drift"],
-    )
+    if glottis_init is not None:
+        for key, v in glottis_init.items():
+            setattr(glo.s, key, v)
+    if pitch is not None:
+        pf = pitch
+    else:
+        # the pitch modulation steps every 32 samples, from the block's parameters
+        per_sample = {
+            key: v[:, :n_blocks].repeat_interleave(ce, dim=-1)[:, :n_int]
+            for key, v in glottis_blocks.items()
+        }
+        pf = pitch_factors(
+            k.fs,
+            n_int,
+            per_sample["vibrato_rate"],
+            per_sample["vibrato_depth"],
+            per_sample["drift"],
+        )
 
+    sample_fn = _sample_compiled() if compile else _sample
     p_lung_now = torch.zeros(B, dtype=dt, device=dev)
     lung_flow = torch.zeros(B, dtype=dt, device=dev)
     ys, areas, flows = [], [], []
@@ -178,15 +197,9 @@ def render(
         )
         for i in range(L):
             p_lung_now = p_lung_now + p_lung_step
-            lung_flow = lung_flow + k.lung_port_coef * (
-                net.u[:, k.lung_port] - lung_flow
+            y, a, lung_flow = sample_fn(
+                net, glo, k, b.glottis, pf[:, pos], white_blk[i], p_lung_now, lung_flow
             )
-            net.set_fixed_pressure(k.lungs, p_lung_now + k.lung_port_excess * lung_flow)
-            a = glo.next(
-                net.p[:, k.sub_node] - net.p[:, k.supra_node], b.glottis, pf[:, pos]
-            )
-            net.set_port_area(k.glottis_port, a)
-            y = net.step(white_blk[i])
             ys.append(y)
             if trace:
                 areas.append(a)
@@ -208,6 +221,30 @@ def render(
             glottal_flow=torch.stack(flows, -1),
         )
     return res
+
+
+def _sample(
+    net: Network,
+    glo: Glottis,
+    k: VoiceConstants,
+    gp: dict[str, Tensor],
+    pitch_factor: Tensor,
+    white: Tensor,
+    p_lung_now: Tensor,
+    lung_flow: Tensor,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """One internal sample: the lungs' pressure, the glottis, the airway. Returns the radiated
+    pressure, the glottal area and the lungs' flow."""
+    lung_flow = lung_flow + k.lung_port_coef * (net.u[:, k.lung_port] - lung_flow)
+    net.set_fixed_pressure(k.lungs, p_lung_now + k.lung_port_excess * lung_flow)
+    a = glo.next(net.p[:, k.sub_node] - net.p[:, k.supra_node], gp, pitch_factor)
+    net.set_port_area(k.glottis_port, a)
+    return net.step(white), a, lung_flow
+
+
+@functools.cache
+def _sample_compiled():
+    return torch.compile(_sample, dynamic=False)
 
 
 def decimate(y: Tensor, h: Tensor, m: int) -> Tensor:

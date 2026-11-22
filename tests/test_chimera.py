@@ -317,3 +317,71 @@ def test_synth_gradients_match_finite_differences():
         with torch.no_grad():
             fd = (loss(p0 + eps * d) - loss(p0 - eps * d)) / (2 * eps)
         assert (p.grad * d).sum().item() == pytest.approx(fd.item(), rel=1e-6), name
+
+
+def test_glottis_cycle_state_matches_the_sample_loop():
+    """``cycle_state_at`` (a cycle at a time) against ``Glottis.next`` (a sample at a time), with
+    f0, jitter, shimmer and diplophonia changing every block."""
+    from samuel.chimera.glottis import Glottis, cycle_state_at
+
+    torch.manual_seed(0)
+    fs, B, n = 88200.0, 2, 8820
+
+    def per(x):
+        return x.repeat_interleave(128, -1)[:, :n]
+
+    def rand(lo, hi):
+        return per(lo + (hi - lo) * torch.rand(B, n // 128 + 1, dtype=torch.float64))
+
+    f0, jit, shim, dip = rand(90, 300), rand(0.0, 0.03), rand(0.02, 0.2), rand(0.0, 0.3)
+    at = [0, 1, 128, 3000, 8819, 8820]
+    glo = Glottis(fs, B)
+    full = lambda v: torch.full((B,), v, dtype=torch.float64)  # noqa: E731
+    fixed = dict(fry=0.0, chink=0.0, closure=0.0, open_quotient=0.6, effort=0.5,
+                 open_with_abduction=0.98, skew=0.6, closure_sharpness=0.5, amplitude=0.17,
+                 abduction=0.0)  # fmt: skip
+    ref = []
+    for i in range(n + 1):
+        if i in at:
+            s = glo.s
+            ref.append([s.phase, s.period_scale, s.cycle_amp, s.cycle_index.double()])
+        if i < n:
+            p = {k: full(v) for k, v in fixed.items()}
+            p.update(
+                f0=f0[:, i], jitter=jit[:, i], shimmer=shim[:, i], diplophonia=dip[:, i]
+            )
+            glo.next(full(1e5), p, full(1.0))
+    got = cycle_state_at(fs, f0, jit, shim, dip, torch.tensor(at))
+    for j, key in enumerate(["phase", "period_scale", "cycle_amp", "cycle_index"]):
+        r = torch.stack([row[j] for row in ref], 1)
+        torch.testing.assert_close(got[key].double(), r, rtol=0, atol=1e-11, msg=key)
+    assert ref[-1][3].min() > 10  # cycles were crossed
+
+
+def test_synth_chunked_is_close_to_sequential(doc):
+    """Chunks side by side in the batch (each after 25 ms of warm-up), overlap-added, against the
+    sequential render: near the floor two noise seeds set (~43 dB SNR here), gradients finite."""
+    from samuel.chimera.synth import chimera
+
+    p = _trace_blocks(doc)
+    rate = 44100 / 64
+    with torch.no_grad():
+        full = chimera(p, seed=0, control_rate=rate)[0, 2205:]
+    pc = p.clone().requires_grad_(True)
+    y = chimera(pc, seed=0, control_rate=rate, chunk_ms=50, warmup_ms=25)
+    (y**2).mean().backward()
+    assert torch.isfinite(pc.grad).all() and pc.grad.abs().sum() > 0
+    y = y.detach()[0, 2205:]
+    snr = 10 * torch.log10((full**2).sum() / ((y - full) ** 2).sum())
+    assert snr > 30, snr
+
+
+def test_synth_compiled_step_matches_eager():
+    from samuel.chimera.synth import PARAM_NAMES, chimera, default_params
+
+    p = default_params(1, 2, dtype=torch.float64)
+    p[0, :, PARAM_NAMES.index("lipAp")] = torch.tensor([0.5, 0.9])
+    with torch.no_grad():
+        a = chimera(p, seed=0, control_rate=100.0)
+        b = chimera(p, seed=0, control_rate=100.0, compile=True)
+    torch.testing.assert_close(a, b, rtol=0, atol=1e-12 * a.abs().max().item())

@@ -2,14 +2,14 @@
 
 A differentiable Torch port of the CHIMERA vocal synth's human voice
 (github.com/jamesondh/chimera-vocal-synth, Rust engine in `crates/chimera/`), sample by sample
-(the full time-domain simulation, not impulse responses). Speed comes later: chunked overlap-add
-with ~25 ms warm-up per chunk was measured to be indistinguishable from the full render
-(Rust experiment `chimera chunked`, branch `experiment/chunked-ola`).
+(the full time-domain simulation, not impulse responses). For speed, `chimera(chunk_ms=...)`
+renders chunks side by side in the batch with ~25 ms warm-up each and overlap-adds them (as the
+Rust experiment `chimera chunked`, branch `experiment/chunked-ola`, did).
 
 ## Where things are
 
 - **This branch** (`chimera-synth` in samuel, worktree `/Users/vaclav/prog/samuel-chimera`):
-  `src/samuel/chimera/`, tests in `tests/test_chimera.py` (11 tests, ~100 s).
+  `src/samuel/chimera/`, tests in `tests/test_chimera.py` (14 tests, ~160 s).
 - **Rust reference tools**: vvolhejn/chimera-vocal-synth branch `experiment/torch-port-dump`
   (worktree `/Users/vaclav/prog/chimera-torch-dump`, built with `cargo build --release -p chimera-cli`):
   - `chimera dump <out.json> <fs_out> <oversample> "Text."`: a full trace of an utterance. Per
@@ -60,10 +60,34 @@ with ~25 ms warm-up per chunk was measured to be indistinguishable from the full
      radiation's "did the lip area grow") sit on their switch points, so gradients are one-sided
      there (per-frame up to ~20 % off a central difference; their sum over frames is exact);
    - backward costs ~2.5× the forward (200 ms: 19 s forward, 50 s backward, CPU).
-4. **Then, separately**: float32 and GPU, speed (torch.compile the step, chunked OLA with ~25 ms
-   warm-up), the noise-rate scaling fix (the Rust at this commit normalises noise by √(96 kHz/fs);
-   a fix to √(fs/96 kHz) was prepared in another session; `network._noise` follows the old one),
-   and the limiter if needed. Not in scope: training code.
+4. ~~float32, GPU, speed~~: done as far as this Mac goes.
+   - **Speed** is per-op overhead, not arithmetic: ~300 small ops per internal sample, 88 200
+     samples per second of audio. CPU float64, B=1: ~60 s per audio second; B=64 costs only ~5×
+     B=1. `compile=True` (`torch.compile` of one sample's lungs + glottis + airway, `voice._sample`)
+     is ~2.3× forward and ~5× forward+backward at B=1, nothing at B=16 with grad (compute-bound),
+     equal to eager to 1e-14. Compiles once per batch size, dtype, device and grad mode (~10 s).
+   - **Chunked** (`chunk_ms`, `warmup_ms=25`, `crossfade_ms=10`; `synth.render_chunked`): chunk 0
+     is the sequential render's start, later chunks start `warmup + crossfade/2` early with the
+     airway at rest; the glottis's cycle phase/jitter/shimmer (`glottis.cycle_state_at`, a
+     cycle-level pass equal to the sample loop to 1e-11) and the pitch modulation follow the
+     sequential timeline, so pulses line up. Whole phrase, CPU B=1: 72 s → 12–17 s; against the
+     sequential render it differs as much as another noise seed does (SNR 11 dB, log-mel
+     1.7–2.0 dB vs 10.8 / 1.69 for a seed change; on the quieter 200 ms clip 36–40 dB vs 43).
+     Gradients flow through it. On a GPU, where a step costs the same at any batch size, this
+     divides the sequential length outright.
+   - **float32** on the 200 ms clip: 70 dB SNR against the Rust (float64: 153), finite; compiled
+     B=1 float32 runs at ~12 s per audio second. Not checked: float32 gradients, stability at
+     extreme poses.
+   - **MPS** works eager in float32 but is launch-bound: ~760 s per audio second, flat in batch
+     size (≈3 s per item-second at B=256). `compile=True` fails there: Inductor fuses more than
+     Metal's 31 buffer arguments into one kernel. Not tried: CUDA (the realistic target; expect
+     launch-bound eager like MPS, so compile + chunking matter most there).
+5. **Next**: a CUDA run (compile, chunked, float32, gradients), then wiring into `model.py` /
+   training (out of this plan's scope until asked). Upstream has moved since the dump branch:
+   jamesondh/chimera-vocal-synth#143 (merged) keeps the frication source for a constriction just
+   past the velum, i.e. it removes the junction skip that `control._noise` copies; regenerate the
+   references from a newer Rust before following it. The noise-rate normalisation (√(96 kHz/fs))
+   stays as it is.
 
 ## Not ported (on purpose, for now)
 
